@@ -20,18 +20,14 @@ import aiohttp
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src import aster, hyperliquid as hl
+from src.fees import (
+    ASTER_FEE_BPS,
+    HL_MAKER_BPS,
+    HL_TAKER_BPS,
+    ROUND_TRIP_MAKER_BPS,
+    ROUND_TRIP_TAKER_BPS,
+)
 from src.types import ArbResult
-
-# ── Fee assumptions (bps per trade, i.e. one-way) ────────────────────────────
-# HIP-3 equity perps: deployer (trade.xyz) applies 2× multiplier on base fees.
-# Verify current rates at https://app.hyperliquid.xyz
-HL_TAKER_BPS = Decimal("10")   # 0.10% per trade
-HL_MAKER_BPS = Decimal("5")    # 0.05% per trade
-ASTER_FEE_BPS = Decimal("0")   # 0% promotional (Dec 2025) — verify still live
-
-# Round-trip = entry + exit = 2 trades on each venue
-ROUND_TRIP_TAKER_BPS = (HL_TAKER_BPS + ASTER_FEE_BPS) * 2   # 20 bps
-ROUND_TRIP_MAKER_BPS = (HL_MAKER_BPS + ASTER_FEE_BPS) * 2   # 10 bps
 
 ZERO = Decimal("0")
 
