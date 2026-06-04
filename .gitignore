@@ -1,0 +1,21 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Data
+data/
+*.parquet
+*.db
+*.sqlite
+
+# Secrets — never commit
+config/secrets.toml
+.env
