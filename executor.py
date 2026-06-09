@@ -26,7 +26,7 @@ from exchange_client import ExchangeClient, OrderBook
 from position_manager import PositionManager
 from config import (
     ENTRY_THRESHOLD_BPS, ENTRY_THRESHOLD_BPS_BY_SYMBOL, EXIT_THRESHOLD_BPS,
-    NOTIONAL_PER_LEG, ENTRY_TIMEOUT_MINUTES,
+    NOTIONAL_PER_LEG, ENTRY_TIMEOUT_MINUTES, EXIT_TIMEOUT_MINUTES,
     MAX_PRICE_RATIO_DIVERGENCE, BLOCKED_SYMBOLS,
 )
 from auth import now_ms
@@ -252,16 +252,21 @@ class Executor:
         if not order_id:
             return
 
-        # Check entry timeout
+        # Check timeouts (entry → close HL; exit → force-close Aster as taker)
         if is_entry:
             elapsed_min = (now_ms() - pos.entry_time) / 60_000
             if elapsed_min > ENTRY_TIMEOUT_MINUTES:
+                await self._handle_entry_timeout(pos, order_id, elapsed_min)
+                return
+        else:
+            elapsed_min = (now_ms() - pos.exit_time) / 60_000 if pos.exit_time else 0
+            if elapsed_min > EXIT_TIMEOUT_MINUTES:
                 log.warning(
-                    f"{symbol}: Aster entry GTX timed out after {elapsed_min:.0f}min — "
-                    f"cancelling and closing HL"
+                    f"{symbol}: Aster exit GTX timed out after {elapsed_min:.0f}min — "
+                    f"cancelling and force-closing with IOC (taker)"
                 )
                 await self.client.cancel_aster_order(symbol, order_id)
-                await self._emergency_close_hl(pos)
+                await self._force_close_aster_exit(pos)
                 return
 
         # Query current Aster order status
@@ -294,8 +299,82 @@ class Executor:
         # Order still resting — check if price needs updating
         await self._reprice_aster_gtx(pos, is_entry, order_id)
 
+    async def _handle_entry_timeout(self, pos, order_id: str, elapsed_min: float):
+        """
+        Entry maker timed out. Query for partial fills before cancelling so we
+        can keep the matched portion hedged and only close the unmatched HL.
+        """
+        symbol = pos.symbol
+        q = await self.client.query_aster_order(symbol, order_id)
+        executed = float(q.get("executedQty", 0) or 0)
+        avg_price = float(q.get("avgPrice", 0) or 0)
+        await self.client.cancel_aster_order(symbol, order_id)
+
+        spec = self.client.aster_specs.get(symbol)
+        min_qty = spec.min_qty if spec else 0.0
+
+        if executed >= min_qty and avg_price > 0:
+            unmatched = pos.qty - executed
+            log.warning(
+                f"{symbol}: Aster entry timed out after {elapsed_min:.0f}min with PARTIAL fill "
+                f"{executed}/{pos.qty} — keeping matched portion, closing HL remainder {unmatched}"
+            )
+            # Close unmatched HL portion (we have full HL qty but only `executed` Aster)
+            if unmatched > 0:
+                close_side = "sell" if pos.direction == "long_hl_short_aster" else "buy"
+                hl_book = await self.client._get_hl_book(symbol)
+                ref_price = hl_book.bid if close_side == "sell" else hl_book.ask
+                if ref_price > 0:
+                    res = await self.client.place_hl_ioc(symbol, close_side, unmatched, ref_price)
+                    if not res.success:
+                        log.critical(
+                            f"{symbol}: HL partial-close FAILED ({res.error}) — "
+                            f"position has {unmatched} unhedged HL. Manual intervention!"
+                        )
+            # Shrink position to matched qty and mark as open
+            self.pm.confirm_aster_entry_partial(symbol, avg_price, executed)
+        else:
+            log.warning(
+                f"{symbol}: Aster entry GTX timed out after {elapsed_min:.0f}min (0 fill) — "
+                f"closing HL leg"
+            )
+            await self._emergency_close_hl(pos)
+
+    async def _force_close_aster_exit(self, pos):
+        """Force-close Aster exit leg with a taker IOC after maker timeout."""
+        symbol = pos.symbol
+        close_side = "buy" if pos.direction == "long_hl_short_aster" else "sell"
+        aster_book = await self.client._get_aster_book(symbol)
+        ref_price = aster_book.ask if close_side == "buy" else aster_book.bid
+        if ref_price <= 0:
+            log.critical(f"{symbol}: empty Aster book on force exit — manual intervention!")
+            self.pm.mark_error(symbol, "force_exit_empty_book")
+            return
+        result = await self.client.place_aster_ioc(symbol, close_side, pos.qty, ref_price)
+        if result.success and result.filled_qty > 0:
+            log.info(
+                f"{symbol}: Aster force-exit filled {result.filled_qty} @ {result.fill_price:.4f}"
+            )
+            self.pm.log_trade(
+                pos.id, "aster", close_side, "ioc_limit",
+                result.order_id, result.filled_qty, result.fill_price, notes="exit forced taker",
+            )
+            self.pm.confirm_aster_exit(
+                symbol, result.fill_price, (pos.exit_reason or "converged") + "_taker"
+            )
+        else:
+            log.critical(
+                f"{symbol}: Aster force-exit FAILED ({result.error}) — UNHEDGED. "
+                f"Manual intervention!"
+            )
+            self.pm.mark_error(symbol, f"force_exit_failed: {result.error}")
+
     async def _reprice_aster_gtx(self, pos, is_entry: bool, current_order_id: str | None):
-        """If the book has moved, cancel existing GTX and repost at new best price."""
+        """
+        Cancel existing GTX and repost at new best price — with a race guard for
+        the case where the order fills between query and cancel (we'd otherwise
+        repost and double the position).
+        """
         symbol = pos.symbol
         aster_book = await self.client._get_aster_book(symbol)
         if aster_book.bid <= 0:
@@ -304,26 +383,74 @@ class Executor:
         if is_entry:
             side = "sell" if pos.direction == "long_hl_short_aster" else "buy"
             target_price = aster_book.bid if side == "sell" else aster_book.ask
-            current_price = float(
-                (await self.client.query_aster_order(symbol, current_order_id or "0")).get("price", 0) or 0
-            ) if current_order_id else 0
         else:
             side = "buy" if pos.direction == "long_hl_short_aster" else "sell"
             target_price = aster_book.ask if side == "buy" else aster_book.bid
-            current_price = float(
-                (await self.client.query_aster_order(symbol, current_order_id or "0")).get("price", 0) or 0
-            ) if current_order_id else 0
 
         spec = self.client.aster_specs.get(symbol)
         tick = spec.tick_size if spec else 0.01
-        if current_order_id and abs(target_price - current_price) < tick / 2:
-            return  # already at best price
 
-        # Cancel old and repost
+        # If we have an existing order, check its state first
+        new_qty = pos.qty
         if current_order_id:
-            await self.client.cancel_aster_order(symbol, current_order_id)
+            q = await self.client.query_aster_order(symbol, current_order_id)
+            current_price = float(q.get("price", 0) or 0)
+            current_status = q.get("status", "")
+            executed = float(q.get("executedQty", 0) or 0)
+            avg_price = float(q.get("avgPrice", 0) or 0)
 
-        new_result = await self.client.place_aster_gtx(symbol, side, pos.qty, target_price)
+            # Race: filled between last poll and now → advance state, don't repost
+            if current_status == "FILLED":
+                log.info(f"{symbol}: GTX {current_order_id} filled during reprice check")
+                if is_entry:
+                    self.pm.confirm_aster_entry(symbol, avg_price)
+                else:
+                    self.pm.confirm_aster_exit(symbol, avg_price, pos.exit_reason or "converged")
+                return
+
+            # Already at best price (within half a tick) — nothing to do
+            if current_price > 0 and abs(target_price - current_price) < tick / 2:
+                return
+
+            # Cancel and re-query to capture any fill that landed during cancel
+            await self.client.cancel_aster_order(symbol, current_order_id)
+            q2 = await self.client.query_aster_order(symbol, current_order_id)
+            final_executed = float(q2.get("executedQty", executed) or executed)
+            final_avg = float(q2.get("avgPrice", avg_price) or avg_price)
+
+            if final_executed >= pos.qty * 0.999:
+                # Fully filled in the race — advance state, don't repost
+                log.warning(
+                    f"{symbol}: GTX {current_order_id} fully filled during cancel race"
+                )
+                if is_entry:
+                    self.pm.confirm_aster_entry(symbol, final_avg)
+                else:
+                    self.pm.confirm_aster_exit(symbol, final_avg, pos.exit_reason or "converged")
+                return
+
+            if final_executed > executed and final_executed > 0:
+                # Partial fill during cancel — repost only for the remainder
+                remainder = pos.qty - final_executed
+                snapped = self.client.snap_aster_qty(symbol, remainder)
+                if snapped > 0:
+                    log.warning(
+                        f"{symbol}: GTX partial-fill {final_executed} during cancel, "
+                        f"reposting remainder {snapped}"
+                    )
+                    new_qty = snapped
+                else:
+                    log.warning(
+                        f"{symbol}: GTX partial-fill {final_executed} during cancel, "
+                        f"remainder too small to repost — treating as filled"
+                    )
+                    if is_entry:
+                        self.pm.confirm_aster_entry_partial(symbol, final_avg, final_executed)
+                    else:
+                        self.pm.confirm_aster_exit(symbol, final_avg, pos.exit_reason or "converged")
+                    return
+
+        new_result = await self.client.place_aster_gtx(symbol, side, new_qty, target_price)
         if new_result.success:
             new_oid = new_result.order_id
             if is_entry:
@@ -398,52 +525,101 @@ class Executor:
             f"HL {hl_close_side} @ {hl_ref_price:.2f} | Aster {aster_close_side} @ {aster_ref_price:.2f}"
         )
 
-        # Step 1: HL IOC close
-        hl_result = await self.client.place_hl_ioc(
-            symbol, hl_close_side, pos.qty, hl_ref_price
-        )
-        if not hl_result.success or hl_result.filled_qty <= 0:
-            log.error(f"{symbol}: HL exit IOC failed ({hl_result.error})")
-            # Retry once with market
-            hl_result = await self.client.place_hl_ioc(
-                symbol, hl_close_side, pos.qty, hl_ref_price
+        # Step 1: HL IOC close — keep filling until we have the full qty (max 2 attempts)
+        hl_filled = 0.0
+        hl_avg_price = 0.0
+        hl_order_id = ""
+        last_err = ""
+        for attempt in range(2):
+            remaining = pos.qty - hl_filled
+            if remaining <= 0:
+                break
+            res = await self.client.place_hl_ioc(symbol, hl_close_side, remaining, hl_ref_price)
+            if res.success and res.filled_qty > 0:
+                # Weighted-average the fill price across attempts
+                new_total = hl_filled + res.filled_qty
+                hl_avg_price = (hl_avg_price * hl_filled + res.fill_price * res.filled_qty) / new_total
+                hl_filled = new_total
+                hl_order_id = res.order_id or hl_order_id
+            else:
+                last_err = res.error or last_err
+                if attempt == 0:
+                    log.warning(f"{symbol}: HL exit attempt 1 returned 0 fill ({res.error}), retrying")
+
+        if hl_filled <= 0:
+            log.critical(f"{symbol}: HL exit FAILED — manual intervention needed ({last_err})")
+            self.pm.mark_error(symbol, f"HL exit failed: {last_err}")
+            return False
+
+        partial_hl = hl_filled < pos.qty * 0.999  # tolerate 0.1% rounding
+        if partial_hl:
+            log.warning(
+                f"{symbol}: HL exit PARTIAL {hl_filled}/{pos.qty} — closing matched Aster qty, "
+                f"residual {pos.qty - hl_filled} will need manual close"
             )
-            if not hl_result.success:
-                log.critical(f"{symbol}: HL exit FAILED — manual intervention needed")
-                self.pm.mark_error(symbol, f"HL exit failed: {hl_result.error}")
-                return False
 
-        log.info(f"{symbol}: HL exit filled {hl_result.filled_qty} @ {hl_result.fill_price:.2f}")
+        log.info(f"{symbol}: HL exit filled {hl_filled} @ {hl_avg_price:.2f}")
 
-        # Step 2: Aster GTX close (maker, resting)
+        # Step 2: Aster close — match the HL filled qty exactly to stay hedged
+        aster_qty = self.client.snap_aster_qty(symbol, hl_filled)
+        if aster_qty <= 0:
+            log.critical(f"{symbol}: HL filled {hl_filled} but Aster snap returned 0 — UNHEDGED")
+            self.pm.mark_error(symbol, "aster_qty_snap_zero")
+            return False
+
         aster_result = await self.client.place_aster_gtx(
-            symbol, aster_close_side, pos.qty, aster_ref_price
+            symbol, aster_close_side, aster_qty, aster_ref_price
         )
+
+        # If maker fails, escalate to real IOC (taker) — pays ~0.9bps to escape stuck exit
         if not aster_result.success:
-            log.error(f"{symbol}: Aster exit GTX failed — retrying as IOC")
-            # Try IOC as fallback (will be taker)
-            aster_result = await self.client.place_aster_gtx(
-                symbol, aster_close_side, pos.qty, aster_ref_price
+            log.error(f"{symbol}: Aster exit GTX failed ({aster_result.error}) — forcing IOC taker")
+            aster_result = await self.client.place_aster_ioc(
+                symbol, aster_close_side, aster_qty, aster_ref_price
             )
-            if not aster_result.success:
-                log.critical(f"{symbol}: Aster exit FAILED — UNHEDGED on Aster. Manual intervention!")
+            if not aster_result.success or aster_result.filled_qty <= 0:
+                log.critical(f"{symbol}: Aster exit FAILED — UNHEDGED. Manual intervention!")
                 self.pm.mark_error(symbol, f"Aster exit failed: {aster_result.error}")
                 return False
+            # IOC filled immediately — start_exiting then confirm in one shot
+            self.pm.start_exiting(
+                symbol, hl_order_id, aster_result.order_id, hl_avg_price, exit_spread_bps,
+            )
+            self.pm.log_trade(
+                pos.id, "hl", hl_close_side, "ioc_limit",
+                hl_order_id, hl_filled, hl_avg_price, notes="exit" + (" partial" if partial_hl else ""),
+            )
+            self.pm.log_trade(
+                pos.id, "aster", aster_close_side, "ioc_limit",
+                aster_result.order_id, aster_result.filled_qty, aster_result.fill_price,
+                notes="exit forced taker",
+            )
+            self.pm.confirm_aster_exit(symbol, aster_result.fill_price, reason + "_taker")
+            if partial_hl:
+                self.pm.mark_error(symbol, "hl_exit_partial_residual")
+            return True
 
-        # Record exit as 'exiting' — wait for Aster GTX to fill
+        # Maker order resting — wait for fill via poll_aster_maker
         pos.exit_reason = reason
         self.pm.start_exiting(
-            symbol, hl_result.order_id, aster_result.order_id,
-            hl_result.fill_price, exit_spread_bps,
+            symbol, hl_order_id, aster_result.order_id, hl_avg_price, exit_spread_bps,
         )
         self.pm.log_trade(
             pos.id, "hl", hl_close_side, "ioc_limit",
-            hl_result.order_id, hl_result.filled_qty, hl_result.fill_price, notes="exit"
+            hl_order_id, hl_filled, hl_avg_price, notes="exit" + (" partial" if partial_hl else ""),
         )
         self.pm.log_trade(
             pos.id, "aster", aster_close_side, "gtx_limit",
-            aster_result.order_id, pos.qty, aster_ref_price, notes="exit resting"
+            aster_result.order_id, aster_qty, aster_ref_price, notes="exit resting",
         )
+        # If HL partial, update pos.qty to match what's actually open on Aster
+        if partial_hl:
+            pos.qty = aster_qty
+            from database import get_connection
+            conn = get_connection()
+            conn.execute("UPDATE positions SET qty=? WHERE id=?", (aster_qty, pos.id))
+            conn.commit()
+            conn.close()
         return True
 
     async def _emergency_close_hl(self, pos):

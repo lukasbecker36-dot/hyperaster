@@ -28,7 +28,7 @@ from auth import sign_aster_request, now_ms
 from config import (
     HYPERLIQUID_API, HL_EXCHANGE_URL,
     ASTER_ORDER_URL, ASTER_OPEN_ORDERS_URL, ASTER_POSITION_URL, ASTER_EXCHANGE_INFO_URL,
-    ORDER_TIMEOUT_SECONDS, HL_IOC_BUFFER_BPS,
+    ORDER_TIMEOUT_SECONDS, HL_IOC_BUFFER_BPS, ASTER_IOC_BUFFER_BPS,
 )
 
 log = logging.getLogger(__name__)
@@ -447,6 +447,52 @@ class ExchangeClient:
                 return OrderResult(success=False, error=err, raw=data)
         except Exception as e:
             log.error(f"Aster GTX exception: {e}")
+            return OrderResult(success=False, error=str(e))
+
+    async def place_aster_ioc(
+        self, symbol: str, side: str, qty: float, price: float
+    ) -> OrderResult:
+        """
+        Place an IOC (taker) limit order on Aster to force-fill — used to escape
+        a stuck maker exit. Pays Aster taker fee (~0.9bps); use sparingly.
+        """
+        aster_sym = f"{symbol}USDT"
+        is_buy = side.lower() == "buy"
+        buffer = price * ASTER_IOC_BUFFER_BPS / 10000
+        limit_px = price + buffer if is_buy else price - buffer
+        params = {
+            "symbol": aster_sym,
+            "side": side.upper(),
+            "type": "LIMIT",
+            "timeInForce": "IOC",
+            "price": self.format_aster_price(symbol, limit_px),
+            "quantity": self.format_aster_qty(symbol, qty),
+        }
+        signed = self._sign_aster(params)
+        try:
+            async with self.session.post(
+                ASTER_ORDER_URL, data=signed, timeout=self.timeout
+            ) as r:
+                data = await r.json()
+            if "orderId" in data:
+                oid = str(data["orderId"])
+                filled_qty = float(data.get("executedQty", 0) or 0)
+                fill_price = float(data.get("avgPrice", 0) or 0)
+                log.info(
+                    f"Aster IOC: {side.upper()} {qty} {aster_sym} @ {limit_px} -> "
+                    f"filled {filled_qty} @ {fill_price} (oid {oid})"
+                )
+                return OrderResult(
+                    success=filled_qty > 0, order_id=oid,
+                    filled_qty=filled_qty, fill_price=fill_price or limit_px,
+                    raw=data,
+                )
+            else:
+                err = data.get("msg", str(data))
+                log.error(f"Aster IOC failed: {err}")
+                return OrderResult(success=False, error=err, raw=data)
+        except Exception as e:
+            log.error(f"Aster IOC exception: {e}")
             return OrderResult(success=False, error=str(e))
 
     async def cancel_aster_order(self, symbol: str, order_id: str) -> bool:

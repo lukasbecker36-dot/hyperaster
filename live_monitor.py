@@ -136,7 +136,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
         log.error("No valid symbols. Exiting.")
         return
 
-    pm = PositionManager()
+    pm = PositionManager(paper_mode=paper_mode)
     executor = Executor(client, pm, paper_mode=paper_mode)
 
     # Crash recovery: log any positions found in DB

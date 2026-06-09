@@ -36,6 +36,9 @@ ENTRY_THRESHOLD_BPS = 30.0
 EXIT_THRESHOLD_BPS = 8.0
 # Abandon entry (close HL leg) if Aster maker hasn't filled within this many minutes
 ENTRY_TIMEOUT_MINUTES = 60
+# Force-close Aster exit leg with a taker IOC if maker hasn't filled within this many minutes
+# (pays ~0.9bps Aster taker once, but escapes being stuck one-legged while spread runs away)
+EXIT_TIMEOUT_MINUTES = 30
 # Force-close position after this many hours regardless of spread
 MAX_HOLD_HOURS = 48
 
@@ -47,6 +50,7 @@ MAX_CONCURRENT_POSITIONS = 3     # max simultaneous positions across all symbols
 POLL_INTERVAL_SECONDS = 1        # main loop interval
 ASTER_FILL_POLL_SECONDS = 10     # how often to poll pending Aster maker orders for fills
 HL_IOC_BUFFER_BPS = 5            # bps above/below current price for HL IOC limit
+ASTER_IOC_BUFFER_BPS = 5         # bps past best for Aster IOC (force-close) limit
 ORDER_TIMEOUT_SECONDS = 8        # HTTP request timeout
 
 # ── Paper mode ──

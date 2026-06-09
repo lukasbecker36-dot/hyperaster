@@ -48,7 +48,8 @@ def init_db():
             gross_pnl           REAL,
             fee_cost            REAL,
             net_pnl             REAL,
-            exit_reason         TEXT                   -- 'converged', 'timeout', 'error'
+            exit_reason         TEXT,                  -- 'converged', 'timeout', 'error'
+            paper               INTEGER NOT NULL DEFAULT 0  -- 1 if paper-mode simulation
         );
 
         CREATE TABLE IF NOT EXISTS trade_log (
@@ -75,5 +76,10 @@ def init_db():
             conn.execute(f"ALTER TABLE positions ADD COLUMN {col} TEXT")
         except Exception:
             pass  # column already exists
+    # Migrate existing DBs that predate the paper column
+    try:
+        conn.execute("ALTER TABLE positions ADD COLUMN paper INTEGER NOT NULL DEFAULT 0")
+    except Exception:
+        pass
     conn.commit()
     conn.close()

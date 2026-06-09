@@ -52,19 +52,23 @@ class Position:
 
 
 class PositionManager:
-    def __init__(self):
+    def __init__(self, paper_mode: bool = False):
+        self.paper_mode = paper_mode
         # symbol -> Position (only one per symbol at a time)
         self.positions: dict[str, Position] = {}
         self._load_open_positions()
 
     def _load_open_positions(self):
+        """Only load positions matching the current run mode — live runs ignore paper rows, vice versa."""
+        paper_val = 1 if self.paper_mode else 0
         conn = get_connection()
         rows = conn.execute(
             "SELECT id, symbol, hl_coin, aster_symbol, direction, status, "
             "entry_time, entry_spread_bps, hl_entry_price, aster_entry_price, "
             "hl_entry_order_id, aster_entry_order_id, qty, notional_usd, "
             "exit_time, hl_exit_order_id, aster_exit_order_id "
-            "FROM positions WHERE status NOT IN ('closed', 'error')"
+            "FROM positions WHERE status NOT IN ('closed', 'error') AND paper=?",
+            (paper_val,)
         ).fetchall()
         conn.close()
         for r in rows:
@@ -107,11 +111,12 @@ class PositionManager:
             "INSERT INTO positions "
             "(symbol, hl_coin, aster_symbol, direction, status, entry_time, "
             "entry_spread_bps, hl_entry_price, hl_entry_order_id, "
-            "aster_entry_order_id, qty, notional_usd) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "aster_entry_order_id, qty, notional_usd, paper) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (symbol, hl_coin, aster_symbol, direction, "entering", entry_time,
              entry_spread_bps, hl_entry_price, hl_order_id,
-             aster_entry_order_id, qty, notional_usd),
+             aster_entry_order_id, qty, notional_usd,
+             1 if self.paper_mode else 0),
         )
         conn.commit()
         pid = cur.lastrowid
@@ -149,6 +154,28 @@ class PositionManager:
         conn.close()
         log.info(
             f"Position #{pos.id} OPEN: {symbol} | "
+            f"HL @ {pos.hl_entry_price:.2f} | Aster @ {aster_fill_price:.2f}"
+        )
+
+    def confirm_aster_entry_partial(
+        self, symbol: str, aster_fill_price: float, matched_qty: float
+    ):
+        """Aster maker partial-fill at entry timeout: shrink position to matched qty, open it."""
+        pos = self.positions.get(symbol)
+        if not pos or pos.status != "entering":
+            return
+        pos.qty = matched_qty
+        pos.aster_entry_price = aster_fill_price
+        pos.status = "open"
+        conn = get_connection()
+        conn.execute(
+            "UPDATE positions SET status='open', aster_entry_price=?, qty=? WHERE id=?",
+            (aster_fill_price, matched_qty, pos.id),
+        )
+        conn.commit()
+        conn.close()
+        log.warning(
+            f"Position #{pos.id} OPEN (partial): {symbol} | qty shrunk to {matched_qty} | "
             f"HL @ {pos.hl_entry_price:.2f} | Aster @ {aster_fill_price:.2f}"
         )
 
