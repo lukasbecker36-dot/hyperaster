@@ -1,0 +1,346 @@
+"""
+Live monitor for equity perp arb: AsterDEX vs Hyperliquid XYZ.
+
+Watches all overlapping equity perps simultaneously.
+Uses Aster GTX (post-only maker) + Hyperliquid IOC (taker).
+
+Usage:
+    python live_monitor.py --paper       # paper mode (default)
+    python live_monitor.py --live        # live mode (real orders)
+    python live_monitor.py --symbols AAPL NVDA TSLA  # specific symbols only
+"""
+
+import argparse
+import asyncio
+import logging
+import os
+import sys
+import time
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+# UTF-8 console output on Windows
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+from auth import load_api_keys, now_ms
+from config import (
+    POLL_INTERVAL_SECONDS, ASTER_FILL_POLL_SECONDS,
+    ENTRY_THRESHOLD_BPS, ENTRY_THRESHOLD_BPS_BY_SYMBOL,
+    EXIT_THRESHOLD_BPS, MAX_HOLD_HOURS, MAX_CONCURRENT_POSITIONS,
+    HEARTBEAT_INTERVAL_MINUTES, PAPER_MODE, DATA_DIR, OUTPUT_DIR,
+    BLOCKED_SYMBOLS,
+)
+
+SLOW_SCAN_INTERVAL_SECONDS = 300   # re-rank all symbols every 5 min
+FAST_CANDIDATES = 3                # symbols to poll every tick between slow scans
+from database import init_db
+from exchange_client import ExchangeClient
+from position_manager import PositionManager
+from executor import Executor
+
+# ── Logging ──
+
+def setup_logging():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    fh = RotatingFileHandler(
+        os.path.join(DATA_DIR, "monitor.log"),
+        maxBytes=10 * 1024 * 1024, backupCount=7,
+    )
+    fh.setFormatter(formatter)
+    fh.setLevel(logging.DEBUG)
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(formatter)
+    ch.setLevel(logging.INFO)
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    root.addHandler(fh)
+    root.addHandler(ch)
+
+
+log = logging.getLogger(__name__)
+
+
+def load_symbols(override: list[str] | None) -> list[dict]:
+    """Load the overlapping equity perp universe from fetch_data output."""
+    if override:
+        return [{"coin": s, "hl_coin": f"xyz:{s}", "aster_symbol": f"{s}USDT"}
+                for s in override]
+
+    overlap_path = Path(OUTPUT_DIR) / "overlap_symbols.csv"
+    if not overlap_path.exists():
+        log.error(
+            "No overlap_symbols.csv found. Run fetch_data.py first to discover "
+            "overlapping equity perps."
+        )
+        sys.exit(1)
+
+    import pandas as pd
+    df = pd.read_csv(overlap_path)
+    symbols = df.to_dict("records")
+    log.info(f"Loaded {len(symbols)} symbols from overlap_symbols.csv")
+    return symbols
+
+
+async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
+    symbol_rows = load_symbols(symbol_filter)
+    symbols = [r["coin"] for r in symbol_rows if r["coin"] not in BLOCKED_SYMBOLS]
+    blocked = [r["coin"] for r in symbol_rows if r["coin"] in BLOCKED_SYMBOLS]
+    if blocked:
+        log.info(f"Excluded blocked symbols: {blocked}")
+
+    log.info("=" * 70)
+    log.info("EQUITY PERP ARB MONITOR — Aster vs Hyperliquid XYZ")
+    log.info(f"Mode:         {'PAPER' if paper_mode else 'LIVE'}")
+    log.info(f"Symbols ({len(symbols)}): {symbols}")
+    log.info(f"Poll:         {POLL_INTERVAL_SECONDS}s main | {ASTER_FILL_POLL_SECONDS}s Aster fill poll")
+    log.info(f"Max positions: {MAX_CONCURRENT_POSITIONS}")
+    log.info("=" * 70)
+
+    init_db()
+
+    try:
+        api_keys = load_api_keys()
+    except EnvironmentError as e:
+        if paper_mode:
+            log.warning(f"API keys missing ({e}) — OK for paper mode")
+            api_keys = {
+                "aster_api_key": "", "aster_api_secret": "",
+                "aster_wallet_address": "", "aster_signer_address": "",
+                "hl_private_key": "", "hl_wallet_address": "",
+            }
+        else:
+            log.error(f"Cannot start live: {e}")
+            return
+
+    client = ExchangeClient(api_keys)
+    await client.start(symbols)
+
+    # Verify all specs loaded
+    missing = [s for s in symbols if s not in client.aster_specs or s not in client.hl_specs]
+    if missing:
+        log.warning(f"Specs not loaded for: {missing} — these will be skipped")
+        symbols = [s for s in symbols if s not in missing]
+
+    if not symbols:
+        log.error("No valid symbols. Exiting.")
+        return
+
+    pm = PositionManager()
+    executor = Executor(client, pm, paper_mode=paper_mode)
+
+    # Crash recovery: log any positions found in DB
+    if pm.positions:
+        for sym, pos in pm.positions.items():
+            log.warning(
+                f"Crash recovery: {sym} position #{pos.id} status={pos.status} "
+                f"qty={pos.qty} direction={pos.direction}"
+            )
+
+    start_time = now_ms()
+    last_heartbeat = start_time
+    last_aster_poll = 0
+    last_slow_scan = 0
+    tick_count = 0
+    consecutive_errors = 0
+    # symbol -> (excess_bps, direction_str, oracle_delta_bps) from last scan
+    latest_spreads: dict[str, tuple[float, str, float]] = {}
+    # top N candidates polled every fast tick
+    candidates: list[str] = []
+
+    async def scan_symbol(symbol: str) -> tuple[str, float, str, float, object, object] | None:
+        """Fetch books and return (symbol, abs_excess_bps, direction, oracle_delta_bps, aster_book, hl_book).
+
+        excess_bps = cross_bps - oracle_delta_bps removes the structural index price
+        difference between the two exchanges, leaving only the convergeable spread.
+        """
+        try:
+            aster_book, hl_book = await client.get_both_books(symbol)
+            if aster_book.bid <= 0 or hl_book.bid <= 0:
+                return None
+            mid = (aster_book.mid + hl_book.mid) / 2
+            if mid <= 0:
+                return None
+            cross_bps = (aster_book.mid - hl_book.mid) / mid * 10000
+
+            aster_index = client.get_aster_index(symbol)
+            hl_oracle = client.get_hl_oracle(symbol)
+            oracle_delta_bps = (
+                (aster_index - hl_oracle) / mid * 10000
+                if aster_index > 0 and hl_oracle > 0 else 0.0
+            )
+            excess_bps = cross_bps - oracle_delta_bps
+            direction = "L-HL/S-AST" if excess_bps < 0 else "L-AST/S-HL"
+            return symbol, abs(excess_bps), direction, oracle_delta_bps, aster_book, hl_book
+        except Exception as e:
+            log.debug(f"scan_symbol {symbol}: {e}")
+            return None
+
+    async def process_result(result):
+        """Act on a scan result — check entry/exit conditions."""
+        if result is None:
+            return
+        symbol, abs_excess_bps, direction, oracle_delta_bps, aster_book, hl_book = result
+        latest_spreads[symbol] = (abs_excess_bps, direction, oracle_delta_bps)
+        abs_spread_bps = abs_excess_bps  # alias for clarity below
+        pos = pm.get(symbol)
+        nonlocal consecutive_errors
+        try:
+            if pos and pos.status == "open":
+                elapsed_hours = (now_ms() - pos.entry_time) / 3_600_000
+                should_exit, reason = False, ""
+                if abs_spread_bps <= EXIT_THRESHOLD_BPS:
+                    should_exit, reason = True, "converged"
+                elif elapsed_hours >= MAX_HOLD_HOURS:
+                    should_exit, reason = True, "timeout"
+                if should_exit:
+                    await executor.try_exit(symbol, aster_book, hl_book, reason)
+            elif not pos:
+                if pm.active_count < MAX_CONCURRENT_POSITIONS:
+                    await executor.try_entry(symbol, aster_book, hl_book)
+        except Exception as e:
+            log.error(f"Error processing {symbol}: {e}")
+            consecutive_errors += 1
+
+    try:
+        while True:
+            tick_start = time.time()
+            tick_count += 1
+            now = now_ms()
+
+            # ── 1. Poll Aster maker orders (entering/exiting) ──
+            if now - last_aster_poll >= ASTER_FILL_POLL_SECONDS * 1000:
+                last_aster_poll = now
+                pending = [s for s, p in pm.positions.items()
+                           if p.status in ("entering", "exiting")]
+                if pending and not paper_mode:
+                    await asyncio.gather(*[executor.poll_aster_maker(s) for s in pending])
+
+            # ── 2. Slow scan: rank all symbols every 5 min ──
+            if now - last_slow_scan >= SLOW_SCAN_INTERVAL_SECONDS * 1000:
+                last_slow_scan = now
+                await client.refresh_hl_oracles(symbols)
+                all_results = await asyncio.gather(*[scan_symbol(s) for s in symbols])
+                open_syms = set(pm.positions.keys())
+                ranked = sorted(
+                    [r for r in all_results if r and r[0] not in open_syms],
+                    key=lambda r: r[1] / ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(r[0], ENTRY_THRESHOLD_BPS),
+                    reverse=True,
+                )
+                candidates = [r[0] for r in ranked[:FAST_CANDIDATES]]
+                for r in all_results:
+                    if r:
+                        await process_result(r)
+                thresh_strs = " | ".join(
+                    f"{s} {spd:.1f}/{ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(s, ENTRY_THRESHOLD_BPS):.0f}bps (d={odelta:+.1f})"
+                    for s, spd, _, odelta, *_ in ranked[:5]
+                )
+                log.info(f"Slow scan | Watching: {candidates} | Top 5: {thresh_strs}")
+
+            # ── 3. Fast tick: poll candidates + open positions ──
+            open_syms = set(pm.positions.keys())
+            fast_syms = list(dict.fromkeys(list(open_syms) + candidates))
+            fast_results = await asyncio.gather(*[scan_symbol(s) for s in fast_syms])
+            for r in fast_results:
+                await process_result(r)
+
+            # ── 4. Periodic tick log ──
+            if tick_count % 20 == 0:
+                pos_str = ""
+                if pm.positions:
+                    pos_str = " | " + ", ".join(
+                        f"{s}[{p.status} {(now_ms()-p.entry_time)/3_600_000:.1f}h]"
+                        for s, p in pm.positions.items()
+                    )
+                cand_str = "  ".join(
+                    f"{s}:{latest_spreads.get(s,(0,'',0.0))[0]:.1f}/{ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(s, ENTRY_THRESHOLD_BPS):.0f}bps"
+                    for s in candidates
+                ) or "pending scan"
+                log.info(
+                    f"Tick {tick_count} | Active: {pm.active_count}{pos_str} | "
+                    f"Watching: {cand_str}"
+                )
+                consecutive_errors = 0
+
+            # ── 5. Heartbeat ──
+            elapsed_hb = (now_ms() - last_heartbeat) / 60_000
+            if elapsed_hb >= HEARTBEAT_INTERVAL_MINUTES:
+                uptime = (now_ms() - start_time) / 60_000
+
+                # Open positions summary
+                pos_lines = []
+                for sym, pos in pm.positions.items():
+                    elapsed_h = (now_ms() - pos.entry_time) / 3_600_000
+                    cur_spread = latest_spreads.get(sym, (0.0, "", 0.0))[0]
+                    pos_lines.append(
+                        f"  {sym} [{pos.status}] entry={pos.entry_spread_bps:.1f}bps "
+                        f"now={cur_spread:.1f}bps hold={elapsed_h:.1f}h"
+                    )
+
+                # Top 5 symbols closest to entry threshold (no open position)
+                open_syms = set(pm.positions.keys())
+                spread_ranking = [
+                    (sym, spd, drn, odelta)
+                    for sym, (spd, drn, odelta) in latest_spreads.items()
+                    if sym not in open_syms
+                ]
+                spread_ranking.sort(key=lambda x: x[1], reverse=True)
+                watch_lines = [
+                    f"  {sym}: excess={spd:.1f}/{ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(sym, ENTRY_THRESHOLD_BPS):.0f}bps  d={odelta:+.1f}bps  ({drn})"
+                    for sym, spd, drn, odelta in spread_ranking[:5]
+                ]
+
+                log.info(
+                    f"HEARTBEAT | uptime={uptime:.0f}min | ticks={tick_count} | "
+                    f"positions={pm.active_count}/{MAX_CONCURRENT_POSITIONS} | "
+                    f"threshold={ENTRY_THRESHOLD_BPS:.0f}bps\n"
+                    + (("  Open positions:\n" + "\n".join(pos_lines) + "\n") if pos_lines else "  No open positions\n")
+                    + "  Closest to entry:\n" + ("\n".join(watch_lines) if watch_lines else "  (no data yet)")
+                )
+                last_heartbeat = now_ms()
+
+            elapsed = time.time() - tick_start
+            await asyncio.sleep(max(0, POLL_INTERVAL_SECONDS - elapsed))
+
+    except KeyboardInterrupt:
+        log.info("Stopped by user (Ctrl+C)")
+    finally:
+        await client.close()
+        log.info("Monitor shut down")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Equity Perp Arb Monitor (Aster vs HL)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--paper", action="store_true")
+    mode.add_argument("--live", action="store_true")
+    parser.add_argument("--symbols", nargs="*", help="Override symbols (e.g. AAPL NVDA)")
+    args = parser.parse_args()
+
+    if args.paper:
+        paper_mode = True
+    elif args.live:
+        paper_mode = False
+    else:
+        paper_mode = PAPER_MODE
+
+    setup_logging()
+
+    try:
+        asyncio.run(run_monitor(paper_mode, args.symbols))
+    except Exception as e:
+        log.exception(f"Fatal error: {e}")
+
+
+if __name__ == "__main__":
+    main()
