@@ -134,8 +134,24 @@ class Executor:
         )
 
         if self.paper_mode:
-            log.info(f"[PAPER] Would enter {symbol} — skipping orders")
-            return False
+            log.info(
+                f"[PAPER] ENTRY {symbol}: {direction} | excess={spread_bps:.1f}bps | "
+                f"qty={qty} | HL {hl_side} @ {hl_ref_price:.2f} | Aster {aster_side} @ {aster_ref_price:.2f}"
+            )
+            self.pm.open_entering(
+                symbol=symbol,
+                hl_coin=f"xyz:{symbol}",
+                aster_symbol=f"{symbol}USDT",
+                direction=direction,
+                entry_spread_bps=spread_bps,
+                hl_entry_price=hl_ref_price,
+                hl_order_id="PAPER",
+                aster_entry_order_id="PAPER",
+                qty=qty,
+                notional_usd=NOTIONAL_PER_LEG,
+            )
+            self.pm.confirm_aster_entry(symbol, aster_ref_price)
+            return True
 
         # Pre-trade recheck
         try:
@@ -349,8 +365,18 @@ class Executor:
             return False
 
         if self.paper_mode:
-            log.info(f"[PAPER] Would exit {symbol} ({reason})")
-            return False
+            mid = (aster_book.mid + hl_book.mid) / 2
+            exit_spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000 if mid > 0 else 0
+            if pos.direction == "long_hl_short_aster":
+                hl_exit_px = hl_book.bid
+                aster_exit_px = aster_book.ask
+            else:
+                hl_exit_px = hl_book.ask
+                aster_exit_px = aster_book.bid
+            self.pm.start_exiting(symbol, "PAPER", "PAPER", hl_exit_px, exit_spread_bps)
+            self.pm.confirm_aster_exit(symbol, aster_exit_px, reason)
+            log.info(f"[PAPER] EXIT {symbol} ({reason}) | spread={exit_spread_bps:.1f}bps")
+            return True
 
         # HL close (taker)
         if pos.direction == "long_hl_short_aster":
