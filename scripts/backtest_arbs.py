@@ -32,7 +32,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src import aster, history, hyperliquid as hl
 from src.fees import ROUND_TRIP_MAKER_BPS, ROUND_TRIP_TAKER_BPS
-from config import ENTRY_THRESHOLD_BPS_BY_SYMBOL, ENTRY_THRESHOLD_BPS, BLOCKED_SYMBOLS
+from config import (
+    ENTRY_THRESHOLD_BPS_BY_SYMBOL, ENTRY_THRESHOLD_BPS, BLOCKED_SYMBOLS,
+    NOTIONAL_PER_LEG, MAX_CONCURRENT_POSITIONS,
+)
 
 HOUR_MS = history.HOUR_MS
 
@@ -190,6 +193,104 @@ def backtest_symbol(
     }
 
 
+def backtest_portfolio(
+    panels: dict[str, pd.DataFrame], thresholds: dict[str, float],
+    exit_bps: float, max_hold_h: int, max_slots: int,
+    cost_taker: float, cost_maker: float,
+) -> dict:
+    """Capacity-aware sim across ALL symbols on one timeline with a shared slot cap.
+
+    Unlike backtest_symbol (which runs each name independently with unlimited
+    capital), this walks the union hourly clock and holds at most `max_slots`
+    positions at once. When more entry signals fire than free slots, they are
+    filled best-first by margin over threshold — the live executor's edge-rank
+    intent. This is the realistic P&L ceiling the per-symbol sum cannot show.
+    """
+    # Precompute per-symbol structural gap + O(1) timestamp lookup.
+    sym_data: dict[str, dict] = {}
+    all_ts: set[int] = set()
+    for sym, df in panels.items():
+        structural = float(df["spread_bps"].median())
+        recs: dict[int, dict] = {}
+        for ts, r in df.iterrows():
+            recs[int(ts)] = {
+                "excess": float(r["spread_bps"]) - structural,
+                "hl_fund": float(r["hl_fund"]),
+                "aster_fund_hr": float(r["aster_fund_hr"]),
+            }
+        sym_data[sym] = recs
+        all_ts.update(recs)
+
+    open_pos: dict[str, dict] = {}
+    trades: list[dict] = []
+    slot_hours_used = 0
+
+    for ts in sorted(all_ts):
+        exited_now: set[str] = set()
+        # 1. Exits — only evaluate a position on hours its symbol has data.
+        for sym in list(open_pos.keys()):
+            rec = sym_data[sym].get(ts)
+            if rec is None:
+                continue
+            pos = open_pos[sym]
+            pos["hold"] += 1
+            pos["carry_acc"] += carry_bps_hr(rec, pos["direction"])
+            slot_hours_used += 1
+            abs_excess = abs(rec["excess"])
+            if abs_excess <= exit_bps or pos["hold"] >= max_hold_h:
+                conv = pos["entry_abs"] - abs_excess
+                gross = conv + pos["carry_acc"]
+                trades.append({
+                    "sym": sym, "hold_h": pos["hold"],
+                    "net_taker": gross - cost_taker,
+                    "net_maker": gross - cost_maker,
+                    "exit_reason": "converged" if abs_excess <= exit_bps else "timeout",
+                })
+                del open_pos[sym]
+                exited_now.add(sym)
+
+        # 2. Entries — rank free-slot candidates best-first by margin over threshold.
+        free = max_slots - len(open_pos)
+        if free <= 0:
+            continue
+        candidates = []
+        for sym, recs in sym_data.items():
+            if sym in open_pos or sym in exited_now:
+                continue
+            rec = recs.get(ts)
+            if rec is None:
+                continue
+            thr = thresholds.get(sym, ENTRY_THRESHOLD_BPS)
+            margin = abs(rec["excess"]) - thr
+            if margin >= 0:
+                candidates.append((margin, sym, rec))
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        for _margin, sym, rec in candidates[:free]:
+            open_pos[sym] = {
+                "direction": "BUY_HL" if rec["excess"] > 0 else "BUY_ASTER",
+                "entry_abs": abs(rec["excess"]),
+                "hold": 0,
+                "carry_acc": 0.0,
+            }
+
+    if not trades:
+        return {"n_trades": 0}
+    t = pd.DataFrame(trades)
+    horizon_h = (max(all_ts) - min(all_ts)) / history.HOUR_MS if all_ts else 0
+    return {
+        "n_trades": len(t),
+        "total_net_taker": t["net_taker"].sum(),
+        "total_net_maker": t["net_maker"].sum(),
+        "win_rate_taker": (t["net_taker"] > 0).mean() * 100,
+        "win_rate_maker": (t["net_maker"] > 0).mean() * 100,
+        "avg_hold_h": t["hold_h"].mean(),
+        "pct_timeout": (t["exit_reason"] == "timeout").mean() * 100,
+        "slot_hours_used": slot_hours_used,
+        "slot_hours_avail": max_slots * horizon_h,
+        "by_sym": t.groupby("sym")["net_taker"].agg(["count", "sum"]).sort_values("sum", ascending=False),
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Historical HL<->Aster arb backtest")
     ap.add_argument("--days", type=int, default=30, help="lookback window (default 30)")
@@ -201,6 +302,8 @@ def main() -> None:
                     help="max hold hours before forced exit (default 168 = 1wk)")
     ap.add_argument("--bo-bps", type=float, default=15.0,
                     help="estimated round-trip bid/offer cost bps, both legs (default 15)")
+    ap.add_argument("--slots", type=int, default=MAX_CONCURRENT_POSITIONS,
+                    help=f"concurrent position cap for portfolio sim (default {MAX_CONCURRENT_POSITIONS})")
     args = ap.parse_args()
 
     cost_taker = float(ROUND_TRIP_TAKER_BPS) + args.bo_bps
@@ -290,6 +393,39 @@ def main() -> None:
                   f"avg hold {r['avg_hold_h']:.0f}h")
     else:
         print("\n  No symbol was net-profitable over the window under these assumptions.")
+
+    # ── Portfolio sim (capacity-aware) ────────────────────────────────────────
+    sim_panels = {s: df for s, df in panels.items() if s not in BLOCKED_SYMBOLS}
+    thr_map = {
+        s: (ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(s, ENTRY_THRESHOLD_BPS) if use_per_symbol else global_entry)
+        for s in sim_panels
+    }
+    pf = backtest_portfolio(
+        sim_panels, thr_map, args.exit, args.max_hold, args.slots, cost_taker, cost_maker
+    )
+    print(f"""
+{'='*108}
+ PORTFOLIO SIMULATION  |  {args.slots} concurrent slots, best-first by edge  (the per-symbol sum above ignores this cap)
+{'='*108}""")
+    if pf["n_trades"] == 0:
+        print("  No trades.")
+    else:
+        util = 100 * pf["slot_hours_used"] / pf["slot_hours_avail"] if pf["slot_hours_avail"] else 0
+        notional = float(NOTIONAL_PER_LEG)
+        print(
+            f"  Trades:        {pf['n_trades']}  (vs {len(summary)} symbols' independent runs above)\n"
+            f"  Win rate:      {pf['win_rate_taker']:.0f}% taker / {pf['win_rate_maker']:.0f}% maker\n"
+            f"  Avg hold:      {pf['avg_hold_h']:.1f}h   |  timeout exits: {pf['pct_timeout']:.0f}%\n"
+            f"  Slot usage:    {pf['slot_hours_used']:.0f} / {pf['slot_hours_avail']:.0f} position-hours "
+            f"({util:.0f}% of {args.slots}-slot capacity)\n"
+            f"  ── Total P&L over window (notional ${notional:,.0f}/leg) ──\n"
+            f"     TAKER entry:  {pf['total_net_taker']:+,.0f} bps  →  ${pf['total_net_taker']/10000*notional:+,.0f}\n"
+            f"     MAKER entry:  {pf['total_net_maker']:+,.0f} bps  →  ${pf['total_net_maker']/10000*notional:+,.0f}"
+        )
+        print("\n  Top contributors (taker, captured under the cap):")
+        for sym, row in pf["by_sym"].head(8).iterrows():
+            print(f"    {sym:<6} {int(row['count']):>3} trades  {row['sum']/10000*notional:+,.0f}$ "
+                  f"({row['sum']:+.0f}bps)")
 
     print(f"""
 CAVEATS:
