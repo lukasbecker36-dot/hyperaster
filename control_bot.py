@@ -479,6 +479,25 @@ def main():
         raise SystemExit("No allowed chat IDs — set ALERT_TELEGRAM_CHAT_ID or CONTROL_TELEGRAM_CHAT_IDS")
     print(f"Control bot up. service={SERVICE} allowed={ALLOWED} python={PYTHON}", flush=True)
 
+    try:
+        _api("setMyCommands", {"commands": json.dumps([
+            {"command": "status", "description": "Service state + spreads + positions"},
+            {"command": "spreads", "description": "Current spread vs threshold"},
+            {"command": "positions", "description": "Open positions detail"},
+            {"command": "pnl", "description": "Realised P&L today + all-time"},
+            {"command": "log", "description": "Last n journal lines"},
+            {"command": "mode", "description": "Show configured mode"},
+            {"command": "paper", "description": "Switch to paper mode"},
+            {"command": "live", "description": "Switch to live mode (YES to confirm)"},
+            {"command": "start", "description": "Start trader"},
+            {"command": "stop", "description": "Stop trader (YES to confirm)"},
+            {"command": "restart", "description": "Git pull + restart"},
+            {"command": "flatten", "description": "Emergency close ALL positions"},
+            {"command": "help", "description": "Command list"},
+        ])}, timeout=10)
+    except Exception as e:
+        print(f"setMyCommands failed: {e}", flush=True)
+
     offset = 0
     while True:
         try:
