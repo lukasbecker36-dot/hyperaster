@@ -89,33 +89,36 @@ HEARTBEAT_INTERVAL_MINUTES = 60
 # Derived from p75 of historical cross-exchange spread, rounded to nearest 5bps.
 # Symbols not listed fall back to ENTRY_THRESHOLD_BPS.
 ENTRY_THRESHOLD_BPS_BY_SYMBOL: dict = {
-    "BIRD":    260,  # excess p75=260bps  oracle_delta=-123bps
-    "HIMS":    175,  # excess p75=177bps  oracle_delta=+19bps
-    "CRWV":    140,  # excess p75=141bps  oracle_delta=-6bps
-    "NOW":     115,  # excess p75=113bps  oracle_delta=+12bps
-    "ARM":     100,  # excess p75=102bps  oracle_delta=-24bps
-    "HYUNDAI": 100,  # excess p75=102bps  oracle_delta=-23bps
-    "RKLB":    100,  # excess p75=98bps   oracle_delta=-4bps
-    "DRAM":     95,  # excess p75=93bps   oracle_delta=-20bps
-    "PLTR":     85,  # excess p75=85bps   oracle_delta=+1bps
-    "COIN":     80,  # excess p75=81bps   oracle_delta=-13bps
-    "LITE":     75,  # excess p75=76bps   oracle_delta=-17bps
-    "ORCL":     70,  # excess p75=69bps   oracle_delta=-0bps
-    "AMD":      65,  # excess p75=64bps   oracle_delta=-3bps
-    "DELL":     60,  # excess p75=58bps   oracle_delta=-8bps
-    "HOOD":     60,  # excess p75=62bps   oracle_delta=+1bps
-    "BABA":     55,  # excess p75=55bps   oracle_delta=-16bps
-    "AVGO":     50,  # excess p75=52bps   oracle_delta=+2bps
-    "IBM":      50,  # excess p75=52bps   oracle_delta=-12bps
-    "MRVL":     45,  # excess p75=46bps   oracle_delta=-7bps
-    "CBRS":     40,  # excess p75=40bps   oracle_delta=-16bps
-    "INTC":     40,  # excess p75=40bps   oracle_delta=+0bps
-    "META":     40,  # excess p75=41bps   oracle_delta=-2bps
-    "MSTR":     40,  # excess p75=42bps   oracle_delta=-4bps
-    "SNDK":     40,  # excess p75=38bps   oracle_delta=+4bps
-    "SKHX":     80,  # PROVISIONAL — Korean (SK Hynix). Replace with p75 after fetch_data history
-    "SMSN":     80,  # PROVISIONAL — Korean (Samsung).  Replace with p75 after fetch_data history
-    "MSFT":     35,  # excess p75=33bps   oracle_delta=-4bps
+    "BIRD":    240,  # excess p75=239bps  oracle_delta=-115bps
+    "HIMS":    195,  # excess p75=196bps  oracle_delta=+25bps
+    "NBIS":    195,  # excess p75=193bps  oracle_delta=-58bps
+    "CRWV":    170,  # excess p75=168bps  oracle_delta=-6bps
+    "HYUNDAI": 135,  # excess p75=137bps  oracle_delta=-23bps
+    "ARM":     105,  # excess p75=103bps  oracle_delta=-23bps
+    "NOW":     100,  # excess p75=98bps   oracle_delta=-1bps
+    "RKLB":     95,  # excess p75=97bps   oracle_delta=-4bps
+    "COIN":     85,  # excess p75=83bps   oracle_delta=-12bps
+    "PLTR":     85,  # excess p75=87bps   oracle_delta=+3bps
+    "SKHX":     85,  # excess p75=87bps   oracle_delta=-53bps  (Korean: SK Hynix)
+    "SMSN":     85,  # excess p75=85bps   oracle_delta=-43bps  (Korean: Samsung)
+    "DRAM":     80,  # excess p75=78bps   oracle_delta=-18bps
+    "LITE":     80,  # excess p75=82bps   oracle_delta=-17bps
+    "DELL":     75,  # excess p75=77bps   oracle_delta=-8bps
+    "AMD":      70,  # excess p75=69bps   oracle_delta=-4bps
+    "ORCL":     70,  # excess p75=71bps   oracle_delta=+1bps
+    "HOOD":     65,  # excess p75=65bps   oracle_delta=-0bps
+    "WDC":      60,  # excess p75=60bps   oracle_delta=-1bps
+    "BABA":     55,  # excess p75=56bps   oracle_delta=-15bps
+    "IBM":      55,  # excess p75=55bps   oracle_delta=-16bps
+    "AVGO":     45,  # excess p75=46bps   oracle_delta=+2bps
+    "LLY":      45,  # excess p75=46bps   oracle_delta=-27bps
+    "META":     45,  # excess p75=43bps   oracle_delta=-2bps
+    "MRVL":     45,  # excess p75=47bps   oracle_delta=-5bps
+    "CBRS":     40,  # excess p75=41bps   oracle_delta=-16bps
+    "INTC":     40,  # excess p75=38bps   oracle_delta=-0bps
+    "MSTR":     40,  # excess p75=40bps   oracle_delta=-4bps
+    "MSFT":     35,  # excess p75=35bps   oracle_delta=-3bps
+    "SNDK":     35,  # excess p75=37bps   oracle_delta=+4bps
     "AAPL":     30,  # (default)
     "AMZN":     30,  # (default)
     "CRCL":     30,  # (default)
