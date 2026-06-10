@@ -408,12 +408,51 @@ def cmd_spreads(chat_id: str, _arg: str):
          f"🔍 Top 5 (with oracle delta):\n{top5}")
 
 
+def cmd_trades(chat_id: str, arg: str):
+    """Show last N closed trades with full P&L breakdown."""
+    n = 5
+    if arg.strip().isdigit():
+        n = min(int(arg.strip()), 20)
+    try:
+        rows = query_db(
+            "SELECT symbol, direction, entry_spread_bps, exit_spread_bps, "
+            "hl_entry_price, hl_exit_price, aster_entry_price, aster_exit_price, "
+            "qty, notional_usd, gross_pnl, fee_cost, net_pnl, exit_reason, "
+            "entry_time, exit_time, paper "
+            "FROM positions WHERE status='closed' "
+            "ORDER BY exit_time DESC LIMIT ?",
+            (n,),
+        )
+    except Exception as e:
+        send(chat_id, f"DB error: {e}")
+        return
+    if not rows:
+        send(chat_id, "No closed trades yet.")
+        return
+    lines = [f"📋 Last {len(rows)} trade(s):"]
+    for (sym, direction, entry_sp, exit_sp, hl_in, hl_out, ast_in, ast_out,
+         qty, notional, gross, fees, net, reason, etime, xtime, paper) in rows:
+        tag = " [paper]" if paper else ""
+        held_h = ((xtime or 0) - (etime or 0)) / 3_600_000
+        short_dir = "HL↑ Ast↓" if "long_hl" in (direction or "") else "HL↓ Ast↑"
+        lines.append(
+            f"\n• {sym}{tag} {short_dir} — {reason}\n"
+            f"  entry spread={entry_sp or 0:.1f}bps → exit={exit_sp or 0:.1f}bps\n"
+            f"  HL: {hl_in:.2f}→{hl_out:.2f}  Ast: {ast_in:.2f}→{ast_out:.2f}\n"
+            f"  qty={qty}  notional=${notional or 0:.0f}\n"
+            f"  gross=${gross:.4f}  fees=${fees:.4f}  net=${net:.4f}\n"
+            f"  held={held_h:.1f}h"
+        )
+    send(chat_id, "\n".join(lines))
+
+
 def cmd_help(chat_id: str, _arg: str):
     send(chat_id,
          "Commands:\n"
          "/status — service state + spreads + positions\n"
          "/spreads — current spread vs threshold detail\n"
          "/positions — open positions detail\n"
+         "/trades [n] — last n closed trades with P&L detail\n"
          "/pnl — realised P&L (today + all-time)\n"
          "/log [n] — last n journal lines\n"
          "/mode — show configured mode\n"
@@ -427,7 +466,8 @@ def cmd_help(chat_id: str, _arg: str):
 
 HANDLERS = {
     "/status": cmd_status, "/positions": cmd_positions, "/pos": cmd_positions,
-    "/pnl": cmd_pnl, "/log": cmd_log, "/logs": cmd_log,
+    "/pnl": cmd_pnl, "/trades": cmd_trades,
+    "/log": cmd_log, "/logs": cmd_log,
     "/spreads": cmd_spreads, "/spread": cmd_spreads,
     "/mode": cmd_mode, "/paper": cmd_paper, "/live": cmd_live,
     "/start": cmd_start, "/stop": cmd_stop, "/restart": cmd_restart,
@@ -484,6 +524,7 @@ def main():
             {"command": "status", "description": "Service state + spreads + positions"},
             {"command": "spreads", "description": "Current spread vs threshold"},
             {"command": "positions", "description": "Open positions detail"},
+            {"command": "trades", "description": "Last N closed trades with P&L"},
             {"command": "pnl", "description": "Realised P&L today + all-time"},
             {"command": "log", "description": "Last n journal lines"},
             {"command": "mode", "description": "Show configured mode"},
