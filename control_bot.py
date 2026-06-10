@@ -251,36 +251,49 @@ def cmd_positions(chat_id: str, _arg: str):
     send(chat_id, "\n".join(lines))
 
 
+def _pnl_for_mode(paper: int) -> tuple[int, float, int, float, int]:
+    """Return (n_all, pnl_all, n_today, pnl_today, n_err) for a given mode."""
+    rows = query_db(
+        "SELECT COUNT(*), COALESCE(SUM(net_pnl),0) FROM positions "
+        "WHERE status='closed' AND paper=?", (paper,),
+    )
+    n_all, pnl_all = rows[0]
+    midnight = int(time.time()) - (int(time.time()) % 86400)
+    rows = query_db(
+        "SELECT COUNT(*), COALESCE(SUM(net_pnl),0) FROM positions "
+        "WHERE status='closed' AND paper=? AND exit_time >= ?",
+        (paper, midnight * 1000),
+    )
+    n_today, pnl_today = rows[0]
+    rows = query_db(
+        "SELECT COUNT(*) FROM positions WHERE status='error' AND paper=?",
+        (paper,),
+    )
+    n_err = rows[0][0]
+    return n_all, pnl_all, n_today, pnl_today, n_err
+
+
 def cmd_pnl(chat_id: str, _arg: str):
     try:
-        # All-time realised (live only)
-        rows = query_db(
-            "SELECT COUNT(*), COALESCE(SUM(net_pnl),0) FROM positions "
-            "WHERE status='closed' AND paper=0"
-        )
-        n_all, pnl_all = rows[0]
-        # Today (UTC midnight in ms)
-        midnight = int(time.time()) - (int(time.time()) % 86400)
-        rows = query_db(
-            "SELECT COUNT(*), COALESCE(SUM(net_pnl),0) FROM positions "
-            "WHERE status='closed' AND paper=0 AND exit_time >= ?",
-            (midnight * 1000,),
-        )
-        n_today, pnl_today = rows[0]
-        # Errors needing attention
-        rows = query_db(
-            "SELECT COUNT(*) FROM positions WHERE status='error' AND paper=0"
-        )
-        n_err = rows[0][0]
+        sections = []
+        for label, paper_val in [("LIVE", 0), ("PAPER", 1)]:
+            n_all, pnl_all, n_today, pnl_today, n_err = _pnl_for_mode(paper_val)
+            if n_all == 0 and n_today == 0 and n_err == 0:
+                continue
+            err_line = f"\n⚠️ {n_err} position(s) in ERROR state" if n_err else ""
+            sections.append(
+                f"💰 Realised P&L ({label})\n"
+                f"today: ${pnl_today:.2f} ({n_today} trades)\n"
+                f"all-time: ${pnl_all:.2f} ({n_all} trades)"
+                f"{err_line}"
+            )
+        if not sections:
+            send(chat_id, "No closed trades yet.")
+            return
     except Exception as e:
         send(chat_id, f"DB error: {e}")
         return
-    err_line = f"\n⚠️ {n_err} position(s) in ERROR state" if n_err else ""
-    send(chat_id,
-         f"💰 Realised P&L (live)\n"
-         f"today: ${pnl_today:.2f} ({n_today} trades)\n"
-         f"all-time: ${pnl_all:.2f} ({n_all} trades)"
-         f"{err_line}")
+    send(chat_id, "\n\n".join(sections))
 
 
 def cmd_log(chat_id: str, arg: str):
