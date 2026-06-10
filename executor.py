@@ -29,7 +29,7 @@ from config import (
     ENTRY_THRESHOLD_BPS, ENTRY_THRESHOLD_BPS_BY_SYMBOL, EXIT_THRESHOLD_BPS,
     NOTIONAL_PER_LEG, ENTRY_TIMEOUT_MINUTES, EXIT_TIMEOUT_MINUTES,
     MAX_PRICE_RATIO_DIVERGENCE, BLOCKED_SYMBOLS, MIN_EXECUTABLE_PREMIUM_BPS,
-    ENTRY_CONFIRM_TICKS, ENTRY_COST_MARGIN_BPS, ROUND_TRIP_FEE,
+    MIN_RAW_PREMIUM_BPS, ENTRY_CONFIRM_TICKS, ENTRY_COST_MARGIN_BPS, ROUND_TRIP_FEE,
     aster_symbol_for,
 )
 from auth import now_ms
@@ -135,6 +135,7 @@ class Executor:
         if aster_excess_bps >= threshold:
             direction = "long_hl_short_aster"
             spread_bps = aster_excess_bps
+            raw_premium_bps = aster_premium_bps
             # HL: buy (long) at ask — taker
             hl_side = "buy"
             hl_ref_price = hl_book.ask
@@ -144,12 +145,25 @@ class Executor:
         elif hl_excess_bps >= threshold:
             direction = "long_aster_short_hl"
             spread_bps = hl_excess_bps
+            raw_premium_bps = hl_premium_bps
             hl_side = "sell"
             hl_ref_price = hl_book.bid
             aster_side = "buy"
             aster_ref_price = aster_book.ask
         else:
             # No qualifying direction this tick — reset the persistence streak.
+            self._entry_streak.pop(symbol, None)
+            return False
+
+        # Raw premium guard — the actual market prices must show the venue is
+        # expensive, not just the oracle delta. If the raw crossing premium is
+        # below this floor the entire "edge" is oracle noise and will evaporate
+        # when the oracle delta shifts, leaving a guaranteed loss.
+        if raw_premium_bps < MIN_RAW_PREMIUM_BPS:
+            log.debug(
+                f"{symbol}: raw premium {raw_premium_bps:.1f}bps below MIN_RAW floor "
+                f"({MIN_RAW_PREMIUM_BPS}bps), excess={spread_bps:.1f}bps is oracle-driven — skipping"
+            )
             self._entry_streak.pop(symbol, None)
             return False
 

@@ -34,6 +34,11 @@ ROUND_TRIP_FEE = 2 * ASTER_MAKER_FEE + 2 * HL_TAKER_FEE  # ~0.09% = 9bps
 # apparent excess during the first few ticks before the rolling median stabilises.
 MIN_EXECUTABLE_PREMIUM_BPS = 15.0
 
+# Minimum RAW crossing premium (before oracle delta adjustment) in bps.
+# Prevents entries where the entire "edge" comes from oracle delta noise —
+# the market prices themselves must show the venue is actually expensive.
+MIN_RAW_PREMIUM_BPS = 5.0
+
 # ── Strategy parameters ──
 # Spread in bps above which we enter.  Round-trip cost ~9-14bps so 30bps = ~2x cushion.
 ENTRY_THRESHOLD_BPS = 30.0

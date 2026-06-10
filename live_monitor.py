@@ -253,8 +253,26 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     # Edge inverted hard — phantom entry that reversed. Bail now.
                     should_exit, reason = True, "stop"
                 elif own_excess <= EXIT_THRESHOLD_BPS:
-                    # Actionable arb has compressed below the exit threshold.
-                    should_exit, reason = True, "converged"
+                    # Oracle-adjusted spread compressed — but only exit if the
+                    # actual P&L at current prices is non-negative. Without this
+                    # guard, oracle delta shifts create phantom "convergence" and
+                    # the position is closed at a loss.
+                    if mid > 0 and pos.direction == "long_hl_short_aster":
+                        est_hl = (hl_book.bid - pos.hl_entry_price) * pos.qty
+                        est_ast = (pos.aster_entry_price - aster_book.ask) * pos.qty
+                    elif mid > 0:
+                        est_hl = (pos.hl_entry_price - hl_book.ask) * pos.qty
+                        est_ast = (aster_book.bid - pos.aster_entry_price) * pos.qty
+                    else:
+                        est_hl, est_ast = 0.0, 0.0
+                    est_gross = est_hl + est_ast
+                    if est_gross >= 0:
+                        should_exit, reason = True, "converged"
+                    else:
+                        log.debug(
+                            f"{symbol}: excess={own_excess:.1f}bps below exit threshold "
+                            f"but est gross=${est_gross:.2f} < 0 — holding"
+                        )
                 elif elapsed_hours >= MAX_HOLD_HOURS:
                     should_exit, reason = True, "timeout"
                 if should_exit:
