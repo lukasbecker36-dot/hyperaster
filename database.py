@@ -69,6 +69,30 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_pos_status ON positions(status);
         CREATE INDEX IF NOT EXISTS idx_pos_symbol ON positions(symbol);
+
+        -- Intent log for position-changing order calls (HL IOC entry/exit,
+        -- Aster IOC force-close). Written BEFORE the API call; updated to
+        -- completed AFTER. On startup, any row with completed_at IS NULL is
+        -- a crash window that needs reconciliation against venue state.
+        CREATE TABLE IF NOT EXISTS order_intents (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_id   INTEGER,                -- NULL for entry intents
+            symbol        TEXT    NOT NULL,
+            venue         TEXT    NOT NULL,       -- 'hl' | 'aster'
+            action        TEXT    NOT NULL,       -- 'entry_ioc' | 'exit_ioc' | 'force_exit_ioc'
+            direction     TEXT,                   -- direction of overall arb position
+            side          TEXT    NOT NULL,       -- 'buy' | 'sell' on the specified venue
+            qty           REAL    NOT NULL,
+            ref_price     REAL,
+            baseline_szi  REAL,                   -- HL position size BEFORE the call (HL only)
+            created_at    INTEGER NOT NULL,
+            completed_at  INTEGER,
+            outcome       TEXT,                   -- 'filled' | 'rejected' | 'no_fill' | 'reconciled_filled' | 'ambiguous' | ...
+            notes         TEXT,
+            paper         INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_intent_open
+            ON order_intents(symbol, completed_at);
     """)
     # Migrate existing DBs that predate the exit order id columns
     for col in ("hl_exit_order_id", "aster_exit_order_id"):

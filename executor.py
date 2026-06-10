@@ -24,6 +24,7 @@ import logging
 
 from exchange_client import ExchangeClient, OrderBook, OrderResult
 from position_manager import PositionManager
+from intents import record_intent, complete_intent
 from config import (
     ENTRY_THRESHOLD_BPS, ENTRY_THRESHOLD_BPS_BY_SYMBOL, EXIT_THRESHOLD_BPS,
     NOTIONAL_PER_LEG, ENTRY_TIMEOUT_MINUTES, EXIT_TIMEOUT_MINUTES,
@@ -205,13 +206,23 @@ class Executor:
             return False
 
         # Snapshot HL position BEFORE placing the order so we can reconcile if
-        # the order call returns ambiguously (network timeout / non-JSON).
+        # the order call returns ambiguously (network timeout / non-JSON) OR
+        # we crash before completing the intent.
         try:
             pre_pos = await self.client.get_hl_position(symbol)
             baseline_szi = float(pre_pos.get("szi", 0) or 0)
         except Exception as e:
             log.warning(f"{symbol}: HL pre-position snapshot failed ({e}) — aborting entry to stay safe")
             return False
+
+        # Record intent BEFORE placing the order — crash-safety for the window
+        # between order-sent and DB-row-written. recovery.py reconciles on next start.
+        hl_intent_id = record_intent(
+            symbol=symbol, venue="hl", action="entry_ioc",
+            direction=direction, side=hl_side, qty=qty,
+            ref_price=hl_ref_price, baseline_szi=baseline_szi,
+            paper=self.paper_mode,
+        )
 
         # Step 1: HL IOC (taker) — fills immediately or not at all
         hl_result = await self.client.place_hl_ioc(symbol, hl_side, qty, hl_ref_price)
@@ -230,6 +241,7 @@ class Executor:
                     f"{symbol}: HL ambiguous reconciled as NOT filled "
                     f"(szi {baseline_szi}->{current_szi}) — entry aborted"
                 )
+                complete_intent(hl_intent_id, "no_fill", notes="ambiguous reconciled as unfilled")
                 return False
             # It did fill. Reconstruct a synthetic OrderResult so the rest of
             # the flow can proceed. Use ref price as fill price (no avg available).
@@ -247,7 +259,12 @@ class Executor:
 
         if not hl_result.success or hl_result.filled_qty <= 0:
             log.info(f"{symbol}: HL IOC did not fill ({hl_result.error}) — entry aborted")
+            complete_intent(hl_intent_id, "no_fill", notes=hl_result.error[:200])
             return False
+
+        # HL filled successfully — close out the intent before anything else can crash
+        complete_intent(hl_intent_id, "filled",
+                        notes=f"order_id={hl_result.order_id} qty={hl_result.filled_qty}")
 
         actual_qty = hl_result.filled_qty
         log.info(f"{symbol}: HL {hl_side} filled {actual_qty} @ {hl_result.fill_price:.2f}")
@@ -461,11 +478,19 @@ class Executor:
             log.critical(f"{symbol}: empty Aster book on force exit — manual intervention!")
             self.pm.mark_error(symbol, "force_exit_empty_book")
             return
+        force_intent_id = record_intent(
+            symbol=symbol, venue="aster", action="force_exit_ioc",
+            direction=pos.direction, side=close_side, qty=pos.qty,
+            ref_price=ref_price, position_id=pos.id, paper=self.paper_mode,
+        )
         result = await self.client.place_aster_ioc(symbol, close_side, pos.qty, ref_price)
         if result.success and result.filled_qty > 0:
             log.info(
                 f"{symbol}: Aster force-exit filled {result.filled_qty} @ {result.fill_price:.4f}"
             )
+            complete_intent(force_intent_id, "filled",
+                            notes=f"oid={result.order_id} qty={result.filled_qty}",
+                            position_id=pos.id)
             self.pm.log_trade(
                 pos.id, "aster", close_side, "ioc_limit",
                 result.order_id, result.filled_qty, result.fill_price, notes="exit forced taker",
@@ -478,6 +503,8 @@ class Executor:
                 f"{symbol}: Aster force-exit FAILED ({result.error}) — UNHEDGED. "
                 f"Manual intervention!"
             )
+            complete_intent(force_intent_id, "rejected",
+                            notes=(result.error or "no_fill")[:200], position_id=pos.id)
             self.pm.mark_error(symbol, f"force_exit_failed: {result.error}")
 
     async def _reprice_aster_gtx(self, pos, is_entry: bool, current_order_id: str | None):
@@ -636,6 +663,23 @@ class Executor:
             f"HL {hl_close_side} @ {hl_ref_price:.2f} | Aster {aster_close_side} @ {aster_ref_price:.2f}"
         )
 
+        # Snapshot HL baseline + record intent BEFORE the close call. Closing the
+        # HL leg actually changes position; if we crash between fill and DB write
+        # the bot would otherwise try to close again on restart and flip naked.
+        try:
+            pre_pos = await self.client.get_hl_position(symbol)
+            exit_baseline_szi = float(pre_pos.get("szi", 0) or 0)
+        except Exception as e:
+            log.error(f"{symbol}: HL exit pre-snapshot failed ({e}) — aborting exit")
+            return False
+
+        exit_intent_id = record_intent(
+            symbol=symbol, venue="hl", action="exit_ioc",
+            direction=pos.direction, side=hl_close_side, qty=pos.qty,
+            ref_price=hl_ref_price, baseline_szi=exit_baseline_szi,
+            position_id=pos.id, paper=self.paper_mode,
+        )
+
         # Step 1: HL IOC close — keep filling until we have the full qty (max 2 attempts)
         hl_filled = 0.0
         hl_avg_price = 0.0
@@ -652,6 +696,25 @@ class Executor:
                 hl_avg_price = (hl_avg_price * hl_filled + res.fill_price * res.filled_qty) / new_total
                 hl_filled = new_total
                 hl_order_id = res.order_id or hl_order_id
+            elif res.ambiguous and attempt == 0:
+                # Don't risk a second IOC on an ambiguous first response — reconcile.
+                expected_signed = -remaining if hl_close_side == "sell" else remaining
+                filled_check, actual_signed, _ = await self.client.reconcile_hl_position_delta(
+                    symbol, exit_baseline_szi - hl_filled * (-1 if hl_close_side == "sell" else 1),
+                    expected_signed,
+                )
+                if filled_check:
+                    new_total = hl_filled + abs(actual_signed)
+                    hl_avg_price = (
+                        (hl_avg_price * hl_filled + hl_ref_price * abs(actual_signed)) / new_total
+                    )
+                    hl_filled = new_total
+                    hl_order_id = hl_order_id or "RECONCILED"
+                    log.critical(
+                        f"{symbol}: HL exit ambiguous reconciled as FILLED {abs(actual_signed)}"
+                    )
+                    break  # don't retry — we got what we expected
+                last_err = "ambiguous_not_filled"
             else:
                 last_err = res.error or last_err
                 if attempt == 0:
@@ -659,8 +722,15 @@ class Executor:
 
         if hl_filled <= 0:
             log.critical(f"{symbol}: HL exit FAILED — manual intervention needed ({last_err})")
+            complete_intent(exit_intent_id, "rejected", notes=last_err[:200], position_id=pos.id)
             self.pm.mark_error(symbol, f"HL exit failed: {last_err}")
             return False
+
+        # HL leg closed (fully or partially) — close intent before any downstream work
+        complete_intent(
+            exit_intent_id, "filled",
+            notes=f"hl_filled={hl_filled} qty={pos.qty}", position_id=pos.id,
+        )
 
         partial_hl = hl_filled < pos.qty * 0.999  # tolerate 0.1% rounding
         if partial_hl:
@@ -685,13 +755,23 @@ class Executor:
         # If maker fails, escalate to real IOC (taker) — pays ~0.9bps to escape stuck exit
         if not aster_result.success:
             log.error(f"{symbol}: Aster exit GTX failed ({aster_result.error}) — forcing IOC taker")
+            force_intent_id = record_intent(
+                symbol=symbol, venue="aster", action="force_exit_ioc",
+                direction=pos.direction, side=aster_close_side, qty=aster_qty,
+                ref_price=aster_ref_price, position_id=pos.id, paper=self.paper_mode,
+            )
             aster_result = await self.client.place_aster_ioc(
                 symbol, aster_close_side, aster_qty, aster_ref_price
             )
             if not aster_result.success or aster_result.filled_qty <= 0:
                 log.critical(f"{symbol}: Aster exit FAILED — UNHEDGED. Manual intervention!")
+                complete_intent(force_intent_id, "rejected",
+                                notes=(aster_result.error or "no_fill")[:200], position_id=pos.id)
                 self.pm.mark_error(symbol, f"Aster exit failed: {aster_result.error}")
                 return False
+            complete_intent(force_intent_id, "filled",
+                            notes=f"oid={aster_result.order_id} qty={aster_result.filled_qty}",
+                            position_id=pos.id)
             # IOC filled immediately — start_exiting then confirm in one shot
             self.pm.start_exiting(
                 symbol, hl_order_id, aster_result.order_id, hl_avg_price, exit_spread_bps,

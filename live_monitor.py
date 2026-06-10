@@ -45,6 +45,7 @@ from exchange_client import ExchangeClient
 from position_manager import PositionManager
 from executor import Executor
 from notify import install_handler as install_alert_handler
+from recovery import reconcile_incomplete_intents
 
 # ── Logging ──
 
@@ -140,7 +141,31 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     pm = PositionManager(paper_mode=paper_mode)
     executor = Executor(client, pm, paper_mode=paper_mode)
 
-    # Crash recovery: log any positions found in DB
+    # Crash recovery: reconcile any uncompleted intents against venue state.
+    # MUST run before the main loop so we don't start trading on top of an
+    # unknown state. Refuses to start if anything truly ambiguous is found.
+    if not paper_mode:
+        try:
+            report = await reconcile_incomplete_intents(client, pm, paper_mode)
+        except Exception as e:
+            log.critical(f"Crash recovery failed: {e} — REFUSING TO START")
+            await client.close()
+            return
+        if report.auto_recovered:
+            log.warning(f"Auto-recovered positions: {report.auto_recovered}")
+        if report.no_fills:
+            log.info(f"Intents closed as no_fill: {report.no_fills}")
+        if report.requires_manual:
+            log.critical(
+                f"REFUSING TO START — symbols require manual intervention: "
+                f"{report.requires_manual}. Run flatten.py --symbols "
+                f"{' '.join(report.requires_manual)} --reconcile, then clear "
+                f"'error' rows from positions table."
+            )
+            await client.close()
+            return
+
+    # Log any positions found in DB after recovery
     if pm.positions:
         for sym, pos in pm.positions.items():
             log.warning(
