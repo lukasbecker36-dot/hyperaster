@@ -61,6 +61,11 @@ class OrderResult:
     fee: float = 0.0
     error: str = ""
     raw: dict = field(default_factory=dict)
+    # True when we don't know the venue's outcome (network timeout, non-JSON
+    # response). The caller MUST reconcile against the actual position before
+    # treating this as a failure — otherwise a silently-filled order becomes
+    # an untracked naked leg.
+    ambiguous: bool = False
 
 
 @dataclass
@@ -93,10 +98,14 @@ class ExchangeClient:
         # HL oracle price cache: symbol -> (oracle_px, fetched_at_ms)
         self._hl_oracle_cache: dict[str, tuple[float, int]] = {}
 
-        # Rolling oracle delta (aster_index - hl_oracle, in bps) per symbol.
-        # Used by get_smoothed_oracle_delta() to return the median instead of a
-        # noisy point-in-time value, which can cause phantom entries.
+        # Rolling oracle delta history per symbol: deque of (ts_ms, delta_bps).
+        # Used by get_smoothed_oracle_delta() to return the median over the last
+        # ORACLE_DELTA_WINDOW_MS, which suppresses noisy point-in-time spikes.
+        # We dedupe by source-timestamp so the deque holds genuinely fresh
+        # observations rather than 1s-tick duplicates of the same stale oracle.
         self._oracle_delta_history: dict[str, deque] = {}
+        self._last_recorded_source_ts: dict[str, tuple[int, int]] = {}  # (hl_ts, aster_ts)
+        self._oracle_delta_window_ms: int = 30 * 60 * 1000  # 30 min
 
     async def start(self, symbols: list[str]):
         """Load specs for all symbols."""
@@ -307,17 +316,50 @@ class ExchangeClient:
         return cached[0] if cached else 0.0
 
     def record_oracle_delta(self, symbol: str, delta_bps: float):
-        """Append a raw oracle delta observation to the rolling window."""
+        """
+        Append a fresh oracle delta observation, deduped by source freshness.
+        Only records when the underlying oracle timestamps have changed since
+        the last recording — otherwise we'd accumulate duplicates of the same
+        5-minute-stale HL oracle value, and the median would track a noisy
+        point-in-time spike rather than smooth it out.
+        """
+        hl_cached = self._hl_oracle_cache.get(symbol)
+        aster_cached = self._mark_cache.get(symbol)
+        if not hl_cached or not aster_cached:
+            return  # source not loaded yet
+        hl_ts = hl_cached[1]
+        aster_ts = aster_cached[2]
+        last = self._last_recorded_source_ts.get(symbol)
+        if last == (hl_ts, aster_ts):
+            return  # neither feed has updated since last recording
+        self._last_recorded_source_ts[symbol] = (hl_ts, aster_ts)
         if symbol not in self._oracle_delta_history:
-            self._oracle_delta_history[symbol] = deque(maxlen=20)
-        self._oracle_delta_history[symbol].append(delta_bps)
+            self._oracle_delta_history[symbol] = deque(maxlen=200)
+        self._oracle_delta_history[symbol].append((now_ms(), delta_bps))
 
     def get_smoothed_oracle_delta(self, symbol: str, current: float) -> float:
-        """Return rolling-median oracle delta (falls back to current if < 5 observations)."""
+        """
+        Median of oracle-delta observations from the last 30 minutes.
+        Falls back to the current point-in-time value until we have at least 5
+        fresh observations — paired with the MIN_EXECUTABLE_PREMIUM_BPS floor
+        in executor, so cold-start entries still need to clear the fee floor.
+        """
         hist = self._oracle_delta_history.get(symbol)
-        if not hist or len(hist) < 5:
+        if not hist:
             return current
-        return statistics.median(hist)
+        cutoff = now_ms() - self._oracle_delta_window_ms
+        recent = [d for ts, d in hist if ts >= cutoff]
+        if len(recent) < 5:
+            return current
+        return statistics.median(recent)
+
+    def oracle_delta_sample_count(self, symbol: str) -> int:
+        """Number of fresh observations in the current window (for logging/health)."""
+        hist = self._oracle_delta_history.get(symbol)
+        if not hist:
+            return 0
+        cutoff = now_ms() - self._oracle_delta_window_ms
+        return sum(1 for ts, _ in hist if ts >= cutoff)
 
     async def _get_aster_book(self, symbol: str) -> OrderBook:
         aster_sym = f"{symbol}USDT"
@@ -467,7 +509,7 @@ class ExchangeClient:
                 return OrderResult(success=False, error=err, raw=data)
         except Exception as e:
             log.error(f"Aster GTX exception: {e}")
-            return OrderResult(success=False, error=str(e))
+            return OrderResult(success=False, error=str(e), ambiguous=True)
 
     async def place_aster_ioc(
         self, symbol: str, side: str, qty: float, price: float
@@ -513,7 +555,7 @@ class ExchangeClient:
                 return OrderResult(success=False, error=err, raw=data)
         except Exception as e:
             log.error(f"Aster IOC exception: {e}")
-            return OrderResult(success=False, error=str(e))
+            return OrderResult(success=False, error=str(e), ambiguous=True)
 
     async def cancel_aster_order(self, symbol: str, order_id: str) -> bool:
         aster_sym = f"{symbol}USDT"
@@ -675,7 +717,11 @@ class ExchangeClient:
                 if r.content_type != "application/json":
                     text = await r.text()
                     log.error(f"HL non-JSON response ({r.status}): {text}")
-                    return OrderResult(success=False, error=f"HTTP {r.status}: {text}")
+                    # Treat as ambiguous: the venue saw the request but we
+                    # can't parse the outcome. Order may have filled.
+                    return OrderResult(
+                        success=False, error=f"HTTP {r.status}: {text}", ambiguous=True
+                    )
                 data = await r.json()
 
             status = data.get("status", "")
@@ -711,7 +757,35 @@ class ExchangeClient:
                 return OrderResult(success=False, error=err, raw=data)
         except Exception as e:
             log.error(f"HL IOC exception: {e}")
-            return OrderResult(success=False, error=str(e))
+            return OrderResult(success=False, error=str(e), ambiguous=True)
+
+    async def reconcile_hl_position_delta(
+        self, symbol: str, baseline_szi: float, expected_signed_qty: float, tolerance_frac: float = 0.05,
+    ) -> tuple[bool, float, float]:
+        """
+        After an ambiguous HL order, check whether the position actually moved.
+
+        baseline_szi: signed size BEFORE the order (from get_hl_position pre-call)
+        expected_signed_qty: positive for buy, negative for sell — what we tried to fill
+        Returns (filled, actual_filled_signed, current_szi).
+        'filled' is True if the position moved by at least (1-tolerance) of expected.
+        """
+        await asyncio.sleep(1.0)  # let the venue settle
+        for attempt in range(3):
+            pos = await self.get_hl_position(symbol)
+            try:
+                current = float(pos.get("szi", 0) or 0)
+            except (TypeError, ValueError):
+                current = 0.0
+            delta = current - baseline_szi
+            # Same-sign and at least (1-tol) of expected magnitude → it filled
+            same_sign = (delta * expected_signed_qty) > 0
+            magnitude_ok = abs(delta) >= abs(expected_signed_qty) * (1 - tolerance_frac)
+            if same_sign and magnitude_ok:
+                return True, delta, current
+            if attempt < 2:
+                await asyncio.sleep(1.5 * (attempt + 1))
+        return False, current - baseline_szi, current
 
     async def get_hl_position(self, symbol: str) -> dict:
         hl_coin = f"xyz:{symbol}"

@@ -22,7 +22,7 @@ Aster GTX repricing:
 import asyncio
 import logging
 
-from exchange_client import ExchangeClient, OrderBook
+from exchange_client import ExchangeClient, OrderBook, OrderResult
 from position_manager import PositionManager
 from config import (
     ENTRY_THRESHOLD_BPS, ENTRY_THRESHOLD_BPS_BY_SYMBOL, EXIT_THRESHOLD_BPS,
@@ -92,10 +92,15 @@ class Executor:
 
         aster_index = self.client.get_aster_index(symbol)
         hl_oracle = self.client.get_hl_oracle(symbol)
-        raw_delta_bps = (
-            (aster_index - hl_oracle) / mid * 10000
-            if aster_index > 0 and hl_oracle > 0 else 0.0
-        )
+        # No oracle = no entry. Without a delta we'd treat structural feed gap
+        # as tradeable edge (the NBIS failure mode) — and there's no stop-gap
+        # value to fall back to here.
+        if aster_index <= 0 or hl_oracle <= 0:
+            log.debug(
+                f"{symbol}: oracle missing (aster_index={aster_index}, hl_oracle={hl_oracle}) — skipping"
+            )
+            return False
+        raw_delta_bps = (aster_index - hl_oracle) / mid * 10000
         # Use rolling-median oracle delta to suppress noisy point-in-time feed spikes
         oracle_delta_bps = self.client.get_smoothed_oracle_delta(symbol, raw_delta_bps)
 
@@ -172,16 +177,18 @@ class Executor:
             if fresh_mid <= 0:
                 log.warning(f"{symbol}: empty books on recheck, aborting")
                 return False
-            fresh_raw_delta = (
-                (aster_index - hl_oracle) / fresh_mid * 10000
-                if aster_index > 0 and hl_oracle > 0 else 0.0
-            )
+            # Both must still be valid (we checked them above, but the cache
+            # could have been invalidated in between).
+            if aster_index <= 0 or hl_oracle <= 0:
+                log.warning(f"{symbol}: oracle vanished on recheck, aborting")
+                return False
+            fresh_raw_delta = (aster_index - hl_oracle) / fresh_mid * 10000
             fresh_oracle_delta = self.client.get_smoothed_oracle_delta(symbol, fresh_raw_delta)
             if direction == "long_hl_short_aster":
                 fresh_excess = (fresh_aster.bid - fresh_hl.ask) / fresh_mid * 10000 - fresh_oracle_delta
             else:
                 fresh_excess = (fresh_hl.bid - fresh_aster.ask) / fresh_mid * 10000 + fresh_oracle_delta
-            if fresh_excess < max(ENTRY_THRESHOLD_BPS, MIN_EXECUTABLE_PREMIUM_BPS):
+            if fresh_excess < max(threshold, MIN_EXECUTABLE_PREMIUM_BPS):
                 log.warning(
                     f"{symbol}: excess spread collapsed to {fresh_excess:.1f}bps on recheck, aborting"
                 )
@@ -197,8 +204,47 @@ class Executor:
             log.error(f"{symbol}: pre-trade recheck failed ({e}), aborting")
             return False
 
+        # Snapshot HL position BEFORE placing the order so we can reconcile if
+        # the order call returns ambiguously (network timeout / non-JSON).
+        try:
+            pre_pos = await self.client.get_hl_position(symbol)
+            baseline_szi = float(pre_pos.get("szi", 0) or 0)
+        except Exception as e:
+            log.warning(f"{symbol}: HL pre-position snapshot failed ({e}) — aborting entry to stay safe")
+            return False
+
         # Step 1: HL IOC (taker) — fills immediately or not at all
         hl_result = await self.client.place_hl_ioc(symbol, hl_side, qty, hl_ref_price)
+
+        if hl_result.ambiguous:
+            # Don't know if it filled. Query position to find out.
+            expected_signed = qty if hl_side == "buy" else -qty
+            log.warning(
+                f"{symbol}: HL IOC ambiguous ({hl_result.error}) — reconciling against position"
+            )
+            filled, actual_signed, current_szi = await self.client.reconcile_hl_position_delta(
+                symbol, baseline_szi, expected_signed,
+            )
+            if not filled:
+                log.warning(
+                    f"{symbol}: HL ambiguous reconciled as NOT filled "
+                    f"(szi {baseline_szi}->{current_szi}) — entry aborted"
+                )
+                return False
+            # It did fill. Reconstruct a synthetic OrderResult so the rest of
+            # the flow can proceed. Use ref price as fill price (no avg available).
+            log.critical(
+                f"{symbol}: HL ambiguous reconciled as FILLED {abs(actual_signed)} "
+                f"(szi {baseline_szi}->{current_szi}) — continuing entry"
+            )
+            hl_result = OrderResult(
+                success=True,
+                order_id="RECONCILED",
+                filled_qty=abs(actual_signed),
+                fill_price=hl_ref_price,
+                ambiguous=False,
+            )
+
         if not hl_result.success or hl_result.filled_qty <= 0:
             log.info(f"{symbol}: HL IOC did not fill ({hl_result.error}) — entry aborted")
             return False
@@ -210,6 +256,58 @@ class Executor:
         aster_result = await self.client.place_aster_gtx(
             symbol, aster_side, actual_qty, aster_ref_price
         )
+
+        # If ambiguous, check whether an order actually landed before deciding
+        # to emergency-close HL. A 30s timeout that actually placed an order
+        # would otherwise leave us racing two opposite Aster fills.
+        if aster_result.ambiguous:
+            log.warning(
+                f"{symbol}: Aster GTX ambiguous ({aster_result.error}) — checking open orders"
+            )
+            await asyncio.sleep(1.5)
+            try:
+                open_orders = await self.client.get_aster_open_orders(symbol)
+            except Exception as e:
+                open_orders = []
+                log.error(f"{symbol}: open orders query failed after ambiguous GTX: {e}")
+            matching = [
+                o for o in open_orders
+                if str(o.get("side", "")).upper() == aster_side.upper()
+            ]
+            if matching:
+                o = matching[0]
+                aster_result = OrderResult(
+                    success=True,
+                    order_id=str(o.get("orderId", "")),
+                    filled_qty=float(o.get("executedQty", 0) or 0),
+                    fill_price=float(o.get("price", 0) or aster_ref_price),
+                    ambiguous=False,
+                )
+                log.critical(
+                    f"{symbol}: Aster GTX ambiguous reconciled as PLACED "
+                    f"(oid={aster_result.order_id}) — continuing"
+                )
+            else:
+                # No matching open order — likely the request never landed, or
+                # it filled instantly. Check position to disambiguate.
+                aster_pos = await self.client.get_aster_position(symbol)
+                aster_qty = float(aster_pos.get("positionAmt", 0) or 0)
+                expected_sign = -1 if aster_side == "sell" else 1
+                if aster_qty * expected_sign > 0 and abs(aster_qty) >= actual_qty * 0.95:
+                    # Filled instantly (GTX crossed). Treat as filled order.
+                    aster_result = OrderResult(
+                        success=True,
+                        order_id="RECONCILED",
+                        filled_qty=abs(aster_qty),
+                        fill_price=aster_ref_price,
+                        ambiguous=False,
+                    )
+                    log.critical(
+                        f"{symbol}: Aster GTX ambiguous reconciled as INSTANT FILL "
+                        f"qty={aster_qty} — continuing"
+                    )
+                # Else fall through to the failure branch below
+
         if not aster_result.success:
             # HL filled but Aster failed — emergency close HL
             log.error(f"{symbol}: Aster GTX failed after HL fill — emergency closing HL")

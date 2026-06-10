@@ -44,6 +44,7 @@ from database import init_db
 from exchange_client import ExchangeClient
 from position_manager import PositionManager
 from executor import Executor
+from notify import install_handler as install_alert_handler
 
 # ── Logging ──
 
@@ -175,16 +176,17 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
 
             aster_index = client.get_aster_index(symbol)
             hl_oracle = client.get_hl_oracle(symbol)
-            oracle_delta_bps = (
-                (aster_index - hl_oracle) / mid * 10000
-                if aster_index > 0 and hl_oracle > 0 else 0.0
-            )
-            # Record raw observation and use rolling median to reduce noise
+            # If either oracle is missing, return None — the scan-result protocol
+            # already treats None as "skip". Far safer than substituting delta=0
+            # and letting structural feed gap masquerade as tradeable edge.
+            if aster_index <= 0 or hl_oracle <= 0:
+                return None
+            oracle_delta_bps = (aster_index - hl_oracle) / mid * 10000
             client.record_oracle_delta(symbol, oracle_delta_bps)
             smoothed_delta = client.get_smoothed_oracle_delta(symbol, oracle_delta_bps)
             excess_bps = cross_bps - smoothed_delta
             direction = "L-HL/S-AST" if excess_bps < 0 else "L-AST/S-HL"
-            return symbol, abs(excess_bps), direction, oracle_delta_bps, aster_book, hl_book
+            return symbol, abs(excess_bps), direction, smoothed_delta, aster_book, hl_book
         except Exception as e:
             log.debug(f"scan_symbol {symbol}: {e}")
             return None
@@ -338,6 +340,7 @@ def main():
         paper_mode = PAPER_MODE
 
     setup_logging()
+    install_alert_handler()
 
     try:
         asyncio.run(run_monitor(paper_mode, args.symbols))
