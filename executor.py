@@ -186,6 +186,10 @@ class Executor:
             f"qty={qty} | HL {hl_side} @ {hl_ref_price:.2f} | Aster {aster_side} @ {aster_ref_price:.2f}"
         )
 
+        # Snapshot funding rates at entry (HL hourly, Aster 8h) for carry accounting.
+        hl_fr = self.client.get_hl_funding_rate(symbol)
+        aster_fr = self.client.get_aster_funding_rate(symbol)
+
         if self.paper_mode:
             log.info(
                 f"[PAPER] ENTRY {symbol}: {direction} | excess={spread_bps:.1f}bps | "
@@ -202,6 +206,8 @@ class Executor:
                 aster_entry_order_id="PAPER",
                 qty=qty,
                 notional_usd=NOTIONAL_PER_LEG,
+                hl_funding_rate=hl_fr,
+                aster_funding_rate=aster_fr,
             )
             self.pm.confirm_aster_entry(symbol, aster_ref_price)
             return True
@@ -383,6 +389,8 @@ class Executor:
             aster_entry_order_id=aster_result.order_id,
             qty=actual_qty,
             notional_usd=NOTIONAL_PER_LEG,
+            hl_funding_rate=hl_fr,
+            aster_funding_rate=aster_fr,
         )
         self.pm.log_trade(
             pos.id, "hl", hl_side, "ioc_limit",

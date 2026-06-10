@@ -47,9 +47,14 @@ def init_db():
             -- P&L
             gross_pnl           REAL,
             fee_cost            REAL,
-            net_pnl             REAL,
+            net_pnl             REAL,                  -- gross - fees + funding
             exit_reason         TEXT,                  -- 'converged', 'timeout', 'error'
-            paper               INTEGER NOT NULL DEFAULT 0  -- 1 if paper-mode simulation
+            paper               INTEGER NOT NULL DEFAULT 0, -- 1 if paper-mode simulation
+
+            -- Funding (snapshotted at entry, accrued over hold)
+            hl_funding_rate     REAL DEFAULT 0,        -- HL hourly funding rate at entry
+            aster_funding_rate  REAL DEFAULT 0,        -- Aster 8h funding rate at entry
+            funding_pnl         REAL DEFAULT 0         -- estimated net carry over the hold
         );
 
         CREATE TABLE IF NOT EXISTS trade_log (
@@ -105,5 +110,13 @@ def init_db():
         conn.execute("ALTER TABLE positions ADD COLUMN paper INTEGER NOT NULL DEFAULT 0")
     except Exception:
         pass
+    # Migrate existing DBs that predate funding accounting. Funding rates are
+    # snapshotted at entry (HL hourly, Aster 8h); funding_pnl is the estimated
+    # net carry over the hold, folded into net_pnl.
+    for col in ("hl_funding_rate", "aster_funding_rate", "funding_pnl"):
+        try:
+            conn.execute(f"ALTER TABLE positions ADD COLUMN {col} REAL DEFAULT 0")
+        except Exception:
+            pass
     conn.commit()
     conn.close()

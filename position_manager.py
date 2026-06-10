@@ -20,6 +20,31 @@ from config import ASTER_MAKER_FEE, HL_TAKER_FEE
 log = logging.getLogger(__name__)
 
 
+def estimate_funding_pnl(
+    direction: str, hours_held: float, notional: float,
+    hl_funding_rate: float, aster_funding_rate: float,
+) -> float:
+    """
+    Estimate net funding carry (USD) over a hold from entry-snapshot rates.
+
+    Convention: a positive funding rate means longs pay shorts. So a leg we are
+    LONG accrues -rate (we pay when positive); a leg we are SHORT accrues +rate.
+    HL settles hourly (rate is per-1h); Aster every 8h (rate is per-8h), so we
+    normalise each to the actual hours held.
+
+    This is a continuous-accrual approximation — funding really settles at
+    discrete times, but for paper P&L (and a first live estimate) rate × elapsed
+    fraction of the period is the standard, sufficiently-accurate model.
+    """
+    if direction == "long_hl_short_aster":
+        hl_sign, aster_sign = -1.0, +1.0   # long HL, short Aster
+    else:
+        hl_sign, aster_sign = +1.0, -1.0   # short HL, long Aster
+    hl_carry = hl_sign * hl_funding_rate * hours_held * notional
+    aster_carry = aster_sign * aster_funding_rate * (hours_held / 8.0) * notional
+    return hl_carry + aster_carry
+
+
 @dataclass
 class Position:
     id: int = 0
@@ -50,6 +75,12 @@ class Position:
     net_pnl: float = 0.0
     exit_reason: str = ""
 
+    # Funding: rates snapshotted at entry (HL hourly, Aster 8h),
+    # funding_pnl = estimated net carry over the hold (folded into net_pnl).
+    hl_funding_rate: float = 0.0
+    aster_funding_rate: float = 0.0
+    funding_pnl: float = 0.0
+
 
 class PositionManager:
     def __init__(self, paper_mode: bool = False):
@@ -66,7 +97,8 @@ class PositionManager:
             "SELECT id, symbol, hl_coin, aster_symbol, direction, status, "
             "entry_time, entry_spread_bps, hl_entry_price, aster_entry_price, "
             "hl_entry_order_id, aster_entry_order_id, qty, notional_usd, "
-            "exit_time, hl_exit_order_id, aster_exit_order_id "
+            "exit_time, hl_exit_order_id, aster_exit_order_id, "
+            "hl_funding_rate, aster_funding_rate "
             "FROM positions WHERE status NOT IN ('closed', 'error') AND paper=?",
             (paper_val,)
         ).fetchall()
@@ -81,6 +113,7 @@ class PositionManager:
                 qty=r[12] or 0.0, notional_usd=r[13] or 0.0,
                 exit_time=r[14] or 0,
                 hl_exit_order_id=r[15] or "", aster_exit_order_id=r[16] or "",
+                hl_funding_rate=r[17] or 0.0, aster_funding_rate=r[18] or 0.0,
             )
             self.positions[p.symbol] = p
             log.warning(
@@ -104,6 +137,7 @@ class PositionManager:
         hl_entry_price: float, hl_order_id: str,
         aster_entry_order_id: str,  # resting GTX order
         qty: float, notional_usd: float,
+        hl_funding_rate: float = 0.0, aster_funding_rate: float = 0.0,
     ) -> Position:
         entry_time = now_ms()
         conn = get_connection()
@@ -111,12 +145,14 @@ class PositionManager:
             "INSERT INTO positions "
             "(symbol, hl_coin, aster_symbol, direction, status, entry_time, "
             "entry_spread_bps, hl_entry_price, hl_entry_order_id, "
-            "aster_entry_order_id, qty, notional_usd, paper) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "aster_entry_order_id, qty, notional_usd, paper, "
+            "hl_funding_rate, aster_funding_rate) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (symbol, hl_coin, aster_symbol, direction, "entering", entry_time,
              entry_spread_bps, hl_entry_price, hl_order_id,
              aster_entry_order_id, qty, notional_usd,
-             1 if self.paper_mode else 0),
+             1 if self.paper_mode else 0,
+             hl_funding_rate, aster_funding_rate),
         )
         conn.commit()
         pid = cur.lastrowid
@@ -129,6 +165,7 @@ class PositionManager:
             hl_entry_price=hl_entry_price, hl_entry_order_id=hl_order_id,
             aster_entry_order_id=aster_entry_order_id,
             qty=qty, notional_usd=notional_usd,
+            hl_funding_rate=hl_funding_rate, aster_funding_rate=aster_funding_rate,
         )
         self.positions[symbol] = pos
         log.info(
@@ -225,26 +262,35 @@ class PositionManager:
         # Fees: 2x HL taker (entry+exit) + 2x Aster maker (entry+exit = 0 during sprint)
         notional = pos.notional_usd
         fees = notional * 2 * HL_TAKER_FEE + notional * 2 * ASTER_MAKER_FEE
-        net = gross - fees
+
+        # Funding carry over the hold (estimated from entry-snapshot rates).
+        hours_held = max(0.0, (pos.exit_time - pos.entry_time) / 3_600_000)
+        funding = estimate_funding_pnl(
+            pos.direction, hours_held, notional,
+            pos.hl_funding_rate, pos.aster_funding_rate,
+        )
+
+        net = gross - fees + funding
 
         pos.gross_pnl = round(gross, 4)
         pos.fee_cost = round(fees, 4)
+        pos.funding_pnl = round(funding, 4)
         pos.net_pnl = round(net, 4)
         pos.exit_reason = exit_reason
 
         conn = get_connection()
         conn.execute(
             "UPDATE positions SET status='closed', aster_exit_price=?, "
-            "gross_pnl=?, fee_cost=?, net_pnl=?, exit_reason=? WHERE id=?",
-            (aster_exit_price, pos.gross_pnl, pos.fee_cost, pos.net_pnl,
-             exit_reason, pos.id),
+            "gross_pnl=?, fee_cost=?, funding_pnl=?, net_pnl=?, exit_reason=? WHERE id=?",
+            (aster_exit_price, pos.gross_pnl, pos.fee_cost, pos.funding_pnl,
+             pos.net_pnl, exit_reason, pos.id),
         )
         conn.commit()
         conn.close()
 
         log.info(
             f"Position #{pos.id} CLOSED: {symbol} | {exit_reason} | "
-            f"gross=${gross:.2f} fees=${fees:.2f} net=${net:.2f}"
+            f"gross=${gross:.2f} fees=${fees:.2f} funding=${funding:.2f} net=${net:.2f}"
         )
         del self.positions[symbol]
 

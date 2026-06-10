@@ -251,13 +251,13 @@ def cmd_positions(chat_id: str, _arg: str):
     send(chat_id, "\n".join(lines))
 
 
-def _pnl_for_mode(paper: int) -> tuple[int, float, int, float, int]:
-    """Return (n_all, pnl_all, n_today, pnl_today, n_err) for a given mode."""
+def _pnl_for_mode(paper: int) -> tuple[int, float, int, float, int, float]:
+    """Return (n_all, pnl_all, n_today, pnl_today, n_err, funding_all) for a mode."""
     rows = query_db(
-        "SELECT COUNT(*), COALESCE(SUM(net_pnl),0) FROM positions "
-        "WHERE status='closed' AND paper=?", (paper,),
+        "SELECT COUNT(*), COALESCE(SUM(net_pnl),0), COALESCE(SUM(funding_pnl),0) "
+        "FROM positions WHERE status='closed' AND paper=?", (paper,),
     )
-    n_all, pnl_all = rows[0]
+    n_all, pnl_all, funding_all = rows[0]
     midnight = int(time.time()) - (int(time.time()) % 86400)
     rows = query_db(
         "SELECT COUNT(*), COALESCE(SUM(net_pnl),0) FROM positions "
@@ -270,21 +270,22 @@ def _pnl_for_mode(paper: int) -> tuple[int, float, int, float, int]:
         (paper,),
     )
     n_err = rows[0][0]
-    return n_all, pnl_all, n_today, pnl_today, n_err
+    return n_all, pnl_all, n_today, pnl_today, n_err, funding_all
 
 
 def cmd_pnl(chat_id: str, _arg: str):
     try:
         sections = []
         for label, paper_val in [("LIVE", 0), ("PAPER", 1)]:
-            n_all, pnl_all, n_today, pnl_today, n_err = _pnl_for_mode(paper_val)
+            n_all, pnl_all, n_today, pnl_today, n_err, funding_all = _pnl_for_mode(paper_val)
             if n_all == 0 and n_today == 0 and n_err == 0:
                 continue
             err_line = f"\n⚠️ {n_err} position(s) in ERROR state" if n_err else ""
             sections.append(
                 f"💰 Realised P&L ({label})\n"
                 f"today: ${pnl_today:.2f} ({n_today} trades)\n"
-                f"all-time: ${pnl_all:.2f} ({n_all} trades)"
+                f"all-time: ${pnl_all:.2f} ({n_all} trades)\n"
+                f"  incl. funding carry: ${funding_all:+.2f}"
                 f"{err_line}"
             )
         if not sections:
@@ -417,7 +418,8 @@ def cmd_trades(chat_id: str, arg: str):
         rows = query_db(
             "SELECT symbol, direction, entry_spread_bps, exit_spread_bps, "
             "hl_entry_price, hl_exit_price, aster_entry_price, aster_exit_price, "
-            "qty, notional_usd, gross_pnl, fee_cost, net_pnl, exit_reason, "
+            "qty, notional_usd, gross_pnl, fee_cost, "
+            "COALESCE(funding_pnl,0), net_pnl, exit_reason, "
             "entry_time, exit_time, paper "
             "FROM positions WHERE status='closed' "
             "ORDER BY exit_time DESC LIMIT ?",
@@ -431,7 +433,7 @@ def cmd_trades(chat_id: str, arg: str):
         return
     lines = [f"📋 Last {len(rows)} trade(s):"]
     for (sym, direction, entry_sp, exit_sp, hl_in, hl_out, ast_in, ast_out,
-         qty, notional, gross, fees, net, reason, etime, xtime, paper) in rows:
+         qty, notional, gross, fees, funding, net, reason, etime, xtime, paper) in rows:
         tag = " [paper]" if paper else ""
         held_h = ((xtime or 0) - (etime or 0)) / 3_600_000
         short_dir = "HL↑ Ast↓" if "long_hl" in (direction or "") else "HL↓ Ast↑"
@@ -440,8 +442,8 @@ def cmd_trades(chat_id: str, arg: str):
             f"  entry spread={entry_sp or 0:.1f}bps → exit={exit_sp or 0:.1f}bps\n"
             f"  HL: {hl_in:.2f}→{hl_out:.2f}  Ast: {ast_in:.2f}→{ast_out:.2f}\n"
             f"  qty={qty}  notional=${notional or 0:.0f}\n"
-            f"  gross=${gross:.4f}  fees=${fees:.4f}  net=${net:.4f}\n"
-            f"  held={held_h:.1f}h"
+            f"  gross=${gross:.4f}  fees=${fees:.4f}  funding=${funding:+.4f}\n"
+            f"  net=${net:.4f}  held={held_h:.1f}h"
         )
     send(chat_id, "\n".join(lines))
 

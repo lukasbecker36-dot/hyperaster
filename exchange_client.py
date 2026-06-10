@@ -98,6 +98,13 @@ class ExchangeClient:
         # HL oracle price cache: symbol -> (oracle_px, fetched_at_ms)
         self._hl_oracle_cache: dict[str, tuple[float, int]] = {}
 
+        # Funding rate caches.
+        #   HL:    hourly rate, refreshed alongside oracles via metaAndAssetCtxs.
+        #   Aster: 8h rate, refreshed alongside mark price via premiumIndex.
+        # symbol -> (rate, fetched_at_ms)
+        self._hl_funding_cache: dict[str, tuple[float, int]] = {}
+        self._aster_funding_cache: dict[str, tuple[float, int]] = {}
+
         # Rolling oracle delta history per symbol: deque of (ts_ms, delta_bps).
         # Used by get_smoothed_oracle_delta() to return the median over the last
         # ORACLE_DELTA_WINDOW_MS, which suppresses noisy point-in-time spikes.
@@ -279,6 +286,12 @@ class ExchangeClient:
             index = float(data.get("indexPrice") or 0)
             if mark > 0:
                 self._mark_cache[symbol] = (mark, index, now)
+            # Aster funding settles every 8h; lastFundingRate is the per-8h rate.
+            try:
+                rate = float(data.get("lastFundingRate") or 0)
+                self._aster_funding_cache[symbol] = (rate, now)
+            except (TypeError, ValueError):
+                pass
             return mark
         except Exception:
             return cached[0] if cached else 0.0
@@ -306,6 +319,11 @@ class ExchangeClient:
                     oracle_px = float(ctxs[i].get("oraclePx") or 0)
                     if oracle_px > 0:
                         self._hl_oracle_cache[base] = (oracle_px, now)
+                    # HL funding is published as an hourly rate.
+                    try:
+                        self._hl_funding_cache[base] = (float(ctxs[i].get("funding") or 0), now)
+                    except (TypeError, ValueError):
+                        pass
             log.debug(f"HL oracle prices refreshed for {len(self._hl_oracle_cache)} symbols")
         except Exception as e:
             log.warning(f"Failed to refresh HL oracle prices: {e}")
@@ -313,6 +331,16 @@ class ExchangeClient:
     def get_hl_oracle(self, symbol: str) -> float:
         """Return cached HL XYZ oracle price."""
         cached = self._hl_oracle_cache.get(symbol)
+        return cached[0] if cached else 0.0
+
+    def get_hl_funding_rate(self, symbol: str) -> float:
+        """Cached HL funding rate (per 1h). Positive = longs pay shorts."""
+        cached = self._hl_funding_cache.get(symbol)
+        return cached[0] if cached else 0.0
+
+    def get_aster_funding_rate(self, symbol: str) -> float:
+        """Cached Aster funding rate (per 8h). Positive = longs pay shorts."""
+        cached = self._aster_funding_cache.get(symbol)
         return cached[0] if cached else 0.0
 
     def record_oracle_delta(self, symbol: str, delta_bps: float):
