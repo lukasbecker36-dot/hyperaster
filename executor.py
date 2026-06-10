@@ -129,21 +129,6 @@ class Executor:
             aster_side = "buy"
             aster_ref_price = aster_book.ask
         else:
-            # Neither direction cleared the bid-ask version of the threshold.
-            # If the mid-to-mid signal (what scan_symbol displays) DID clear it,
-            # the operator deserves to know why — usually crossing cost on one
-            # or both books ate the edge.
-            displayed_excess = abs((aster_book.mid - hl_book.mid) / mid * 10000 - oracle_delta_bps)
-            best_executable = max(aster_excess_bps, hl_excess_bps)
-            if displayed_excess >= threshold:
-                aster_spread_bps = (aster_book.ask - aster_book.bid) / aster_book.mid * 10000 if aster_book.mid > 0 else 0
-                hl_spread_bps = (hl_book.ask - hl_book.bid) / hl_book.mid * 10000 if hl_book.mid > 0 else 0
-                log.info(
-                    f"{symbol}: signal {displayed_excess:.1f}bps but executable only "
-                    f"{best_executable:.1f}/{threshold:.0f}bps "
-                    f"(crossing cost {displayed_excess - best_executable:.1f}bps: "
-                    f"aster {aster_spread_bps:.1f}bps + hl {hl_spread_bps:.1f}bps top-of-book) — skipping"
-                )
             return False
 
         # Hard floor — ensures the edge exceeds fee cost even before rolling median

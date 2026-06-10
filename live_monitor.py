@@ -185,10 +185,11 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     candidates: list[str] = []
 
     async def scan_symbol(symbol: str) -> tuple[str, float, str, float, object, object] | None:
-        """Fetch books and return (symbol, abs_excess_bps, direction, oracle_delta_bps, aster_book, hl_book).
+        """Fetch books and return (symbol, executable_excess_bps, direction, smoothed_delta_bps, aster_book, hl_book).
 
-        excess_bps = cross_bps - oracle_delta_bps removes the structural index price
-        difference between the two exchanges, leaving only the convergeable spread.
+        executable_excess_bps uses bid-to-other-ask prices — what try_entry
+        actually checks, not the optimistic mid-to-mid value. May be negative
+        when neither direction has a positive edge after crossing cost.
         """
         try:
             aster_book, hl_book = await client.get_both_books(symbol)
@@ -197,7 +198,6 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             mid = (aster_book.mid + hl_book.mid) / 2
             if mid <= 0:
                 return None
-            cross_bps = (aster_book.mid - hl_book.mid) / mid * 10000
 
             aster_index = client.get_aster_index(symbol)
             hl_oracle = client.get_hl_oracle(symbol)
@@ -209,9 +209,19 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             oracle_delta_bps = (aster_index - hl_oracle) / mid * 10000
             client.record_oracle_delta(symbol, oracle_delta_bps)
             smoothed_delta = client.get_smoothed_oracle_delta(symbol, oracle_delta_bps)
-            excess_bps = cross_bps - smoothed_delta
-            direction = "L-HL/S-AST" if excess_bps < 0 else "L-AST/S-HL"
-            return symbol, abs(excess_bps), direction, smoothed_delta, aster_book, hl_book
+
+            # Match try_entry exactly: bid-to-other-ask, less smoothed delta.
+            aster_premium_bps = (aster_book.bid - hl_book.ask) / mid * 10000
+            hl_premium_bps    = (hl_book.bid - aster_book.ask) / mid * 10000
+            aster_excess = aster_premium_bps - smoothed_delta   # long_hl_short_aster
+            hl_excess    = hl_premium_bps    + smoothed_delta   # long_aster_short_hl
+            if aster_excess >= hl_excess:
+                executable_excess = aster_excess
+                direction = "L-HL/S-AST"
+            else:
+                executable_excess = hl_excess
+                direction = "L-AST/S-HL"
+            return symbol, executable_excess, direction, smoothed_delta, aster_book, hl_book
         except Exception as e:
             log.debug(f"scan_symbol {symbol}: {e}")
             return None
@@ -220,16 +230,18 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
         """Act on a scan result — check entry/exit conditions."""
         if result is None:
             return
-        symbol, abs_excess_bps, direction, oracle_delta_bps, aster_book, hl_book = result
-        latest_spreads[symbol] = (abs_excess_bps, direction, oracle_delta_bps)
-        abs_spread_bps = abs_excess_bps  # alias for clarity below
+        symbol, executable_excess_bps, direction, smoothed_delta_bps, aster_book, hl_book = result
+        latest_spreads[symbol] = (executable_excess_bps, direction, smoothed_delta_bps)
         pos = pm.get(symbol)
         nonlocal consecutive_errors
         try:
             if pos and pos.status == "open":
                 elapsed_hours = (now_ms() - pos.entry_time) / 3_600_000
                 should_exit, reason = False, ""
-                if abs_spread_bps <= EXIT_THRESHOLD_BPS:
+                # Exit when neither direction would be entry-worthy anymore.
+                # Best-executable <= small threshold means the actionable arb
+                # has compressed to under exit_threshold_bps.
+                if executable_excess_bps <= EXIT_THRESHOLD_BPS:
                     should_exit, reason = True, "converged"
                 elif elapsed_hours >= MAX_HOLD_HOURS:
                     should_exit, reason = True, "timeout"
