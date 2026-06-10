@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src import aster, history, hyperliquid as hl
 from src.fees import ROUND_TRIP_MAKER_BPS, ROUND_TRIP_TAKER_BPS
+from config import ENTRY_THRESHOLD_BPS_BY_SYMBOL, ENTRY_THRESHOLD_BPS
 
 HOUR_MS = history.HOUR_MS
 
@@ -193,7 +194,8 @@ def main() -> None:
 
     cost_taker = float(ROUND_TRIP_TAKER_BPS) + args.bo_bps
     cost_maker = float(ROUND_TRIP_MAKER_BPS) + args.bo_bps
-    entry = args.entry if args.entry is not None else cost_taker
+    use_per_symbol = args.entry is None
+    global_entry = args.entry if args.entry is not None else cost_taker
 
     async def run():
         conn = aiohttp.TCPConnector(limit=20)
@@ -231,11 +233,12 @@ def main() -> None:
         )
 
     # ── Backtest ──────────────────────────────────────────────────────────────
+    mode = "per-symbol from config" if use_per_symbol else f"|spread|>={global_entry:.0f}bps"
     print(f"""
 {'='*108}
- CONVERGENCE BACKTEST  |  enter |spread|>={entry:.0f}bps, exit<={args.exit:.0f}bps or {args.max_hold}h timeout
+ CONVERGENCE BACKTEST  |  entry: {mode}, exit<={args.exit:.0f}bps or {args.max_hold}h timeout
 {'='*108}""")
-    hdr2 = (f"{'Sym':<6} {'trades':>6} {'win%tkr':>7} {'win%mkr':>7} {'avgHold':>7} "
+    hdr2 = (f"{'Sym':<6} {'entry':>5} {'trades':>6} {'win%tkr':>7} {'win%mkr':>7} {'avgHold':>7} "
             f"{'avgConv':>7} {'avgCarry':>8} {'avgNet(t)':>9} {'avgNet(m)':>9} "
             f"{'totNet(t)':>9} {'totNet(m)':>9} {'timeout%':>8}")
     print(hdr2)
@@ -243,13 +246,14 @@ def main() -> None:
 
     summary = []
     for sym, df in panels.items():
+        entry = ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(sym, ENTRY_THRESHOLD_BPS) if use_per_symbol else global_entry
         r = backtest_symbol(df, entry, args.exit, args.max_hold, cost_taker, cost_maker)
         if r["n_trades"] == 0:
-            print(f"{sym:<6} {'0':>6}  (spread never reached entry threshold)")
+            print(f"{sym:<6} {entry:>5.0f} {'0':>6}  (spread never reached entry threshold)")
             continue
-        summary.append((sym, r))
+        summary.append((sym, r, entry))
         print(
-            f"{sym:<6} {r['n_trades']:>6} {r['win_rate_taker']:>6.0f}% {r['win_rate_maker']:>6.0f}% "
+            f"{sym:<6} {entry:>5.0f} {r['n_trades']:>6} {r['win_rate_taker']:>6.0f}% {r['win_rate_maker']:>6.0f}% "
             f"{r['avg_hold_h']:>6.1f}h {r['avg_conv']:>7.1f} {r['avg_carry']:>+7.2f}b "
             f"{r['avg_net_taker']:>+8.1f}b {r['avg_net_maker']:>+8.1f}b "
             f"{r['total_net_taker']:>+8.1f}b {r['total_net_maker']:>+8.1f}b "
@@ -258,16 +262,16 @@ def main() -> None:
 
     # ── Verdict ───────────────────────────────────────────────────────────────
     print(f"\n{'='*108}\n VERDICT\n{'='*108}")
-    taker_pos = [(s, r) for s, r in summary if r["total_net_taker"] > 0]
-    maker_pos = [(s, r) for s, r in summary if r["total_net_maker"] > 0]
+    taker_pos = [(s, r, e) for s, r, e in summary if r["total_net_taker"] > 0]
+    maker_pos = [(s, r, e) for s, r, e in summary if r["total_net_maker"] > 0]
 
     print(f"  Symbols with POSITIVE total backtest P&L — taker entry: {len(taker_pos)}/{len(summary)}")
     print(f"  Symbols with POSITIVE total backtest P&L — maker entry: {len(maker_pos)}/{len(summary)}")
 
     if maker_pos:
         print("\n  Best (by total maker P&L over window):")
-        for s, r in sorted(maker_pos, key=lambda x: x[1]["total_net_maker"], reverse=True)[:8]:
-            print(f"    {s:<6} {r['n_trades']:>3} trades  "
+        for s, r, e in sorted(maker_pos, key=lambda x: x[1]["total_net_maker"], reverse=True)[:8]:
+            print(f"    {s:<6} thr={e:.0f}  {r['n_trades']:>3} trades  "
                   f"total {r['total_net_maker']:+.0f}bps (maker) / {r['total_net_taker']:+.0f}bps (taker)  "
                   f"win {r['win_rate_maker']:.0f}%/{r['win_rate_taker']:.0f}%  "
                   f"avg hold {r['avg_hold_h']:.0f}h")

@@ -8,6 +8,15 @@ from .types import BookTicker, EquityPerp
 
 ASTER_URL = "https://fapi.asterdex.com"
 
+# Cross-venue aliases: Aster's tradeable base -> HL's canonical base.
+# HL uses short/GDR tickers (SMSN, SKHX), Aster's name-matching contracts are
+# dead (400), and the live books use the long names (SAMSUNG, SKHYNIX).
+_ASTER_TO_CANON = {
+    "SAMSUNG": "SMSN",
+    "SKHYNIX": "SKHX",
+}
+_CANON_PHANTOMS = set(_ASTER_TO_CANON.values())  # dead listings to skip
+
 
 async def _get(
     session: aiohttp.ClientSession, path: str, params: dict | None = None
@@ -32,7 +41,10 @@ async def get_all_perps(session: aiohttp.ClientSession) -> dict[str, EquityPerp]
         symbol: str = sym["symbol"]
         if not symbol.endswith("USDT"):
             continue
-        canonical = symbol[:-4]
+        raw_base = symbol[:-4]
+        if raw_base in _CANON_PHANTOMS:
+            continue
+        canonical = _ASTER_TO_CANON.get(raw_base, raw_base)
         result[canonical] = EquityPerp(
             canonical=canonical,
             venue_symbol=symbol,
@@ -53,7 +65,10 @@ async def get_all_book_tickers(session: aiohttp.ClientSession) -> dict[str, Book
             ask = Decimal(t["askPrice"])
             if bid <= 0 or ask <= 0:
                 continue
-            canonical = symbol[:-4]
+            raw_base = symbol[:-4]
+            if raw_base in _CANON_PHANTOMS:
+                continue
+            canonical = _ASTER_TO_CANON.get(raw_base, raw_base)
             result[canonical] = BookTicker(symbol=symbol, bid=bid, ask=ask)
         except Exception:
             continue
@@ -70,7 +85,10 @@ async def get_all_funding_rates(session: aiohttp.ClientSession) -> dict[str, Dec
             continue
         try:
             rate_str = item.get("lastFundingRate") or item.get("fundingRate", "0")
-            canonical = symbol[:-4]
+            raw_base = symbol[:-4]
+            if raw_base in _CANON_PHANTOMS:
+                continue
+            canonical = _ASTER_TO_CANON.get(raw_base, raw_base)
             result[canonical] = Decimal(rate_str)
         except Exception:
             continue
