@@ -35,7 +35,7 @@ from config import (
     ENTRY_THRESHOLD_BPS, ENTRY_THRESHOLD_BPS_BY_SYMBOL,
     EXIT_THRESHOLD_BPS, MAX_HOLD_HOURS, MAX_CONCURRENT_POSITIONS,
     HEARTBEAT_INTERVAL_MINUTES, PAPER_MODE, DATA_DIR, OUTPUT_DIR,
-    BLOCKED_SYMBOLS,
+    BLOCKED_SYMBOLS, ADVERSE_STOP_BPS,
 )
 
 SLOW_SCAN_INTERVAL_SECONDS = 300   # re-rank all symbols every 5 min
@@ -237,11 +237,23 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
         try:
             if pos and pos.status == "open":
                 elapsed_hours = (now_ms() - pos.entry_time) / 3_600_000
+                # Evaluate exits on the POSITION'S OWN direction, not the scan's
+                # best-of-both `executable_excess_bps`. Using the max meant a
+                # reversed position wasn't exited until the *opposite* direction
+                # also calmed down — letting losses run (CBRS ran to -24.7bps).
+                mid = (aster_book.mid + hl_book.mid) / 2
+                if mid > 0 and pos.direction == "long_hl_short_aster":
+                    own_excess = (aster_book.bid - hl_book.ask) / mid * 10000 - smoothed_delta_bps
+                elif mid > 0:
+                    own_excess = (hl_book.bid - aster_book.ask) / mid * 10000 + smoothed_delta_bps
+                else:
+                    own_excess = executable_excess_bps
                 should_exit, reason = False, ""
-                # Exit when neither direction would be entry-worthy anymore.
-                # Best-executable <= small threshold means the actionable arb
-                # has compressed to under exit_threshold_bps.
-                if executable_excess_bps <= EXIT_THRESHOLD_BPS:
+                if own_excess <= -ADVERSE_STOP_BPS:
+                    # Edge inverted hard — phantom entry that reversed. Bail now.
+                    should_exit, reason = True, "stop"
+                elif own_excess <= EXIT_THRESHOLD_BPS:
+                    # Actionable arb has compressed below the exit threshold.
                     should_exit, reason = True, "converged"
                 elif elapsed_hours >= MAX_HOLD_HOURS:
                     should_exit, reason = True, "timeout"
@@ -280,8 +292,12 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     reverse=True,
                 )
                 candidates = [r[0] for r in ranked[:FAST_CANDIDATES]]
+                # Candidates + open positions are re-processed in the fast tick
+                # below; skip them here so the entry persistence streak isn't
+                # double-counted within a single loop iteration.
+                fast_set = set(candidates) | set(open_syms)
                 for r in all_results:
-                    if r:
+                    if r and r[0] not in fast_set:
                         await process_result(r)
                 thresh_strs = " | ".join(
                     f"{s} {spd:.1f}/{ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(s, ENTRY_THRESHOLD_BPS):.0f}bps (d={odelta:+.1f})"

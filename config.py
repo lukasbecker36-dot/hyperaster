@@ -39,6 +39,27 @@ MIN_EXECUTABLE_PREMIUM_BPS = 15.0
 ENTRY_THRESHOLD_BPS = 30.0
 # Exit when spread falls below this (in bps, absolute cross-exchange mid spread)
 EXIT_THRESHOLD_BPS = 8.0
+
+# Number of consecutive qualifying scans the entry signal must persist before we
+# commit capital. A genuine dislocation holds across ticks; a stale-feed/oracle-lag
+# phantom (e.g. CBRS entering at +41bps then inverting to -25bps within minutes)
+# evaporates the moment the feeds catch up. Filtering these out is the single biggest
+# lever against fee-bleeding churn (every round trip costs ~9bps in HL taker fees).
+ENTRY_CONFIRM_TICKS = 3
+
+# Hard stop: bail a held position immediately if its OWN-direction executable excess
+# inverts past this (negative) level. Protects against a phantom entry whose edge
+# reverses hard before the normal converge-exit at EXIT_THRESHOLD_BPS would fire.
+ADVERSE_STOP_BPS = 20.0
+
+# Dynamic cost floor on entry. The per-symbol p75 thresholds capture "is the spread
+# statistically wide?" but not "is it wide enough to profit after costs?". On exit we
+# pay round-trip fees PLUS cross the bid-ask spread on both venues again. So require:
+#   effective_threshold = max(p75_threshold, fee_bps + (aster_spread + hl_spread) + margin)
+# This auto-lifts thin-book names where the p75 sits below breakeven, and is
+# self-maintaining as liquidity changes — no per-ticker recalibration needed.
+ENTRY_COST_MARGIN_BPS = 5.0
+
 # Abandon entry (close HL leg) if Aster maker hasn't filled within this many minutes
 ENTRY_TIMEOUT_MINUTES = 60
 # Force-close Aster exit leg with a taker IOC if maker hasn't filled within this many minutes

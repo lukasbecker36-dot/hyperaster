@@ -29,6 +29,7 @@ from config import (
     ENTRY_THRESHOLD_BPS, ENTRY_THRESHOLD_BPS_BY_SYMBOL, EXIT_THRESHOLD_BPS,
     NOTIONAL_PER_LEG, ENTRY_TIMEOUT_MINUTES, EXIT_TIMEOUT_MINUTES,
     MAX_PRICE_RATIO_DIVERGENCE, BLOCKED_SYMBOLS, MIN_EXECUTABLE_PREMIUM_BPS,
+    ENTRY_CONFIRM_TICKS, ENTRY_COST_MARGIN_BPS, ROUND_TRIP_FEE,
 )
 from auth import now_ms
 
@@ -48,6 +49,10 @@ class Executor:
         self.pm = pm
         self.paper_mode = paper_mode
         self._price_mismatch_warned: set[str] = set()
+        # Entry persistence: symbol -> (direction, consecutive qualifying ticks).
+        # An entry only commits once the same-direction signal has held for
+        # ENTRY_CONFIRM_TICKS consecutive scans, filtering out stale-feed phantoms.
+        self._entry_streak: dict[str, tuple[str, int]] = {}
 
     # ── Entry ──
 
@@ -65,6 +70,9 @@ class Executor:
             return False
 
         if self.pm.has_position(symbol):
+            # Position already open (or mid-entry) — drop any stale streak so a
+            # later re-entry must re-confirm from scratch.
+            self._entry_streak.pop(symbol, None)
             return False
 
         mid = (aster_book.mid + hl_book.mid) / 2
@@ -110,7 +118,18 @@ class Executor:
         aster_excess_bps = aster_premium_bps - oracle_delta_bps
         hl_excess_bps = hl_premium_bps + oracle_delta_bps
 
-        threshold = ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(symbol, ENTRY_THRESHOLD_BPS)
+        base_threshold = ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(symbol, ENTRY_THRESHOLD_BPS)
+        # Dynamic cost floor: on exit we pay round-trip fees plus cross the bid-ask
+        # spread on both venues again. Require the edge to clear that, so a wide
+        # statistical spread on a thin book doesn't get traded into a loss.
+        aster_spread_bps = (aster_book.ask - aster_book.bid) / mid * 10000 if mid > 0 else 0
+        hl_spread_bps = (hl_book.ask - hl_book.bid) / mid * 10000 if mid > 0 else 0
+        cost_floor = (
+            ROUND_TRIP_FEE * 10000
+            + aster_spread_bps + hl_spread_bps
+            + ENTRY_COST_MARGIN_BPS
+        )
+        threshold = max(base_threshold, cost_floor)
 
         if aster_excess_bps >= threshold:
             direction = "long_hl_short_aster"
@@ -129,6 +148,8 @@ class Executor:
             aster_side = "buy"
             aster_ref_price = aster_book.ask
         else:
+            # No qualifying direction this tick — reset the persistence streak.
+            self._entry_streak.pop(symbol, None)
             return False
 
         # Hard floor — ensures the edge exceeds fee cost even before rolling median
@@ -137,6 +158,20 @@ class Executor:
             log.debug(
                 f"{symbol}: excess {spread_bps:.1f}bps below MIN_EXECUTABLE floor "
                 f"({MIN_EXECUTABLE_PREMIUM_BPS}bps), skipping"
+            )
+            self._entry_streak.pop(symbol, None)
+            return False
+
+        # Persistence filter — the signal must hold the same direction for
+        # ENTRY_CONFIRM_TICKS consecutive scans before we commit. Stale-feed phantoms
+        # evaporate within a tick or two; real dislocations persist.
+        prev_dir, prev_count = self._entry_streak.get(symbol, ("", 0))
+        count = prev_count + 1 if prev_dir == direction else 1
+        self._entry_streak[symbol] = (direction, count)
+        if count < ENTRY_CONFIRM_TICKS:
+            log.info(
+                f"{symbol}: {direction} excess={spread_bps:.1f}bps (thr={threshold:.0f}) "
+                f"confirming {count}/{ENTRY_CONFIRM_TICKS}"
             )
             return False
 
