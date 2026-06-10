@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""
+Telegram control bot for the hyperaster arb monitor.
+
+Always-on long-polling bot that lets you check status and control the trader
+from your phone. Locked to an allowlist of chat IDs. Destructive commands
+(/stop, /flatten) require a typed confirmation so a stray tap can't halt
+trading or close the book.
+
+Stdlib only — no extra deps. Reads the same SQLite DB the trader writes, and
+shells out to systemctl / flatten.py for lifecycle + emergency actions.
+
+Env (from .env, loaded by systemd EnvironmentFile or python-dotenv):
+  ALERT_TELEGRAM_BOT_TOKEN        bot token (reused from alerting)
+  ALERT_TELEGRAM_CHAT_ID          your chat id (single)
+  CONTROL_TELEGRAM_CHAT_IDS       optional, comma-separated allowlist (overrides above)
+  CONTROL_SERVICE_NAME            systemd unit to control (default: hyperaster)
+  CONTROL_BRANCH                  git branch for /restart pull (default: current)
+
+Commands:
+  /status      service state + uptime + open position count
+  /positions   open positions from the DB
+  /pnl         realised P&L (today + all-time)
+  /log [n]     last n journal lines (default 20)
+  /start       start the trader service
+  /stop        stop the trader  (requires: /stop YES)
+  /restart     git pull + restart the trader
+  /flatten     emergency close ALL positions (requires: /flatten YES)
+  /help        command list
+"""
+
+import json
+import os
+import subprocess
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except Exception:
+    pass
+
+BASE_DIR = Path(__file__).resolve().parent
+VENV_PY = BASE_DIR / ".venv" / "bin" / "python"
+PYTHON = str(VENV_PY) if VENV_PY.exists() else "python3"
+
+TOKEN = os.getenv("ALERT_TELEGRAM_BOT_TOKEN", "")
+SERVICE = os.getenv("CONTROL_SERVICE_NAME", "hyperaster")
+BRANCH = os.getenv("CONTROL_BRANCH", "")
+
+def _allowed_chat_ids() -> set[str]:
+    raw = os.getenv("CONTROL_TELEGRAM_CHAT_IDS") or os.getenv("ALERT_TELEGRAM_CHAT_ID", "")
+    return {c.strip() for c in raw.split(",") if c.strip()}
+
+ALLOWED = _allowed_chat_ids()
+API = f"https://api.telegram.org/bot{TOKEN}"
+
+# Pending destructive confirmations: chat_id -> (command, expires_at)
+_PENDING: dict[str, tuple[str, float]] = {}
+_CONFIRM_TTL = 60  # seconds
+
+
+# ── Telegram I/O ──
+
+def _api(method: str, params: dict, timeout: int = 35) -> dict:
+    url = f"{API}/{method}"
+    data = urllib.parse.urlencode(params).encode()
+    req = urllib.request.Request(url, data=data, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def send(chat_id: str, text: str):
+    # Telegram caps messages at 4096 chars
+    for i in range(0, len(text), 3900):
+        try:
+            _api("sendMessage", {"chat_id": chat_id, "text": text[i:i + 3900]}, timeout=15)
+        except Exception as e:
+            print(f"send failed: {e}", flush=True)
+
+
+# ── Shell helpers ──
+
+def run(cmd: list[str], timeout: int = 60) -> tuple[int, str]:
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        out = (p.stdout or "") + (p.stderr or "")
+        return p.returncode, out.strip()
+    except subprocess.TimeoutExpired:
+        return 124, f"timed out after {timeout}s"
+    except Exception as e:
+        return 1, str(e)
+
+
+def db_path() -> str:
+    try:
+        from config import DB_PATH
+        return DB_PATH
+    except Exception:
+        return str(BASE_DIR / "data" / "positions.db")
+
+
+def query_db(sql: str, args: tuple = ()) -> list[tuple]:
+    import sqlite3
+    conn = sqlite3.connect(db_path())
+    try:
+        return conn.execute(sql, args).fetchall()
+    finally:
+        conn.close()
+
+
+# ── Command handlers ──
+
+def cmd_status(chat_id: str, _arg: str):
+    rc, active = run(["systemctl", "is-active", SERVICE], timeout=10)
+    rc2, props = run(
+        ["systemctl", "show", SERVICE,
+         "--property=ActiveState,SubState,ExecMainStartTimestamp,ExecStart"],
+        timeout=10,
+    )
+    # Open positions
+    try:
+        rows = query_db(
+            "SELECT COUNT(*) FROM positions WHERE status NOT IN ('closed','error') AND paper=0"
+        )
+        open_live = rows[0][0] if rows else 0
+        rows = query_db(
+            "SELECT COUNT(*) FROM positions WHERE status NOT IN ('closed','error') AND paper=1"
+        )
+        open_paper = rows[0][0] if rows else 0
+    except Exception as e:
+        open_live = open_paper = f"?({e})"
+    mode = "live" if "--live" in props else ("paper" if "--paper" in props else "?")
+    send(chat_id,
+         f"🤖 {SERVICE}: {active.upper()}\n"
+         f"mode: {mode}\n"
+         f"open positions: {open_live} live / {open_paper} paper\n\n"
+         f"{props}")
+
+
+def cmd_positions(chat_id: str, _arg: str):
+    try:
+        rows = query_db(
+            "SELECT symbol, status, direction, entry_spread_bps, qty, entry_time, paper "
+            "FROM positions WHERE status NOT IN ('closed','error') ORDER BY entry_time"
+        )
+    except Exception as e:
+        send(chat_id, f"DB error: {e}")
+        return
+    if not rows:
+        send(chat_id, "No open positions.")
+        return
+    now = time.time() * 1000
+    lines = ["📊 Open positions:"]
+    for sym, status, direction, spread, qty, etime, paper in rows:
+        held_h = (now - (etime or now)) / 3_600_000
+        tag = " [paper]" if paper else ""
+        lines.append(
+            f"• {sym}{tag} [{status}] {direction or ''}\n"
+            f"    entry={spread or 0:.1f}bps qty={qty or 0} held={held_h:.1f}h"
+        )
+    send(chat_id, "\n".join(lines))
+
+
+def cmd_pnl(chat_id: str, _arg: str):
+    try:
+        # All-time realised (live only)
+        rows = query_db(
+            "SELECT COUNT(*), COALESCE(SUM(net_pnl),0) FROM positions "
+            "WHERE status='closed' AND paper=0"
+        )
+        n_all, pnl_all = rows[0]
+        # Today (UTC midnight in ms)
+        midnight = int(time.time()) - (int(time.time()) % 86400)
+        rows = query_db(
+            "SELECT COUNT(*), COALESCE(SUM(net_pnl),0) FROM positions "
+            "WHERE status='closed' AND paper=0 AND exit_time >= ?",
+            (midnight * 1000,),
+        )
+        n_today, pnl_today = rows[0]
+        # Errors needing attention
+        rows = query_db(
+            "SELECT COUNT(*) FROM positions WHERE status='error' AND paper=0"
+        )
+        n_err = rows[0][0]
+    except Exception as e:
+        send(chat_id, f"DB error: {e}")
+        return
+    err_line = f"\n⚠️ {n_err} position(s) in ERROR state" if n_err else ""
+    send(chat_id,
+         f"💰 Realised P&L (live)\n"
+         f"today: ${pnl_today:.2f} ({n_today} trades)\n"
+         f"all-time: ${pnl_all:.2f} ({n_all} trades)"
+         f"{err_line}")
+
+
+def cmd_log(chat_id: str, arg: str):
+    n = 20
+    if arg.strip().isdigit():
+        n = min(int(arg.strip()), 100)
+    rc, out = run(["journalctl", "-u", SERVICE, "-n", str(n), "--no-pager", "-o", "cat"], timeout=15)
+    send(chat_id, f"📜 last {n} lines:\n\n{out or '(empty)'}")
+
+
+def cmd_start(chat_id: str, _arg: str):
+    rc, out = run(["systemctl", "start", SERVICE], timeout=30)
+    time.sleep(2)
+    _, active = run(["systemctl", "is-active", SERVICE], timeout=10)
+    send(chat_id, f"▶️ start: {'ok' if rc == 0 else 'FAILED'} — now {active}\n{out}")
+
+
+def cmd_stop(chat_id: str, arg: str):
+    # Warn about open positions; require confirmation
+    try:
+        rows = query_db(
+            "SELECT COUNT(*) FROM positions WHERE status NOT IN ('closed','error') AND paper=0"
+        )
+        n_open = rows[0][0]
+    except Exception:
+        n_open = "?"
+    if arg.strip().upper() != "YES":
+        _PENDING[chat_id] = ("stop", time.time() + _CONFIRM_TTL)
+        send(chat_id,
+             f"⚠️ Stop {SERVICE}? {n_open} live position(s) are open and will be "
+             f"LEFT UNMANAGED on the exchanges (no exit monitoring).\n\n"
+             f"Send /stop YES within {_CONFIRM_TTL}s to confirm.")
+        return
+    rc, out = run(["systemctl", "stop", SERVICE], timeout=30)
+    send(chat_id, f"⏹️ stop: {'ok' if rc == 0 else 'FAILED'}\n{out}")
+
+
+def cmd_restart(chat_id: str, _arg: str):
+    send(chat_id, "🔄 pulling + restarting…")
+    pull_cmd = ["git", "-C", str(BASE_DIR), "pull"]
+    if BRANCH:
+        pull_cmd += ["origin", BRANCH]
+    rc, out = run(pull_cmd, timeout=60)
+    send(chat_id, f"git pull:\n{out}")
+    rc, out = run(["systemctl", "restart", SERVICE], timeout=30)
+    time.sleep(2)
+    _, active = run(["systemctl", "is-active", SERVICE], timeout=10)
+    send(chat_id, f"restart: {'ok' if rc == 0 else 'FAILED'} — now {active}\n{out}")
+
+
+def cmd_flatten(chat_id: str, arg: str):
+    if arg.strip().upper() != "YES":
+        _PENDING[chat_id] = ("flatten", time.time() + _CONFIRM_TTL)
+        send(chat_id,
+             "🚨 EMERGENCY FLATTEN — this market-closes EVERY open position on "
+             "BOTH venues (taker fees, immediate).\n\n"
+             f"Send /flatten YES within {_CONFIRM_TTL}s to confirm.")
+        return
+    send(chat_id, "🚨 flattening — querying both venues and closing everything…")
+    rc, out = run(
+        [PYTHON, str(BASE_DIR / "flatten.py"), "--reconcile", "--yes"],
+        timeout=180,
+    )
+    send(chat_id, f"flatten {'completed' if rc == 0 else 'FINISHED WITH ERRORS'}:\n\n{out[-3500:]}")
+
+
+def cmd_help(chat_id: str, _arg: str):
+    send(chat_id,
+         "Commands:\n"
+         "/status — service state + open positions\n"
+         "/positions — open positions detail\n"
+         "/pnl — realised P&L (today + all-time)\n"
+         "/log [n] — last n journal lines\n"
+         "/start — start trader\n"
+         "/stop YES — stop trader (positions left open!)\n"
+         "/restart — git pull + restart\n"
+         "/flatten YES — emergency close ALL positions")
+
+
+HANDLERS = {
+    "/status": cmd_status, "/positions": cmd_positions, "/pos": cmd_positions,
+    "/pnl": cmd_pnl, "/log": cmd_log, "/logs": cmd_log,
+    "/start": cmd_start, "/stop": cmd_stop, "/restart": cmd_restart,
+    "/flatten": cmd_flatten, "/help": cmd_help, "/start@": cmd_help,
+}
+
+
+def handle_message(msg: dict):
+    chat_id = str(msg.get("chat", {}).get("id", ""))
+    text = (msg.get("text") or "").strip()
+    if not chat_id or not text:
+        return
+
+    if chat_id not in ALLOWED:
+        # Silent ignore + log — don't confirm the bot exists to strangers
+        print(f"IGNORED unauthorized chat {chat_id}: {text!r}", flush=True)
+        return
+
+    # Strip @botname suffix that group chats add
+    parts = text.split(maxsplit=1)
+    cmd = parts[0].split("@")[0].lower()
+    arg = parts[1] if len(parts) > 1 else ""
+
+    # Resolve a pending confirmation if they reply with a bare YES
+    if text.upper() == "YES":
+        pend = _PENDING.pop(chat_id, None)
+        if pend and pend[1] > time.time():
+            action = pend[0]  # 'stop' | 'flatten'
+            HANDLERS["/" + action](chat_id, "YES")
+            return
+        send(chat_id, "Nothing pending to confirm (or it expired).")
+        return
+
+    handler = HANDLERS.get(cmd)
+    if handler:
+        print(f"cmd from {chat_id}: {cmd} {arg!r}", flush=True)
+        try:
+            handler(chat_id, arg)
+        except Exception as e:
+            send(chat_id, f"Error running {cmd}: {e}")
+    else:
+        send(chat_id, f"Unknown command {cmd}. /help for the list.")
+
+
+def main():
+    if not TOKEN:
+        raise SystemExit("ALERT_TELEGRAM_BOT_TOKEN not set")
+    if not ALLOWED:
+        raise SystemExit("No allowed chat IDs — set ALERT_TELEGRAM_CHAT_ID or CONTROL_TELEGRAM_CHAT_IDS")
+    print(f"Control bot up. service={SERVICE} allowed={ALLOWED} python={PYTHON}", flush=True)
+
+    offset = 0
+    while True:
+        try:
+            resp = _api("getUpdates", {"offset": offset, "timeout": 30}, timeout=40)
+            for upd in resp.get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message") or upd.get("edited_message")
+                if msg:
+                    handle_message(msg)
+        except Exception as e:
+            print(f"poll error: {e}", flush=True)
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()

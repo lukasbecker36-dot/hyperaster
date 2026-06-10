@@ -1,0 +1,16 @@
+[Unit]
+Description=Hyperaster equity-perp arb monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hyperaster
+ExecStart=/opt/hyperaster/.venv/bin/python live_monitor.py --paper
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
