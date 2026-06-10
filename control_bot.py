@@ -155,13 +155,43 @@ def _apply_mode(chat_id: str, mode: str):
 
 # ── Command handlers ──
 
-def cmd_status(chat_id: str, _arg: str):
-    rc, active = run(["systemctl", "is-active", SERVICE], timeout=10)
-    rc2, props = run(
-        ["systemctl", "show", SERVICE,
-         "--property=ActiveState,SubState,ExecMainStartTimestamp,ExecStart"],
+def _uptime_str() -> str:
+    """Human-readable uptime from systemd."""
+    _, ts = run(
+        ["systemctl", "show", SERVICE, "--property=ExecMainStartTimestamp", "--value"],
         timeout=10,
     )
+    if not ts or ts == "n/a":
+        return "?"
+    try:
+        from datetime import datetime
+        start = datetime.strptime(ts.strip(), "%a %Y-%m-%d %H:%M:%S %Z")
+        delta = datetime.utcnow() - start
+        hours, rem = divmod(int(delta.total_seconds()), 3600)
+        mins = rem // 60
+        if hours >= 24:
+            return f"{hours // 24}d {hours % 24}h"
+        return f"{hours}h {mins}m"
+    except Exception:
+        return ts.strip()
+
+
+def _latest_spreads() -> str:
+    """Parse the most recent tick log line from journalctl."""
+    _, out = run(
+        ["journalctl", "-u", SERVICE, "--no-pager", "-o", "cat",
+         "--grep=Watching:", "-n", "1"],
+        timeout=10,
+    )
+    if not out or "Watching:" not in out:
+        return "(no spread data yet)"
+    # Extract everything after "Watching:"
+    parts = out.split("Watching:", 1)
+    return parts[1].strip() if len(parts) > 1 else out.strip()
+
+
+def cmd_status(chat_id: str, _arg: str):
+    rc, active = run(["systemctl", "is-active", SERVICE], timeout=10)
     # Open positions
     try:
         rows = query_db(
@@ -174,18 +204,14 @@ def cmd_status(chat_id: str, _arg: str):
         open_paper = rows[0][0] if rows else 0
     except Exception as e:
         open_live = open_paper = f"?({e})"
-    # Mode comes from the runtime file unless the unit pins a flag in ExecStart
-    if "--live" in props:
-        mode = "live (pinned in unit)"
-    elif "--paper" in props:
-        mode = "paper (pinned in unit)"
-    else:
-        mode = read_mode()
+    mode = read_mode()
+    uptime = _uptime_str()
+    spreads = _latest_spreads()
     send(chat_id,
-         f"🤖 {SERVICE}: {active.upper()}\n"
+         f"🤖 {SERVICE}: {active.upper()} ({uptime})\n"
          f"mode: {mode}\n"
          f"open positions: {open_live} live / {open_paper} paper\n\n"
-         f"{props}")
+         f"📈 spreads: {spreads}")
 
 
 def cmd_positions(chat_id: str, _arg: str):
@@ -338,10 +364,29 @@ def cmd_paper(chat_id: str, arg: str):
     _apply_mode(chat_id, "paper")
 
 
+def cmd_spreads(chat_id: str, _arg: str):
+    """Show latest fast-tick spreads + slow-scan Top 5 with oracle deltas."""
+    fast = _latest_spreads()
+    # Grab last slow scan line (has oracle delta detail)
+    _, out = run(
+        ["journalctl", "-u", SERVICE, "--no-pager", "-o", "cat",
+         "--grep=Top 5:", "-n", "1"],
+        timeout=10,
+    )
+    if out and "Top 5:" in out:
+        top5 = out.split("Top 5:", 1)[1].strip()
+    else:
+        top5 = "(no slow scan yet)"
+    send(chat_id,
+         f"📈 Fast tick:\n{fast}\n\n"
+         f"🔍 Top 5 (with oracle delta):\n{top5}")
+
+
 def cmd_help(chat_id: str, _arg: str):
     send(chat_id,
          "Commands:\n"
-         "/status — service state + mode + open positions\n"
+         "/status — service state + spreads + positions\n"
+         "/spreads — current spread vs threshold detail\n"
          "/positions — open positions detail\n"
          "/pnl — realised P&L (today + all-time)\n"
          "/log [n] — last n journal lines\n"
@@ -357,6 +402,7 @@ def cmd_help(chat_id: str, _arg: str):
 HANDLERS = {
     "/status": cmd_status, "/positions": cmd_positions, "/pos": cmd_positions,
     "/pnl": cmd_pnl, "/log": cmd_log, "/logs": cmd_log,
+    "/spreads": cmd_spreads, "/spread": cmd_spreads,
     "/mode": cmd_mode, "/paper": cmd_paper, "/live": cmd_live,
     "/start": cmd_start, "/stop": cmd_stop, "/restart": cmd_restart,
     "/flatten": cmd_flatten, "/help": cmd_help,
