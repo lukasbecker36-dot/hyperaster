@@ -31,6 +31,7 @@ from config import (
     HYPERLIQUID_API, HL_EXCHANGE_URL,
     ASTER_ORDER_URL, ASTER_OPEN_ORDERS_URL, ASTER_POSITION_URL, ASTER_EXCHANGE_INFO_URL,
     ORDER_TIMEOUT_SECONDS, HL_IOC_BUFFER_BPS, ASTER_IOC_BUFFER_BPS,
+    aster_symbol_for, ASTER_BASE_ALIAS, ASTER_BASE_TO_CANON,
 )
 
 log = logging.getLogger(__name__)
@@ -154,6 +155,13 @@ class ExchangeClient:
                 if raw.endswith(suffix):
                     base = raw[: -len(suffix)]
                     break
+            # Cross-venue aliases: SAMSUNG/SKHYNIX are Aster's tradeable books for
+            # canonical SMSN/SKHX. The name-matching SMSNUSDT/SKHXUSDT are dead
+            # listings — skip them so the real book wins the canonical spec slot.
+            if base in ASTER_BASE_TO_CANON:
+                base = ASTER_BASE_TO_CANON[base]
+            elif base in ASTER_BASE_ALIAS:
+                continue
             if base not in symbols:
                 continue
             tick = step = min_qty = min_notional = 0.0
@@ -274,7 +282,7 @@ class ExchangeClient:
         now = now_ms()
         if cached and now - cached[2] < self._mark_cache_ttl_ms:
             return cached[0]
-        aster_sym = f"{symbol}USDT"
+        aster_sym = aster_symbol_for(symbol)
         try:
             async with self.session.get(
                 "https://fapi.asterdex.com/fapi/v1/premiumIndex",
@@ -390,7 +398,7 @@ class ExchangeClient:
         return sum(1 for ts, _ in hist if ts >= cutoff)
 
     async def _get_aster_book(self, symbol: str) -> OrderBook:
-        aster_sym = f"{symbol}USDT"
+        aster_sym = aster_symbol_for(symbol)
         try:
             async with self.session.get(
                 "https://fapi.asterdex.com/fapi/v1/depth",
@@ -504,7 +512,7 @@ class ExchangeClient:
         GTX = Good Till Crossing: posts as maker at the given price.
         Rejected immediately if it would cross (take) — use to stay passive.
         """
-        aster_sym = f"{symbol}USDT"
+        aster_sym = aster_symbol_for(symbol)
         params = {
             "symbol": aster_sym,
             "side": side.upper(),
@@ -546,7 +554,7 @@ class ExchangeClient:
         Place an IOC (taker) limit order on Aster to force-fill — used to escape
         a stuck maker exit. Pays Aster taker fee (~0.9bps); use sparingly.
         """
-        aster_sym = f"{symbol}USDT"
+        aster_sym = aster_symbol_for(symbol)
         is_buy = side.lower() == "buy"
         buffer = price * ASTER_IOC_BUFFER_BPS / 10000
         limit_px = price + buffer if is_buy else price - buffer
@@ -586,7 +594,7 @@ class ExchangeClient:
             return OrderResult(success=False, error=str(e), ambiguous=True)
 
     async def cancel_aster_order(self, symbol: str, order_id: str) -> bool:
-        aster_sym = f"{symbol}USDT"
+        aster_sym = aster_symbol_for(symbol)
         params = {"symbol": aster_sym, "orderId": int(order_id)}
         signed = self._sign_aster(params)
         try:
@@ -602,7 +610,7 @@ class ExchangeClient:
             return False
 
     async def query_aster_order(self, symbol: str, order_id: str) -> dict:
-        aster_sym = f"{symbol}USDT"
+        aster_sym = aster_symbol_for(symbol)
         params = {"symbol": aster_sym, "orderId": int(order_id)}
         signed = self._sign_aster(params)
         try:
@@ -615,7 +623,7 @@ class ExchangeClient:
             return {}
 
     async def get_aster_open_orders(self, symbol: str) -> list:
-        aster_sym = f"{symbol}USDT"
+        aster_sym = aster_symbol_for(symbol)
         params = {"symbol": aster_sym}
         signed = self._sign_aster(params)
         try:
@@ -629,7 +637,7 @@ class ExchangeClient:
             return []
 
     async def get_aster_position(self, symbol: str) -> dict:
-        aster_sym = f"{symbol}USDT"
+        aster_sym = aster_symbol_for(symbol)
         params = {"symbol": aster_sym}
         signed = self._sign_aster(params)
         try:

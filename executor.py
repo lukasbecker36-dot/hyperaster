@@ -30,6 +30,7 @@ from config import (
     NOTIONAL_PER_LEG, ENTRY_TIMEOUT_MINUTES, EXIT_TIMEOUT_MINUTES,
     MAX_PRICE_RATIO_DIVERGENCE, BLOCKED_SYMBOLS, MIN_EXECUTABLE_PREMIUM_BPS,
     ENTRY_CONFIRM_TICKS, ENTRY_COST_MARGIN_BPS, ROUND_TRIP_FEE,
+    aster_symbol_for,
 )
 from auth import now_ms
 
@@ -198,7 +199,7 @@ class Executor:
             self.pm.open_entering(
                 symbol=symbol,
                 hl_coin=f"xyz:{symbol}",
-                aster_symbol=f"{symbol}USDT",
+                aster_symbol=aster_symbol_for(symbol),
                 direction=direction,
                 entry_spread_bps=spread_bps,
                 hl_entry_price=hl_ref_price,
@@ -381,7 +382,7 @@ class Executor:
         pos = self.pm.open_entering(
             symbol=symbol,
             hl_coin=f"xyz:{symbol}",
-            aster_symbol=f"{symbol}USDT",
+            aster_symbol=aster_symbol_for(symbol),
             direction=direction,
             entry_spread_bps=spread_bps,
             hl_entry_price=hl_result.fill_price,

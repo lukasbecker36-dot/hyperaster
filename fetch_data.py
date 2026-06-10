@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from config import (
-    HYPERLIQUID_API, ASTER_API, CANDLE_INTERVAL, HISTORY_DAYS
+    HYPERLIQUID_API, ASTER_API, CANDLE_INTERVAL, HISTORY_DAYS, ASTER_BASE_ALIAS
 )
 
 # Python 3.14 strict SSL rejects some valid certs missing key usage extensions.
@@ -92,6 +92,14 @@ def find_overlapping_equity_perps():
                 base = sym[: -len(suffix)]
                 aster_base_map[base] = sym
                 break
+
+    # Cross-venue aliases: point canonical bases (HL's ticker) at Aster's
+    # tradeable book, overriding the dead name-matching listing.
+    #   SMSN -> SAMSUNGUSDT, SKHX -> SKHYNIXUSDT
+    for canon, aster_base in ASTER_BASE_ALIAS.items():
+        aliased = aster_base_map.get(aster_base)
+        if aliased:
+            aster_base_map[canon] = aliased
 
     print(f"  Found {len(aster_symbols_raw)} total symbols on Aster")
 

@@ -113,6 +113,8 @@ ENTRY_THRESHOLD_BPS_BY_SYMBOL: dict = {
     "META":     40,  # excess p75=41bps   oracle_delta=-2bps
     "MSTR":     40,  # excess p75=42bps   oracle_delta=-4bps
     "SNDK":     40,  # excess p75=38bps   oracle_delta=+4bps
+    "SKHX":     80,  # PROVISIONAL — Korean (SK Hynix). Replace with p75 after fetch_data history
+    "SMSN":     80,  # PROVISIONAL — Korean (Samsung).  Replace with p75 after fetch_data history
     "MSFT":     35,  # excess p75=33bps   oracle_delta=-4bps
     "AAPL":     30,  # (default)
     "AMZN":     30,  # (default)
@@ -123,6 +125,27 @@ ENTRY_THRESHOLD_BPS_BY_SYMBOL: dict = {
     "TSLA":     30,  # (default)
     "TSM":      30,  # (default)
 }
+
+# ── Cross-venue ticker aliases ──
+# The canonical base symbol equals HL's xyz coin suffix (e.g. "SMSN" from
+# "xyz:SMSN"). For most names Aster uses the same base + "USDT". A few names
+# differ: HL uses a short/GDR ticker while Aster's *tradeable* book uses the
+# long name, and Aster's name-matching contract is a dead listing that 400s.
+#   - Samsung:  HL xyz:SMSN  <-> Aster SAMSUNGUSDT  (SMSNUSDT is dead)
+#   - SK Hynix: HL xyz:SKHX  <-> Aster SKHYNIXUSDT  (SKHXUSDT is dead)
+# Map: canonical base -> Aster's tradeable base symbol.
+ASTER_BASE_ALIAS: dict = {
+    "SMSN": "SAMSUNG",
+    "SKHX": "SKHYNIX",
+}
+# Reverse map for discovery / spec loading: Aster base -> canonical base.
+ASTER_BASE_TO_CANON: dict = {v: k for k, v in ASTER_BASE_ALIAS.items()}
+
+
+def aster_symbol_for(base: str) -> str:
+    """Aster API symbol for a canonical base, honouring cross-venue aliases."""
+    return f"{ASTER_BASE_ALIAS.get(base, base)}USDT"
+
 
 # ── Sanity / blocklist ──
 # Reject entry if the two exchange mids differ by more than this fraction

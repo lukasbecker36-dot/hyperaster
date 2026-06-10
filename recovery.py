@@ -15,6 +15,7 @@ clears the symbol manually.
 import logging
 from dataclasses import dataclass
 
+from config import aster_symbol_for
 from database import get_connection
 from intents import complete_intent, get_incomplete_intents
 
@@ -132,7 +133,7 @@ async def _handle_hl_entry_intent(client, pm, intent: dict, report: ReconcileRep
     pos = pm.open_entering(
         symbol=symbol,
         hl_coin=f"xyz:{symbol}",
-        aster_symbol=f"{symbol}USDT",
+        aster_symbol=aster_symbol_for(symbol),
         direction=intent["direction"],
         entry_spread_bps=0.0,  # unknown after the fact
         hl_entry_price=intent["ref_price"] or 0.0,

@@ -35,7 +35,7 @@ from config import (
     ENTRY_THRESHOLD_BPS, ENTRY_THRESHOLD_BPS_BY_SYMBOL,
     EXIT_THRESHOLD_BPS, MAX_HOLD_HOURS, MAX_CONCURRENT_POSITIONS,
     HEARTBEAT_INTERVAL_MINUTES, PAPER_MODE, DATA_DIR, OUTPUT_DIR,
-    BLOCKED_SYMBOLS, ADVERSE_STOP_BPS,
+    BLOCKED_SYMBOLS, ADVERSE_STOP_BPS, aster_symbol_for,
 )
 
 SLOW_SCAN_INTERVAL_SECONDS = 300   # re-rank all symbols every 5 min
@@ -76,7 +76,7 @@ log = logging.getLogger(__name__)
 def load_symbols(override: list[str] | None) -> list[dict]:
     """Load the overlapping equity perp universe from fetch_data output."""
     if override:
-        return [{"coin": s, "hl_coin": f"xyz:{s}", "aster_symbol": f"{s}USDT"}
+        return [{"coin": s, "hl_coin": f"xyz:{s}", "aster_symbol": aster_symbol_for(s)}
                 for s in override]
 
     overlap_path = Path(OUTPUT_DIR) / "overlap_symbols.csv"
