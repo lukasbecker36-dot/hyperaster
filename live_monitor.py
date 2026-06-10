@@ -179,7 +179,10 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 (aster_index - hl_oracle) / mid * 10000
                 if aster_index > 0 and hl_oracle > 0 else 0.0
             )
-            excess_bps = cross_bps - oracle_delta_bps
+            # Record raw observation and use rolling median to reduce noise
+            client.record_oracle_delta(symbol, oracle_delta_bps)
+            smoothed_delta = client.get_smoothed_oracle_delta(symbol, oracle_delta_bps)
+            excess_bps = cross_bps - smoothed_delta
             direction = "L-HL/S-AST" if excess_bps < 0 else "L-AST/S-HL"
             return symbol, abs(excess_bps), direction, oracle_delta_bps, aster_book, hl_book
         except Exception as e:

@@ -17,7 +17,9 @@ import asyncio
 import json
 import logging
 import math
+import statistics
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -90,6 +92,11 @@ class ExchangeClient:
 
         # HL oracle price cache: symbol -> (oracle_px, fetched_at_ms)
         self._hl_oracle_cache: dict[str, tuple[float, int]] = {}
+
+        # Rolling oracle delta (aster_index - hl_oracle, in bps) per symbol.
+        # Used by get_smoothed_oracle_delta() to return the median instead of a
+        # noisy point-in-time value, which can cause phantom entries.
+        self._oracle_delta_history: dict[str, deque] = {}
 
     async def start(self, symbols: list[str]):
         """Load specs for all symbols."""
@@ -298,6 +305,19 @@ class ExchangeClient:
         """Return cached HL XYZ oracle price."""
         cached = self._hl_oracle_cache.get(symbol)
         return cached[0] if cached else 0.0
+
+    def record_oracle_delta(self, symbol: str, delta_bps: float):
+        """Append a raw oracle delta observation to the rolling window."""
+        if symbol not in self._oracle_delta_history:
+            self._oracle_delta_history[symbol] = deque(maxlen=20)
+        self._oracle_delta_history[symbol].append(delta_bps)
+
+    def get_smoothed_oracle_delta(self, symbol: str, current: float) -> float:
+        """Return rolling-median oracle delta (falls back to current if < 5 observations)."""
+        hist = self._oracle_delta_history.get(symbol)
+        if not hist or len(hist) < 5:
+            return current
+        return statistics.median(hist)
 
     async def _get_aster_book(self, symbol: str) -> OrderBook:
         aster_sym = f"{symbol}USDT"

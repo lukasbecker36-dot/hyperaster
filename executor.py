@@ -27,7 +27,7 @@ from position_manager import PositionManager
 from config import (
     ENTRY_THRESHOLD_BPS, ENTRY_THRESHOLD_BPS_BY_SYMBOL, EXIT_THRESHOLD_BPS,
     NOTIONAL_PER_LEG, ENTRY_TIMEOUT_MINUTES, EXIT_TIMEOUT_MINUTES,
-    MAX_PRICE_RATIO_DIVERGENCE, BLOCKED_SYMBOLS,
+    MAX_PRICE_RATIO_DIVERGENCE, BLOCKED_SYMBOLS, MIN_EXECUTABLE_PREMIUM_BPS,
 )
 from auth import now_ms
 
@@ -92,10 +92,13 @@ class Executor:
 
         aster_index = self.client.get_aster_index(symbol)
         hl_oracle = self.client.get_hl_oracle(symbol)
-        oracle_delta_bps = (
+        raw_delta_bps = (
             (aster_index - hl_oracle) / mid * 10000
             if aster_index > 0 and hl_oracle > 0 else 0.0
         )
+        # Use rolling-median oracle delta to suppress noisy point-in-time feed spikes
+        oracle_delta_bps = self.client.get_smoothed_oracle_delta(symbol, raw_delta_bps)
+
         # For long_hl_short_aster: Aster premium minus the oracle delta
         # For long_aster_short_hl: HL premium plus the oracle delta (delta is negative here)
         aster_excess_bps = aster_premium_bps - oracle_delta_bps
@@ -120,6 +123,15 @@ class Executor:
             aster_side = "buy"
             aster_ref_price = aster_book.ask
         else:
+            return False
+
+        # Hard floor — ensures the edge exceeds fee cost even before rolling median
+        # stabilises (guards the first 5 ticks per symbol where median falls back to raw)
+        if spread_bps < MIN_EXECUTABLE_PREMIUM_BPS:
+            log.debug(
+                f"{symbol}: excess {spread_bps:.1f}bps below MIN_EXECUTABLE floor "
+                f"({MIN_EXECUTABLE_PREMIUM_BPS}bps), skipping"
+            )
             return False
 
         # Size in base tokens
@@ -160,15 +172,16 @@ class Executor:
             if fresh_mid <= 0:
                 log.warning(f"{symbol}: empty books on recheck, aborting")
                 return False
-            fresh_oracle_delta = (
+            fresh_raw_delta = (
                 (aster_index - hl_oracle) / fresh_mid * 10000
                 if aster_index > 0 and hl_oracle > 0 else 0.0
             )
+            fresh_oracle_delta = self.client.get_smoothed_oracle_delta(symbol, fresh_raw_delta)
             if direction == "long_hl_short_aster":
                 fresh_excess = (fresh_aster.bid - fresh_hl.ask) / fresh_mid * 10000 - fresh_oracle_delta
             else:
                 fresh_excess = (fresh_hl.bid - fresh_aster.ask) / fresh_mid * 10000 + fresh_oracle_delta
-            if fresh_excess < ENTRY_THRESHOLD_BPS:
+            if fresh_excess < max(ENTRY_THRESHOLD_BPS, MIN_EXECUTABLE_PREMIUM_BPS):
                 log.warning(
                     f"{symbol}: excess spread collapsed to {fresh_excess:.1f}bps on recheck, aborting"
                 )

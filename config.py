@@ -29,6 +29,11 @@ ASTER_TAKER_FEE = 0.00009
 # Round-trip: aster maker both legs + HL taker both legs
 ROUND_TRIP_FEE = 2 * ASTER_MAKER_FEE + 2 * HL_TAKER_FEE  # ~0.09% = 9bps
 
+# Minimum net executable premium (bps) after subtracting smoothed oracle delta.
+# Belt-and-suspenders floor: prevents entries where oracle delta noise inflates the
+# apparent excess during the first few ticks before the rolling median stabilises.
+MIN_EXECUTABLE_PREMIUM_BPS = 15.0
+
 # ── Strategy parameters ──
 # Spread in bps above which we enter.  Round-trip cost ~9-14bps so 30bps = ~2x cushion.
 ENTRY_THRESHOLD_BPS = 30.0
