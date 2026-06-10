@@ -47,6 +47,10 @@ BASE_DIR = Path(__file__).resolve().parent
 VENV_PY = BASE_DIR / ".venv" / "bin" / "python"
 PYTHON = str(VENV_PY) if VENV_PY.exists() else "python3"
 
+# Runtime mode file — written here, read by the trader via systemd
+# EnvironmentFile=-/opt/hyperaster/data/mode.env. Not version controlled.
+MODE_FILE = BASE_DIR / "data" / "mode.env"
+
 TOKEN = os.getenv("ALERT_TELEGRAM_BOT_TOKEN", "")
 SERVICE = os.getenv("CONTROL_SERVICE_NAME", "hyperaster")
 BRANCH = os.getenv("CONTROL_BRANCH", "")
@@ -112,6 +116,43 @@ def query_db(sql: str, args: tuple = ()) -> list[tuple]:
         conn.close()
 
 
+def read_mode() -> str:
+    """Current configured mode from the mode file; defaults to paper."""
+    try:
+        for line in MODE_FILE.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("HYPERASTER_MODE="):
+                v = line.split("=", 1)[1].strip().lower()
+                if v in ("paper", "live"):
+                    return v
+    except FileNotFoundError:
+        pass
+    return "paper"
+
+
+def write_mode(mode: str):
+    MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    MODE_FILE.write_text(f"HYPERASTER_MODE={mode}\n")
+
+
+def open_live_count() -> int:
+    try:
+        rows = query_db(
+            "SELECT COUNT(*) FROM positions WHERE status NOT IN ('closed','error') AND paper=0"
+        )
+        return rows[0][0] if rows else 0
+    except Exception:
+        return 0
+
+
+def _apply_mode(chat_id: str, mode: str):
+    write_mode(mode)
+    rc, out = run(["systemctl", "restart", SERVICE], timeout=30)
+    time.sleep(2)
+    _, active = run(["systemctl", "is-active", SERVICE], timeout=10)
+    send(chat_id, f"⚙️ mode → {mode.upper()} — service {active}\n{out}".strip())
+
+
 # ── Command handlers ──
 
 def cmd_status(chat_id: str, _arg: str):
@@ -133,7 +174,13 @@ def cmd_status(chat_id: str, _arg: str):
         open_paper = rows[0][0] if rows else 0
     except Exception as e:
         open_live = open_paper = f"?({e})"
-    mode = "live" if "--live" in props else ("paper" if "--paper" in props else "?")
+    # Mode comes from the runtime file unless the unit pins a flag in ExecStart
+    if "--live" in props:
+        mode = "live (pinned in unit)"
+    elif "--paper" in props:
+        mode = "paper (pinned in unit)"
+    else:
+        mode = read_mode()
     send(chat_id,
          f"🤖 {SERVICE}: {active.upper()}\n"
          f"mode: {mode}\n"
@@ -261,13 +308,46 @@ def cmd_flatten(chat_id: str, arg: str):
     send(chat_id, f"flatten {'completed' if rc == 0 else 'FINISHED WITH ERRORS'}:\n\n{out[-3500:]}")
 
 
+def cmd_mode(chat_id: str, _arg: str):
+    send(chat_id, f"⚙️ configured mode: {read_mode().upper()}\n"
+                  f"(use /paper or /live to switch — restarts the trader)")
+
+
+def cmd_live(chat_id: str, arg: str):
+    if arg.strip().upper() != "YES":
+        _PENDING[chat_id] = ("live", time.time() + _CONFIRM_TTL)
+        send(chat_id,
+             "⚠️ Switch to LIVE mode? The trader will place REAL orders with REAL "
+             "capital on both venues.\n\n"
+             f"Send /live YES within {_CONFIRM_TTL}s to confirm.")
+        return
+    _apply_mode(chat_id, "live")
+
+
+def cmd_paper(chat_id: str, arg: str):
+    n_live = open_live_count()
+    # Switching to paper while live positions are open abandons them (paper mode
+    # won't manage real positions). Require confirmation in that case.
+    if n_live and arg.strip().upper() != "YES":
+        _PENDING[chat_id] = ("paper", time.time() + _CONFIRM_TTL)
+        send(chat_id,
+             f"⚠️ {n_live} live position(s) are open. Switching to PAPER will leave "
+             f"them UNMANAGED on the exchanges. Consider /flatten YES first.\n\n"
+             f"Send /paper YES within {_CONFIRM_TTL}s to switch anyway.")
+        return
+    _apply_mode(chat_id, "paper")
+
+
 def cmd_help(chat_id: str, _arg: str):
     send(chat_id,
          "Commands:\n"
-         "/status — service state + open positions\n"
+         "/status — service state + mode + open positions\n"
          "/positions — open positions detail\n"
          "/pnl — realised P&L (today + all-time)\n"
          "/log [n] — last n journal lines\n"
+         "/mode — show configured mode\n"
+         "/paper — switch to paper mode (restarts)\n"
+         "/live YES — switch to live mode (restarts)\n"
          "/start — start trader\n"
          "/stop YES — stop trader (positions left open!)\n"
          "/restart — git pull + restart\n"
@@ -277,8 +357,9 @@ def cmd_help(chat_id: str, _arg: str):
 HANDLERS = {
     "/status": cmd_status, "/positions": cmd_positions, "/pos": cmd_positions,
     "/pnl": cmd_pnl, "/log": cmd_log, "/logs": cmd_log,
+    "/mode": cmd_mode, "/paper": cmd_paper, "/live": cmd_live,
     "/start": cmd_start, "/stop": cmd_stop, "/restart": cmd_restart,
-    "/flatten": cmd_flatten, "/help": cmd_help, "/start@": cmd_help,
+    "/flatten": cmd_flatten, "/help": cmd_help,
 }
 
 

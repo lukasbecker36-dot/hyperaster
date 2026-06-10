@@ -47,16 +47,29 @@ journalctl -u hyperaster -f
 
 Then from Telegram: `/status`, `/help`.
 
-## Going live
+## Paper vs live
 
-Edit `hyperaster.service`, change `--paper` to `--live`, then:
+Mode is **not** hardcoded in the unit. It's read from `HYPERASTER_MODE` in
+`/opt/hyperaster/data/mode.env` (loaded via `EnvironmentFile`). Missing file =
+paper, the safe default.
+
+Switch from Telegram — this rewrites the mode file and restarts the trader:
+
+```
+/mode        → show current mode
+/paper       → switch to paper (warns if live positions are open)
+/live YES    → switch to live (requires confirmation — real capital)
+```
+
+Or by hand:
 
 ```bash
-sudo systemctl daemon-reload
+echo 'HYPERASTER_MODE=live' | sudo tee /opt/hyperaster/data/mode.env
 sudo systemctl restart hyperaster
 ```
 
-(Or just use `/restart` from Telegram after editing.)
+You can still pin a mode in the unit by adding `--paper` or `--live` to
+`ExecStart`; an explicit flag overrides the env var.
 
 ## Telegram commands
 
@@ -66,6 +79,9 @@ sudo systemctl restart hyperaster
 | `/positions` | open positions detail |
 | `/pnl` | realised P&L today + all-time, error count |
 | `/log [n]` | last n journal lines (default 20) |
+| `/mode` | show configured mode |
+| `/paper` | switch to paper mode (restarts; warns if live positions open) |
+| `/live YES` | switch to live mode (restarts; requires confirm) |
 | `/start` | start the trader |
 | `/stop YES` | stop the trader (positions left unmanaged!) |
 | `/restart` | git pull + restart |

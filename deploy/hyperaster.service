@@ -6,7 +6,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/hyperaster
-ExecStart=/opt/hyperaster/.venv/bin/python live_monitor.py --paper
+# Mode (paper/live) comes from HYPERASTER_MODE in this file, written by the
+# control bot's /paper and /live commands. Missing file = paper (the default).
+EnvironmentFile=-/opt/hyperaster/data/mode.env
+ExecStart=/opt/hyperaster/.venv/bin/python live_monitor.py
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal

@@ -374,7 +374,15 @@ def main():
     elif args.live:
         paper_mode = False
     else:
-        paper_mode = PAPER_MODE
+        # No explicit flag — fall back to HYPERASTER_MODE env var (set by the
+        # control bot's mode file via systemd EnvironmentFile), then config.
+        env_mode = os.getenv("HYPERASTER_MODE", "").strip().lower()
+        if env_mode == "live":
+            paper_mode = False
+        elif env_mode == "paper":
+            paper_mode = True
+        else:
+            paper_mode = PAPER_MODE
 
     setup_logging()
     install_alert_handler()
