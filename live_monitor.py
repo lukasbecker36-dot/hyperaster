@@ -35,7 +35,7 @@ from config import (
     ENTRY_THRESHOLD_BPS, ENTRY_THRESHOLD_BPS_BY_SYMBOL,
     EXIT_THRESHOLD_BPS, MAX_HOLD_HOURS, MAX_CONCURRENT_POSITIONS,
     HEARTBEAT_INTERVAL_MINUTES, PAPER_MODE, DATA_DIR, OUTPUT_DIR,
-    BLOCKED_SYMBOLS, ADVERSE_STOP_BPS, aster_symbol_for,
+    BLOCKED_SYMBOLS, ADVERSE_STOP_BPS, ENTRY_CONFIRM_TICKS, aster_symbol_for,
 )
 
 SLOW_SCAN_INTERVAL_SECONDS = 300   # re-rank all symbols every 5 min
@@ -318,7 +318,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     if r and r[0] not in fast_set:
                         await process_result(r)
                 thresh_strs = " | ".join(
-                    f"{s} {spd:.1f}/{ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(s, ENTRY_THRESHOLD_BPS):.0f}bps (d={odelta:+.1f})"
+                    f"{s} {spd:.0f}/{ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(s, ENTRY_THRESHOLD_BPS):.0f}bps d={odelta:+.0f}"
                     for s, spd, _, odelta, *_ in ranked[:5]
                 )
                 log.info(f"Slow scan | Watching: {candidates} | Top 5: {thresh_strs}")
@@ -338,10 +338,17 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                         f"{s}[{p.status} {(now_ms()-p.entry_time)/3_600_000:.1f}h]"
                         for s, p in pm.positions.items()
                     )
-                cand_str = "  ".join(
-                    f"{s}:{latest_spreads.get(s,(0,'',0.0))[0]:.1f}/{ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(s, ENTRY_THRESHOLD_BPS):.0f}bps"
-                    for s in candidates
-                ) or "pending scan"
+                cand_parts = []
+                for s in candidates:
+                    spd = latest_spreads.get(s, (0, '', 0.0))[0]
+                    thr = ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(s, ENTRY_THRESHOLD_BPS)
+                    _, streak = executor._entry_streak.get(s, ("", 0))
+                    if spd >= thr and streak > 0:
+                        cand_parts.append(f"{s} {spd:.0f}bps({streak}/{ENTRY_CONFIRM_TICKS})")
+                    else:
+                        pct = spd / thr * 100 if thr > 0 else 0
+                        cand_parts.append(f"{s} {pct:.0f}%")
+                cand_str = "  ".join(cand_parts) or "pending scan"
                 log.info(
                     f"Tick {tick_count} | Active: {pm.active_count}{pos_str} | "
                     f"Watching: {cand_str}"
@@ -371,10 +378,18 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     if sym not in open_syms
                 ]
                 spread_ranking.sort(key=lambda x: x[1], reverse=True)
-                watch_lines = [
-                    f"  {sym}: excess={spd:.1f}/{ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(sym, ENTRY_THRESHOLD_BPS):.0f}bps  d={odelta:+.1f}bps  ({drn})"
-                    for sym, spd, drn, odelta in spread_ranking[:5]
-                ]
+                watch_lines = []
+                for sym, spd, drn, odelta in spread_ranking[:5]:
+                    thr = ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(sym, ENTRY_THRESHOLD_BPS)
+                    _, streak = executor._entry_streak.get(sym, ("", 0))
+                    if spd >= thr and streak > 0:
+                        proximity = f"{spd:.0f}bps({streak}/{ENTRY_CONFIRM_TICKS})"
+                    else:
+                        pct = spd / thr * 100 if thr > 0 else 0
+                        proximity = f"{pct:.0f}%"
+                    watch_lines.append(
+                        f"  {sym}: {proximity}  d={odelta:+.0f}bps  ({drn})"
+                    )
 
                 log.info(
                     f"HEARTBEAT | uptime={uptime:.0f}min | ticks={tick_count} | "
