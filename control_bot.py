@@ -216,8 +216,16 @@ def cmd_status(chat_id: str, _arg: str):
 
 def cmd_positions(chat_id: str, _arg: str):
     try:
+        from config import EXIT_THRESHOLD_BPS, ROUND_TRIP_FEE
+        exit_bps = EXIT_THRESHOLD_BPS
+        fee_bps = ROUND_TRIP_FEE * 10000
+    except Exception:
+        exit_bps = 8.0
+        fee_bps = 9.0
+    try:
         rows = query_db(
-            "SELECT symbol, status, direction, entry_spread_bps, qty, entry_time, paper "
+            "SELECT symbol, status, direction, entry_spread_bps, qty, entry_time, "
+            "paper, notional_usd "
             "FROM positions WHERE status NOT IN ('closed','error') ORDER BY entry_time"
         )
     except Exception as e:
@@ -228,12 +236,17 @@ def cmd_positions(chat_id: str, _arg: str):
         return
     now = time.time() * 1000
     lines = ["📊 Open positions:"]
-    for sym, status, direction, spread, qty, etime, paper in rows:
+    for sym, status, direction, spread, qty, etime, paper, notional in rows:
         held_h = (now - (etime or now)) / 3_600_000
         tag = " [paper]" if paper else ""
+        entry_bps = spread or 0
+        net_edge_bps = entry_bps - exit_bps - fee_bps
+        target_pnl = net_edge_bps * (notional or 0) / 10000
         lines.append(
             f"• {sym}{tag} [{status}] {direction or ''}\n"
-            f"    entry={spread or 0:.1f}bps qty={qty or 0} held={held_h:.1f}h"
+            f"    entry={entry_bps:.1f}bps → exit={exit_bps:.0f}bps (fees={fee_bps:.0f}bps)\n"
+            f"    qty={qty or 0}  notional=${notional or 0:.0f}  target P&L=${target_pnl:.2f}\n"
+            f"    held={held_h:.1f}h"
         )
     send(chat_id, "\n".join(lines))
 
