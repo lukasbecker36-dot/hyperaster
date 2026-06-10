@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src import aster, history, hyperliquid as hl
 from src.fees import ROUND_TRIP_MAKER_BPS, ROUND_TRIP_TAKER_BPS
-from config import ENTRY_THRESHOLD_BPS_BY_SYMBOL, ENTRY_THRESHOLD_BPS
+from config import ENTRY_THRESHOLD_BPS_BY_SYMBOL, ENTRY_THRESHOLD_BPS, BLOCKED_SYMBOLS
 
 HOUR_MS = history.HOUR_MS
 
@@ -118,7 +118,17 @@ def backtest_symbol(
     df: pd.DataFrame, entry_bps: float, exit_bps: float,
     max_hold_h: int, total_cost_taker: float, total_cost_maker: float,
 ) -> dict:
-    """State machine: flat → enter on |spread|>=entry → exit on |spread|<=exit or timeout."""
+    """State machine: flat → enter on |excess|>=entry → exit on |excess|<=exit or timeout.
+
+    We trade the *excess* spread (raw minus the structural oracle/basis gap),
+    matching the live executor (which subtracts the smoothed oracle delta) and
+    compute_thresholds.py (whose p75 is on |raw - median|). Using raw spread
+    here would over-fire on names with a large persistent basis (SMSN, SKHX,
+    BIRD, ...). Structural gap = whole-window median (a lookahead approximation
+    of the slowly-varying basis; the live bot uses a trailing estimate).
+    """
+    structural = float(df["spread_bps"].median())
+
     in_pos = False
     direction = ""
     entry_abs = 0.0
@@ -129,13 +139,13 @@ def backtest_symbol(
     rows = df.to_dict("records")
 
     for row in rows:
-        spread = row["spread_bps"]
-        abs_spread = abs(spread)
+        excess = row["spread_bps"] - structural
+        abs_spread = abs(excess)
 
         if not in_pos:
             if abs_spread >= entry_bps:
                 in_pos = True
-                direction = "BUY_HL" if spread > 0 else "BUY_ASTER"
+                direction = "BUY_HL" if excess > 0 else "BUY_ASTER"
                 entry_abs = abs_spread
                 hold = 0
                 carry_acc = 0.0
@@ -161,11 +171,12 @@ def backtest_symbol(
                 in_pos = False
 
     if not trades:
-        return {"n_trades": 0}
+        return {"n_trades": 0, "structural": structural}
 
     t = pd.DataFrame(trades)
     return {
         "n_trades": len(t),
+        "structural": structural,
         "win_rate_taker": (t["net_taker"] > 0).mean() * 100,
         "win_rate_maker": (t["net_maker"] > 0).mean() * 100,
         "avg_hold_h": t["hold_h"].mean(),
@@ -238,7 +249,7 @@ def main() -> None:
 {'='*108}
  CONVERGENCE BACKTEST  |  entry: {mode}, exit<={args.exit:.0f}bps or {args.max_hold}h timeout
 {'='*108}""")
-    hdr2 = (f"{'Sym':<6} {'entry':>5} {'trades':>6} {'win%tkr':>7} {'win%mkr':>7} {'avgHold':>7} "
+    hdr2 = (f"{'Sym':<6} {'entry':>5} {'basis':>6} {'trades':>6} {'win%tkr':>7} {'win%mkr':>7} {'avgHold':>7} "
             f"{'avgConv':>7} {'avgCarry':>8} {'avgNet(t)':>9} {'avgNet(m)':>9} "
             f"{'totNet(t)':>9} {'totNet(m)':>9} {'timeout%':>8}")
     print(hdr2)
@@ -246,14 +257,16 @@ def main() -> None:
 
     summary = []
     for sym, df in panels.items():
+        if sym in BLOCKED_SYMBOLS:
+            continue
         entry = ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(sym, ENTRY_THRESHOLD_BPS) if use_per_symbol else global_entry
         r = backtest_symbol(df, entry, args.exit, args.max_hold, cost_taker, cost_maker)
         if r["n_trades"] == 0:
-            print(f"{sym:<6} {entry:>5.0f} {'0':>6}  (spread never reached entry threshold)")
+            print(f"{sym:<6} {entry:>5.0f} {r['structural']:>+5.0f}b {'0':>6}  (excess never reached entry threshold)")
             continue
         summary.append((sym, r, entry))
         print(
-            f"{sym:<6} {entry:>5.0f} {r['n_trades']:>6} {r['win_rate_taker']:>6.0f}% {r['win_rate_maker']:>6.0f}% "
+            f"{sym:<6} {entry:>5.0f} {r['structural']:>+5.0f}b {r['n_trades']:>6} {r['win_rate_taker']:>6.0f}% {r['win_rate_maker']:>6.0f}% "
             f"{r['avg_hold_h']:>6.1f}h {r['avg_conv']:>7.1f} {r['avg_carry']:>+7.2f}b "
             f"{r['avg_net_taker']:>+8.1f}b {r['avg_net_maker']:>+8.1f}b "
             f"{r['total_net_taker']:>+8.1f}b {r['total_net_maker']:>+8.1f}b "
