@@ -21,21 +21,25 @@ async def get_all_equity_perps(session: aiohttp.ClientSession) -> dict[str, Equi
     """
     Returns {canonical: EquityPerp} for all xyz: HIP-3 equity perps.
     Funding rate is the current 1-hour rate from metaAndAssetCtxs.
+
+    The xyz builder dex must be requested explicitly via the "dex" param —
+    without it the default mainnet universe is returned, which has no xyz coins.
+    Universe names may come back bare ("AAPL") or prefixed ("xyz:AAPL"); we
+    normalise to a bare canonical and rebuild the full "xyz:" coin for /info
+    history queries.
     """
-    data = await _post(session, {"type": "metaAndAssetCtxs"})
+    data = await _post(session, {"type": "metaAndAssetCtxs", "dex": "xyz"})
     meta, ctxs = data[0], data[1]
 
     result: dict[str, EquityPerp] = {}
     for asset, ctx in zip(meta["universe"], ctxs):
-        coin: str = asset["name"]
-        if not coin.startswith("xyz:"):
-            continue
-        canonical = coin[4:]  # strip "xyz:"
+        name: str = asset["name"]
+        canonical = name.split(":")[-1]  # bare base, prefix-agnostic
         mark_px_str = ctx.get("markPx") or ctx.get("midPx")
         funding_str = ctx.get("funding", "0")
         result[canonical] = EquityPerp(
             canonical=canonical,
-            venue_symbol=coin,
+            venue_symbol=f"xyz:{canonical}",  # full coin name for history endpoints
             mark_price=Decimal(mark_px_str) if mark_px_str else None,
             funding_rate_hourly=Decimal(funding_str),
         )
