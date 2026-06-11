@@ -31,7 +31,7 @@ from src.fees import ROUND_TRIP_TAKER_BPS
 from config import (
     ENTRY_THRESHOLD_BPS_BY_SYMBOL, ENTRY_THRESHOLD_BPS, BLOCKED_SYMBOLS,
     NOTIONAL_PER_LEG, MAX_CONCURRENT_POSITIONS, MIN_RAW_PREMIUM_BPS,
-    ROUND_TRIP_FEE, ENTRY_CONFIRM_TICKS,
+    ROUND_TRIP_FEE, ENTRY_CONFIRM_TICKS, ENTRY_COST_MARGIN_BPS,
 )
 
 MIN_MS = 60_000
@@ -293,7 +293,12 @@ def backtest_portfolio(panels, tob_notional, tob_spread_bps, target_net, max_slo
             idx = ts_idx[sym][ts]
             row = df.iloc[idx]
 
-            threshold = ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(sym, ENTRY_THRESHOLD_BPS)
+            base_threshold = ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(sym, ENTRY_THRESHOLD_BPS)
+            # Dynamic cost floor: must clear round-trip fees + both venue spreads
+            # + margin, matching live executor's ENTRY_COST_MARGIN_BPS logic.
+            sym_spread = tob_spread_bps.get(sym, 0) / 2  # RT spread / 2 = one-way HL+Aster
+            cost_floor = ROUND_TRIP_FEE * 10000 + sym_spread + ENTRY_COST_MARGIN_BPS
+            threshold = max(base_threshold, cost_floor)
 
             for excess_col, direction in [
                 ("aster_excess", "long_hl_short_aster"),

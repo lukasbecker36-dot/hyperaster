@@ -131,6 +131,11 @@ class Executor:
             + ENTRY_COST_MARGIN_BPS
         )
         threshold = max(base_threshold, cost_floor)
+        if cost_floor > base_threshold:
+            log.debug(
+                f"{symbol}: cost floor {cost_floor:.0f}bps > base {base_threshold:.0f}bps "
+                f"(HL sprd={hl_spread_bps:.0f} Ast sprd={aster_spread_bps:.0f})"
+            )
 
         if aster_excess_bps >= threshold:
             direction = "long_hl_short_aster"
