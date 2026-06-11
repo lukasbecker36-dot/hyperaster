@@ -262,6 +262,12 @@ def backtest_portfolio(panels, tob_notional, tob_spread_bps, target_net, max_slo
             reason = None
             if net >= target_net:
                 reason = "target"
+                # Cap P&L to target: live bot exits at ~$2 net (1s polling),
+                # not at end-of-candle price. Attribute the overshoot back to
+                # gross so fees/crossing/funding stay accurate.
+                overshoot = net - target_net
+                gross -= overshoot
+                net = target_net
             elif minutes_held >= max_hold_min:
                 reason = "timeout"
 
