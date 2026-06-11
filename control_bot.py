@@ -397,9 +397,9 @@ def cmd_paper(chat_id: str, arg: str):
 
 
 def cmd_spreads(chat_id: str, _arg: str):
-    """Show latest fast-tick spreads + slow-scan Top 5 with oracle deltas."""
+    """Show latest fast-tick spreads + slow-scan Top 5 with baseline detail."""
     fast = _latest_spreads()
-    # Grab last slow scan line (has oracle delta detail)
+    # Grab last slow scan line (shows excess/threshold and rolling baseline)
     _, out = run(
         ["journalctl", "-u", SERVICE, "--no-pager", "-o", "cat",
          "--grep=Top 5:", "-n", "1"],
@@ -410,8 +410,8 @@ def cmd_spreads(chat_id: str, _arg: str):
     else:
         top5 = "(no slow scan yet)"
     send(chat_id,
-         f"📈 Fast tick:\n{fast}\n\n"
-         f"🔍 Top 5 (with oracle delta):\n{top5}")
+         f"📈 Fast tick:  (excess% of threshold, or excessbps(streak))\n{fast}\n\n"
+         f"🔍 Top 5  (excess / threshold bps · base = 8h-median spread):\n{top5}")
 
 
 def cmd_trades(chat_id: str, arg: str):
