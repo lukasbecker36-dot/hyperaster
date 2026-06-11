@@ -190,27 +190,19 @@ class Executor:
             )
             return False
 
-        # Size in base tokens
-        qty = self.client.snap_aster_qty(symbol, NOTIONAL_PER_LEG / mid)
-        if qty <= 0:
-            log.warning(f"{symbol}: qty snapped to 0 at mid={mid:.2f}")
-            return False
-
-        # Liquidity check: best level on both books must accommodate our qty.
-        # Entry buys/sells at top-of-book; if our size exceeds the available
-        # depth we'll get partial fills or walk the book into slippage.
+        # Size in base tokens, capped by top-of-book liquidity on both venues.
+        target_qty = NOTIONAL_PER_LEG / mid
         if direction == "long_hl_short_aster":
             hl_avail, ast_avail = hl_book.ask_size, aster_book.bid_size
         else:
             hl_avail, ast_avail = hl_book.bid_size, aster_book.ask_size
-        if hl_avail < qty:
-            log.debug(f"{symbol}: HL top-of-book {hl_avail:.2f} < qty {qty:.2f} — skipping")
+        max_qty = min(target_qty, hl_avail, ast_avail)
+        qty = self.client.snap_aster_qty(symbol, max_qty)
+        if qty <= 0:
+            log.debug(f"{symbol}: qty snapped to 0 (target={target_qty:.2f} hl={hl_avail:.2f} ast={ast_avail:.2f})")
             self._entry_streak.pop(symbol, None)
             return False
-        if ast_avail < qty:
-            log.debug(f"{symbol}: Aster top-of-book {ast_avail:.2f} < qty {qty:.2f} — skipping")
-            self._entry_streak.pop(symbol, None)
-            return False
+        actual_notional = qty * mid
 
         log.info(
             f"ENTRY {symbol}: {direction} | excess={spread_bps:.1f}bps d={oracle_delta_bps:+.1f}bps | "
@@ -236,7 +228,7 @@ class Executor:
                 hl_order_id="PAPER",
                 aster_entry_order_id="PAPER",
                 qty=qty,
-                notional_usd=NOTIONAL_PER_LEG,
+                notional_usd=actual_notional,
                 hl_funding_rate=hl_fr,
                 aster_funding_rate=aster_fr,
             )
@@ -419,7 +411,7 @@ class Executor:
             hl_order_id=hl_result.order_id,
             aster_entry_order_id=aster_result.order_id,
             qty=actual_qty,
-            notional_usd=NOTIONAL_PER_LEG,
+            notional_usd=actual_notional,
             hl_funding_rate=hl_fr,
             aster_funding_rate=aster_fr,
         )
