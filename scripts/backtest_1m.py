@@ -8,11 +8,11 @@ premium floor, profit-target exit (convergence + funding carry), and
 portfolio-level slot cap.
 
 Sizing is capped to current top-of-book liquidity per symbol.
-Bid-ask crossing cost is estimated via --bo-bps.
+Bid-ask crossing cost uses actual per-symbol spreads from live order books.
 
 Usage (run on Hetzner server):
     .venv/bin/python scripts/backtest_1m.py --hours 48
-    .venv/bin/python scripts/backtest_1m.py --hours 48 --bo-bps 20 --target 2.0
+    .venv/bin/python scripts/backtest_1m.py --hours 48 --target 2.0
 """
 
 import argparse
@@ -67,14 +67,15 @@ async def fetch_book_sizes(
     return sizes
 
 
-async def fetch_top_of_book_notional(
+async def fetch_top_of_book(
     session: aiohttp.ClientSession,
     hl_perps: dict, aster_perps: dict, overlap: list[str],
-) -> dict[str, float]:
-    """Fetch current top-of-book depth and return {symbol: max_notional_usd}.
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Fetch current top-of-book depth and spreads.
 
-    Takes the min of HL best-level size and Aster best-level size,
-    converted to USD notional.
+    Returns:
+        tob_notional: {symbol: max_notional_usd} — min of HL/Aster best-level size
+        tob_spread_bps: {symbol: round_trip_crossing_bps} — HL spread + Aster spread
     """
     async def get_hl_top(canon):
         coin = hl_perps[canon].venue_symbol
@@ -86,15 +87,16 @@ async def fetch_top_of_book_notional(
             bids = levels[0] if levels[0] else []
             asks = levels[1] if levels[1] else []
             if not bids or not asks:
-                return canon, 0, 0
+                return canon, 0, 0, 0, 0
             bid_px = float(bids[0]["px"])
             ask_px = float(asks[0]["px"])
             bid_sz = float(bids[0]["sz"])
             ask_sz = float(asks[0]["sz"])
             mid = (bid_px + ask_px) / 2
-            return canon, bid_sz * mid, ask_sz * mid
+            spread_bps = (ask_px - bid_px) / mid * 10000 if mid > 0 else 0
+            return canon, bid_sz * mid, ask_sz * mid, mid, spread_bps
         except Exception:
-            return canon, 0, 0
+            return canon, 0, 0, 0, 0
 
     async def get_aster_top(canon):
         sym = aster_perps[canon].venue_symbol
@@ -105,32 +107,33 @@ async def fetch_top_of_book_notional(
             bids = data.get("bids", [])
             asks = data.get("asks", [])
             if not bids or not asks:
-                return canon, 0, 0
+                return canon, 0, 0, 0, 0
             bid_px = float(bids[0][0])
             ask_px = float(asks[0][0])
             bid_sz = float(bids[0][1])
             ask_sz = float(asks[0][1])
             mid = (bid_px + ask_px) / 2
-            return canon, bid_sz * mid, ask_sz * mid
+            spread_bps = (ask_px - bid_px) / mid * 10000 if mid > 0 else 0
+            return canon, bid_sz * mid, ask_sz * mid, mid, spread_bps
         except Exception:
-            return canon, 0, 0
+            return canon, 0, 0, 0, 0
 
     hl_results = await asyncio.gather(*[get_hl_top(c) for c in overlap])
     ast_results = await asyncio.gather(*[get_aster_top(c) for c in overlap])
 
-    hl_map = {c: (bid_n, ask_n) for c, bid_n, ask_n in hl_results}
-    ast_map = {c: (bid_n, ask_n) for c, bid_n, ask_n in ast_results}
+    hl_map = {c: (bid_n, ask_n, mid, sp) for c, bid_n, ask_n, mid, sp in hl_results}
+    ast_map = {c: (bid_n, ask_n, mid, sp) for c, bid_n, ask_n, mid, sp in ast_results}
 
     sizes = {}
+    spreads = {}
     for canon in overlap:
-        hl_bid_n, hl_ask_n = hl_map.get(canon, (0, 0))
-        ast_bid_n, ast_ask_n = ast_map.get(canon, (0, 0))
-        # For long_hl_short_aster: buy HL ask, sell Aster bid
-        # For long_aster_short_hl: sell HL bid, buy Aster ask
-        # Conservative: min across all four
+        hl_bid_n, hl_ask_n, hl_mid, hl_sp = hl_map.get(canon, (0, 0, 0, 0))
+        ast_bid_n, ast_ask_n, ast_mid, ast_sp = ast_map.get(canon, (0, 0, 0, 0))
         avail = [x for x in [hl_bid_n, hl_ask_n, ast_bid_n, ast_ask_n] if x > 0]
         sizes[canon] = min(avail) if avail else 0
-    return sizes
+        # Round-trip crossing = pay full spread on each venue twice (entry + exit)
+        spreads[canon] = (hl_sp + ast_sp) * 2
+    return sizes, spreads
 
 
 async def fetch_1m_candles(
@@ -147,8 +150,8 @@ async def fetch_1m_candles(
     overlap = sorted(set(hl_perps) & set(aster_perps) - BLOCKED_SYMBOLS)
     print(f"HL: {len(hl_perps)} | Aster: {len(aster_perps)} | Overlap: {len(overlap)}")
 
-    print(f"Fetching top-of-book liquidity...")
-    tob_notional = await fetch_top_of_book_notional(session, hl_perps, aster_perps, overlap)
+    print(f"Fetching top-of-book liquidity & spreads...")
+    tob_notional, tob_spread_bps = await fetch_top_of_book(session, hl_perps, aster_perps, overlap)
 
     print(f"Fetching {hours}h of 1m candles for {len(overlap)} symbols...")
 
@@ -187,7 +190,7 @@ async def fetch_1m_candles(
         panels[canon] = df
 
     print(f"Built panels for {len(panels)} symbols, skipped {len(skipped)}")
-    return panels, overlap, hl_perps, aster_perps, tob_notional
+    return panels, overlap, hl_perps, aster_perps, tob_notional, tob_spread_bps
 
 
 class Position:
@@ -202,13 +205,13 @@ class Position:
         self.hl_fr = hl_fr
         self.ast_fr = ast_fr
 
-    def est_pnl(self, exit_hl, exit_ast, minutes_held, bo_cost):
+    def est_pnl(self, exit_hl, exit_ast, minutes_held, bo_bps):
         if self.direction == "long_hl_short_aster":
             gross = ((exit_hl - self.entry_hl) + (self.entry_ast - exit_ast)) * self.qty
         else:
             gross = ((self.entry_hl - exit_hl) + (exit_ast - self.entry_ast)) * self.qty
         fees = self.notional * ROUND_TRIP_FEE
-        crossing = bo_cost
+        crossing = self.notional * bo_bps / 10000
         hours = minutes_held / 60
         if self.direction == "long_hl_short_aster":
             hl_sign, ast_sign = -1.0, 1.0
@@ -220,8 +223,8 @@ class Position:
         return gross, fees, crossing, funding, net
 
 
-def backtest_portfolio(panels, tob_notional, target_net, max_slots, max_hold_min,
-                       confirm_ticks, bo_bps):
+def backtest_portfolio(panels, tob_notional, tob_spread_bps, target_net, max_slots,
+                       max_hold_min, confirm_ticks):
     """Walk the 1-minute clock, enforce slot cap, profit-target exit."""
     all_ts = set()
     for df in panels.values():
@@ -251,10 +254,10 @@ def backtest_portfolio(panels, tob_notional, target_net, max_slots, max_hold_min
             idx = ts_idx[sym][ts]
             row = df.iloc[idx]
             minutes_held = (ts - df.iloc[pos.entry_idx]["ts"]) / MIN_MS
-            bo_cost = pos.notional * bo_bps / 10000
+            sym_bo_bps = tob_spread_bps.get(sym, 0)
 
             gross, fees, crossing, funding, net = pos.est_pnl(
-                row["hl_close"], row["ast_close"], minutes_held, bo_cost)
+                row["hl_close"], row["ast_close"], minutes_held, sym_bo_bps)
 
             reason = None
             if net >= target_net:
@@ -338,9 +341,9 @@ def backtest_portfolio(panels, tob_notional, target_net, max_slots, max_hold_min
         df = panels[sym]
         row = df.iloc[-1]
         minutes_held = (row["ts"] - df.iloc[pos.entry_idx]["ts"]) / MIN_MS
-        bo_cost = pos.notional * bo_bps / 10000
+        sym_bo_bps = tob_spread_bps.get(sym, 0)
         gross, fees, crossing, funding, net = pos.est_pnl(
-            row["hl_close"], row["ast_close"], minutes_held, bo_cost)
+            row["hl_close"], row["ast_close"], minutes_held, sym_bo_bps)
         trades.append({
             "symbol": sym, "direction": pos.direction,
             "entry_hl": pos.entry_hl, "entry_ast": pos.entry_ast,
@@ -360,29 +363,30 @@ def main():
     ap.add_argument("--slots", type=int, default=MAX_CONCURRENT_POSITIONS, help="max concurrent positions")
     ap.add_argument("--max-hold", type=int, default=48*60, help="max hold minutes (default 2880 = 48h)")
     ap.add_argument("--confirm", type=int, default=ENTRY_CONFIRM_TICKS, help="confirm ticks (default from config)")
-    ap.add_argument("--bo-bps", type=float, default=0, help="round-trip bid-offer crossing cost bps (default 0)")
     args = ap.parse_args()
 
     async def run():
         async with aiohttp.ClientSession() as session:
-            panels, overlap, hl_perps, aster_perps, tob_notional = await fetch_1m_candles(
-                session, args.hours)
+            panels, overlap, hl_perps, aster_perps, tob_notional, tob_spread_bps = \
+                await fetch_1m_candles(session, args.hours)
 
         if not panels:
             print("No data — check API connectivity")
             return
 
-        # Show liquidity snapshot
-        print(f"\nTop-of-book liquidity (current snapshot):")
+        # Show liquidity & spread snapshot
+        print(f"\nTop-of-book snapshot (current):")
+        print(f"  {'Symbol':8s} {'Notional':>10s}  {'Size':>8s}  {'RT Spread':>10s}")
         for sym in sorted(tob_notional, key=tob_notional.get, reverse=True):
             n = tob_notional[sym]
+            sp = tob_spread_bps.get(sym, 0)
             if n > 0 and sym in panels:
                 cap = "full" if n >= NOTIONAL_PER_LEG else f"${n:.0f}"
-                print(f"  {sym:8s} ${n:>8.0f}  → trade size: {cap}")
+                print(f"  {sym:8s} ${n:>8.0f}  {cap:>8s}  {sp:>8.1f}bps")
 
         trades, slot_min, total_min = backtest_portfolio(
-            panels, tob_notional, args.target, args.slots, args.max_hold,
-            args.confirm, args.bo_bps,
+            panels, tob_notional, tob_spread_bps, args.target, args.slots,
+            args.max_hold, args.confirm,
         )
 
         if not trades:
@@ -406,7 +410,7 @@ def main():
 
         print(f"\n{'='*60}")
         print(f"BACKTEST: {args.hours}h of 1m data | target=${args.target}"
-              f" | {args.slots} slots | bo={args.bo_bps}bps")
+              f" | {args.slots} slots | per-symbol book spreads")
         print(f"{'='*60}")
         print(f"Symbols with data: {len(panels)}")
         print(f"Total trades: {n} ({len(completed)} closed, {len(still_open)} still open)")
@@ -421,7 +425,8 @@ def main():
         print(f"P&L breakdown:")
         print(f"  Gross:     ${total_gross:+.2f}")
         print(f"  Fees:      ${total_fees:.2f}")
-        print(f"  Crossing:  ${total_crossing:.2f}  ({args.bo_bps}bps × {n} trades)")
+        avg_bo = total_crossing / (avg_notional * n) * 10000 if (avg_notional * n) > 0 else 0
+        print(f"  Crossing:  ${total_crossing:.2f}  (avg {avg_bo:.0f}bps from order books)")
         print(f"  Funding:   ${total_funding:+.2f}")
         print(f"  Net:       ${total_net:+.2f}")
         print()
@@ -442,9 +447,10 @@ def main():
             avg_notional=("notional", "mean"),
         ).sort_values("net", ascending=False)
         for sym, row in sym_pnl.iterrows():
+            sp = tob_spread_bps.get(sym, 0)
             print(f"  {sym:8s}  {int(row['trades'])}t  net=${row['net']:+7.2f}  "
                   f"gross=${row['gross']:+7.2f}  bo=${row['crossing']:5.2f}  "
-                  f"${row['avg_notional']:>5.0f}  avg={row['avg_hold']:.0f}min")
+                  f"sprd={sp:>5.0f}bp  ${row['avg_notional']:>5.0f}  avg={row['avg_hold']:.0f}min")
 
     asyncio.run(run())
 
