@@ -139,6 +139,10 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
         log.error("No valid symbols. Exiting.")
         return
 
+    # Seed the rolling book-spread baselines from 1m candles so entries can fire
+    # immediately instead of waiting BASELINE_MIN_SAMPLES minutes of live data.
+    await client.warmup_book_spread(symbols)
+
     pm = PositionManager(paper_mode=paper_mode)
     executor = Executor(client, pm, paper_mode=paper_mode)
 
@@ -180,17 +184,17 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     last_slow_scan = 0
     tick_count = 0
     consecutive_errors = 0
-    # symbol -> (excess_bps, direction_str, oracle_delta_bps) from last scan
+    # symbol -> (excess_bps, direction_str, baseline_bps) from last scan
     latest_spreads: dict[str, tuple[float, str, float]] = {}
     # top N candidates polled every fast tick
     candidates: list[str] = []
 
     async def scan_symbol(symbol: str) -> tuple[str, float, str, float, object, object] | None:
-        """Fetch books and return (symbol, executable_excess_bps, direction, smoothed_delta_bps, aster_book, hl_book).
+        """Fetch books and return (symbol, executable_excess_bps, direction, baseline_bps, aster_book, hl_book).
 
-        executable_excess_bps uses bid-to-other-ask prices — what try_entry
-        actually checks, not the optimistic mid-to-mid value. May be negative
-        when neither direction has a positive edge after crossing cost.
+        executable_excess_bps is the book mid-spread's deviation from its rolling
+        baseline — what try_entry actually checks. May be negative when the
+        current spread sits at or below its own structural baseline.
         """
         try:
             aster_book, hl_book = await client.get_both_books(symbol)
@@ -200,29 +204,23 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             if mid <= 0:
                 return None
 
-            aster_index = client.get_aster_index(symbol)
-            hl_oracle = client.get_hl_oracle(symbol)
-            # If either oracle is missing, return None — the scan-result protocol
-            # already treats None as "skip". Far safer than substituting delta=0
-            # and letting structural feed gap masquerade as tradeable edge.
-            if aster_index <= 0 or hl_oracle <= 0:
+            # Match try_entry exactly: deviation of book mid-spread from its
+            # rolling baseline. Record the sample, then read the baseline.
+            spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000
+            client.record_book_spread(symbol, spread_bps)
+            baseline = client.get_book_spread_baseline(symbol)
+            # No baseline yet (cold start) — return None so the protocol skips it.
+            if baseline is None:
                 return None
-            oracle_delta_bps = (aster_index - hl_oracle) / mid * 10000
-            client.record_oracle_delta(symbol, oracle_delta_bps)
-            smoothed_delta = client.get_smoothed_oracle_delta(symbol, oracle_delta_bps)
-
-            # Match try_entry exactly: bid-to-other-ask, less smoothed delta.
-            aster_premium_bps = (aster_book.bid - hl_book.ask) / mid * 10000
-            hl_premium_bps    = (hl_book.bid - aster_book.ask) / mid * 10000
-            aster_excess = aster_premium_bps - smoothed_delta   # long_hl_short_aster
-            hl_excess    = hl_premium_bps    + smoothed_delta   # long_aster_short_hl
+            aster_excess = spread_bps - baseline    # long_hl_short_aster
+            hl_excess    = -(spread_bps - baseline)  # long_aster_short_hl
             if aster_excess >= hl_excess:
                 executable_excess = aster_excess
                 direction = "L-HL/S-AST"
             else:
                 executable_excess = hl_excess
                 direction = "L-AST/S-HL"
-            return symbol, executable_excess, direction, smoothed_delta, aster_book, hl_book
+            return symbol, executable_excess, direction, baseline, aster_book, hl_book
         except Exception as e:
             log.debug(f"scan_symbol {symbol}: {e}")
             return None
@@ -231,8 +229,8 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
         """Act on a scan result — check entry/exit conditions."""
         if result is None:
             return
-        symbol, executable_excess_bps, direction, smoothed_delta_bps, aster_book, hl_book = result
-        latest_spreads[symbol] = (executable_excess_bps, direction, smoothed_delta_bps)
+        symbol, executable_excess_bps, direction, baseline_bps, aster_book, hl_book = result
+        latest_spreads[symbol] = (executable_excess_bps, direction, baseline_bps)
         pos = pm.get(symbol)
         nonlocal consecutive_errors
         try:
@@ -308,8 +306,8 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     if r and r[0] not in fast_set:
                         await process_result(r)
                 thresh_strs = " | ".join(
-                    f"{s} {spd:.0f}/{ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(s, ENTRY_THRESHOLD_BPS):.0f}bps d={odelta:+.0f}"
-                    for s, spd, _, odelta, *_ in ranked[:5]
+                    f"{s} {spd:.0f}/{ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(s, ENTRY_THRESHOLD_BPS):.0f}bps base={base:+.0f}"
+                    for s, spd, _, base, *_ in ranked[:5]
                 )
                 log.info(f"Slow scan | Watching: {candidates} | Top 5: {thresh_strs}")
 
@@ -363,13 +361,13 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 # Top 5 symbols closest to entry threshold (no open position)
                 open_syms = set(pm.positions.keys())
                 spread_ranking = [
-                    (sym, spd, drn, odelta)
-                    for sym, (spd, drn, odelta) in latest_spreads.items()
+                    (sym, spd, drn, base)
+                    for sym, (spd, drn, base) in latest_spreads.items()
                     if sym not in open_syms
                 ]
                 spread_ranking.sort(key=lambda x: x[1], reverse=True)
                 watch_lines = []
-                for sym, spd, drn, odelta in spread_ranking[:5]:
+                for sym, spd, drn, base in spread_ranking[:5]:
                     thr = ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(sym, ENTRY_THRESHOLD_BPS)
                     _, streak = executor._entry_streak.get(sym, ("", 0))
                     if spd >= thr and streak > 0:
@@ -378,7 +376,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                         pct = spd / thr * 100 if thr > 0 else 0
                         proximity = f"{pct:.0f}%"
                     watch_lines.append(
-                        f"  {sym}: {proximity}  d={odelta:+.0f}bps  ({drn})"
+                        f"  {sym}: {proximity}  base={base:+.0f}bps  ({drn})"
                     )
 
                 log.info(

@@ -32,7 +32,9 @@ from config import (
     ASTER_ORDER_URL, ASTER_OPEN_ORDERS_URL, ASTER_POSITION_URL, ASTER_EXCHANGE_INFO_URL,
     ORDER_TIMEOUT_SECONDS, HL_IOC_BUFFER_BPS, ASTER_IOC_BUFFER_BPS,
     aster_symbol_for, ASTER_BASE_ALIAS, ASTER_BASE_TO_CANON,
+    BASELINE_WINDOW_MINUTES, BASELINE_MIN_SAMPLES, BASELINE_SAMPLE_INTERVAL_SECONDS,
 )
+from src import history
 
 log = logging.getLogger(__name__)
 
@@ -114,6 +116,15 @@ class ExchangeClient:
         self._oracle_delta_history: dict[str, deque] = {}
         self._last_recorded_source_ts: dict[str, tuple[int, int]] = {}  # (hl_ts, aster_ts)
         self._oracle_delta_window_ms: int = 30 * 60 * 1000  # 30 min
+
+        # Rolling book mid-spread history per symbol: deque of (ts_ms, spread_bps).
+        # spread_bps = (aster_mid - hl_mid) / mid * 10000. The median over the
+        # last BASELINE_WINDOW_MINUTES is the "structural" gap we baseline entries
+        # against — this is what we actually trade (the books), unlike the oracle
+        # feeds. Seeded from 1m candles on startup via warmup_book_spread().
+        self._book_spread_history: dict[str, deque] = {}
+        self._book_spread_window_ms: int = BASELINE_WINDOW_MINUTES * 60 * 1000
+        self._last_book_spread_ts: dict[str, int] = {}  # dedupe to ~1/min
 
     async def start(self, symbols: list[str]):
         """Load specs for all symbols."""
@@ -396,6 +407,90 @@ class ExchangeClient:
             return 0
         cutoff = now_ms() - self._oracle_delta_window_ms
         return sum(1 for ts, _ in hist if ts >= cutoff)
+
+    # ── Rolling book mid-spread baseline ──
+
+    def record_book_spread(self, symbol: str, spread_bps: float):
+        """Append a book mid-spread observation, deduped to ~1/min.
+
+        Sampling at 1m granularity matches the candle resolution the baseline
+        window was validated on and keeps the deque bounded regardless of how
+        often we poll the books.
+        """
+        now = now_ms()
+        last = self._last_book_spread_ts.get(symbol, 0)
+        if now - last < BASELINE_SAMPLE_INTERVAL_SECONDS * 1000:
+            return
+        self._last_book_spread_ts[symbol] = now
+        if symbol not in self._book_spread_history:
+            # window/min samples + headroom
+            self._book_spread_history[symbol] = deque(maxlen=BASELINE_WINDOW_MINUTES + 120)
+        self._book_spread_history[symbol].append((now, spread_bps))
+
+    def get_book_spread_baseline(self, symbol: str) -> float | None:
+        """Median book mid-spread over the window, or None if too few samples."""
+        hist = self._book_spread_history.get(symbol)
+        if not hist:
+            return None
+        cutoff = now_ms() - self._book_spread_window_ms
+        recent = [s for ts, s in hist if ts >= cutoff]
+        if len(recent) < BASELINE_MIN_SAMPLES:
+            return None
+        return statistics.median(recent)
+
+    def book_spread_sample_count(self, symbol: str) -> int:
+        """Samples within the current baseline window (for logging/health)."""
+        hist = self._book_spread_history.get(symbol)
+        if not hist:
+            return 0
+        cutoff = now_ms() - self._book_spread_window_ms
+        return sum(1 for ts, _ in hist if ts >= cutoff)
+
+    async def warmup_book_spread(self, symbols: list[str]):
+        """Seed book-spread history from 1m candles so baselines are usable at startup.
+
+        Fetches the last BASELINE_WINDOW_MINUTES of 1m candles from both venues
+        per symbol, computes the mid-to-mid spread at each common minute, and
+        loads it into the rolling deque. Without this the bot would need to run
+        for BASELINE_MIN_SAMPLES minutes before placing any trade.
+        """
+        end_ms = now_ms()
+        start_ms = end_ms - self._book_spread_window_ms
+
+        async def warm_one(canon: str):
+            hl_coin = f"xyz:{canon}"
+            ast_sym = aster_symbol_for(canon)
+            try:
+                hl_data, ast_data = await asyncio.gather(
+                    history.hl_candles(self.session, hl_coin, start_ms, end_ms, interval="1m"),
+                    history.aster_candles(self.session, ast_sym, start_ms, end_ms, interval="1m"),
+                )
+            except Exception as e:
+                log.debug(f"warmup {canon}: candle fetch failed ({e})")
+                return canon, 0
+            if not hl_data or not ast_data:
+                return canon, 0
+            common = sorted(set(hl_data) & set(ast_data))
+            dq = deque(maxlen=BASELINE_WINDOW_MINUTES + 120)
+            for t in common:
+                hl_px = float(hl_data[t])
+                ast_px = float(ast_data[t])
+                mid = (hl_px + ast_px) / 2
+                if mid <= 0:
+                    continue
+                spread_bps = (ast_px - hl_px) / mid * 10000
+                dq.append((t, spread_bps))
+            if dq:
+                self._book_spread_history[canon] = dq
+                self._last_book_spread_ts[canon] = dq[-1][0]
+            return canon, len(dq)
+
+        results = await asyncio.gather(*[warm_one(s) for s in symbols])
+        warmed = [c for c, n in results if n >= BASELINE_MIN_SAMPLES]
+        log.info(
+            f"Book-spread baseline warmed: {len(warmed)}/{len(symbols)} symbols "
+            f"have >= {BASELINE_MIN_SAMPLES} samples ({BASELINE_WINDOW_MINUTES}m window)"
+        )
 
     async def _get_aster_book(self, symbol: str) -> OrderBook:
         aster_sym = aster_symbol_for(symbol)

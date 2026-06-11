@@ -390,7 +390,7 @@ def main():
     ap.add_argument("--slots", type=int, default=MAX_CONCURRENT_POSITIONS, help="max concurrent positions")
     ap.add_argument("--max-hold", type=int, default=48*60, help="max hold minutes (default 2880 = 48h)")
     ap.add_argument("--confirm", type=int, default=ENTRY_CONFIRM_TICKS, help="confirm ticks (default from config)")
-    ap.add_argument("--window", type=int, default=60, help="rolling baseline window in minutes (default 60)")
+    ap.add_argument("--window", type=int, default=480, help="rolling baseline window in minutes (default 480 = 8h, matches live)")
     ap.add_argument("--sweep", action="store_true", help="sweep target from $1-$20 and print comparison")
     ap.add_argument("--window-sweep", action="store_true",
                     help="sweep baseline window (30m-24h) at fixed target/slots")

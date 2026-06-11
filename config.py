@@ -34,10 +34,22 @@ ROUND_TRIP_FEE = 2 * ASTER_MAKER_FEE + 2 * HL_TAKER_FEE  # ~0.09% = 9bps
 # apparent excess during the first few ticks before the rolling median stabilises.
 MIN_EXECUTABLE_PREMIUM_BPS = 15.0
 
-# Minimum RAW crossing premium (before oracle delta adjustment) in bps.
-# Must exceed round-trip fees so even full convergence to zero is profitable.
-# At ROUND_TRIP_FEE ~9bps, a 5bps raw premium can never cover costs.
+# Minimum RAW book mid-spread (abs) in bps before an entry is considered.
+# A weak sanity filter: there must be at least *some* gap between the venues,
+# not just a baseline-relative wiggle. At ROUND_TRIP_FEE ~9bps a 5bps gap can
+# never cover costs, so 12bps is a safe floor.
 MIN_RAW_PREMIUM_BPS = 12.0
+
+# ── Rolling book-spread baseline ──
+# The live entry signal trades deviations of the book mid-spread from its own
+# rolling median (NOT the venue oracle feeds — we trade the books, so we
+# baseline against the books). excess = current_mid_spread - rolling_median.
+# Window validated via scripts/backtest_1m.py --window-sweep: profitable across
+# 30m-24h; 8h chosen for stability and resistance to the "dislocation slowly
+# becomes the new baseline" failure mode of short windows.
+BASELINE_WINDOW_MINUTES = 480          # 8h rolling median
+BASELINE_MIN_SAMPLES = 30              # need this many before a baseline is usable
+BASELINE_SAMPLE_INTERVAL_SECONDS = 55  # dedupe live samples to ~1/min (matches 1m candles)
 
 # ── Strategy parameters ──
 # Spread in bps above which we enter.  Round-trip cost ~9-14bps so 30bps = ~2x cushion.

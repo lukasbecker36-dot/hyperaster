@@ -94,30 +94,30 @@ class Executor:
         # Clear warn flag once prices re-align (market opens)
         self._price_mismatch_warned.discard(symbol)
 
-        # Oracle-adjusted effective entry spreads (bid/ask adjusted).
-        # oracle_delta_bps = structural index price difference that won't converge;
-        # only the excess beyond this is tradeable.
-        aster_premium_bps = (aster_book.bid - hl_book.ask) / mid * 10000
-        hl_premium_bps = (hl_book.bid - aster_book.ask) / mid * 10000
-
-        aster_index = self.client.get_aster_index(symbol)
-        hl_oracle = self.client.get_hl_oracle(symbol)
-        # No oracle = no entry. Without a delta we'd treat structural feed gap
-        # as tradeable edge (the NBIS failure mode) — and there's no stop-gap
-        # value to fall back to here.
-        if aster_index <= 0 or hl_oracle <= 0:
+        # Entry signal = deviation of the book mid-spread from its own rolling
+        # median. We trade the books, so we baseline against the books (not the
+        # venue oracle feeds). spread_bps > baseline => Aster rich vs HL => short
+        # Aster / long HL; spread_bps < baseline => the reverse.
+        spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000
+        self.client.record_book_spread(symbol, spread_bps)
+        baseline_bps = self.client.get_book_spread_baseline(symbol)
+        # No baseline yet (cold start, not enough samples) = no entry. Substituting
+        # 0 would treat the entire structural gap as tradeable edge — the failure
+        # mode that bled fees before.
+        if baseline_bps is None:
             log.debug(
-                f"{symbol}: oracle missing (aster_index={aster_index}, hl_oracle={hl_oracle}) — skipping"
+                f"{symbol}: baseline not ready "
+                f"({self.client.book_spread_sample_count(symbol)} samples) — skipping"
             )
+            self._entry_streak.pop(symbol, None)
             return False
-        raw_delta_bps = (aster_index - hl_oracle) / mid * 10000
-        # Use rolling-median oracle delta to suppress noisy point-in-time feed spikes
-        oracle_delta_bps = self.client.get_smoothed_oracle_delta(symbol, raw_delta_bps)
 
-        # For long_hl_short_aster: Aster premium minus the oracle delta
-        # For long_aster_short_hl: HL premium plus the oracle delta (delta is negative here)
-        aster_excess_bps = aster_premium_bps - oracle_delta_bps
-        hl_excess_bps = hl_premium_bps + oracle_delta_bps
+        # raw_premium guard uses the absolute book gap (matches the backtest's
+        # MIN_RAW filter on abs(spread_bps)).
+        raw_premium_bps = abs(spread_bps)
+
+        aster_excess_bps = spread_bps - baseline_bps   # long_hl_short_aster
+        hl_excess_bps = -(spread_bps - baseline_bps)    # long_aster_short_hl
 
         base_threshold = ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(symbol, ENTRY_THRESHOLD_BPS)
         # Dynamic cost floor: on exit we pay round-trip fees plus cross the bid-ask
@@ -137,10 +137,11 @@ class Executor:
                 f"(HL sprd={hl_spread_bps:.0f} Ast sprd={aster_spread_bps:.0f})"
             )
 
+        # `excess_bps` is the tradeable deviation for the chosen direction;
+        # `spread_bps` stays the raw book mid-spread (used for logging / records).
         if aster_excess_bps >= threshold:
             direction = "long_hl_short_aster"
-            spread_bps = aster_excess_bps
-            raw_premium_bps = aster_premium_bps
+            excess_bps = aster_excess_bps
             # HL: buy (long) at ask — taker
             hl_side = "buy"
             hl_ref_price = hl_book.ask
@@ -149,8 +150,7 @@ class Executor:
             aster_ref_price = aster_book.bid
         elif hl_excess_bps >= threshold:
             direction = "long_aster_short_hl"
-            spread_bps = hl_excess_bps
-            raw_premium_bps = hl_premium_bps
+            excess_bps = hl_excess_bps
             hl_side = "sell"
             hl_ref_price = hl_book.bid
             aster_side = "buy"
@@ -160,23 +160,21 @@ class Executor:
             self._entry_streak.pop(symbol, None)
             return False
 
-        # Raw premium guard — the actual market prices must show the venue is
-        # expensive, not just the oracle delta. If the raw crossing premium is
-        # below this floor the entire "edge" is oracle noise and will evaporate
-        # when the oracle delta shifts, leaving a guaranteed loss.
+        # Raw gap guard — there must be at least some absolute dislocation between
+        # the venues, not just a baseline-relative wiggle on a near-zero spread.
         if raw_premium_bps < MIN_RAW_PREMIUM_BPS:
             log.debug(
-                f"{symbol}: raw premium {raw_premium_bps:.1f}bps below MIN_RAW floor "
-                f"({MIN_RAW_PREMIUM_BPS}bps), excess={spread_bps:.1f}bps is oracle-driven — skipping"
+                f"{symbol}: raw gap {raw_premium_bps:.1f}bps below MIN_RAW floor "
+                f"({MIN_RAW_PREMIUM_BPS}bps), excess={excess_bps:.1f}bps — skipping"
             )
             self._entry_streak.pop(symbol, None)
             return False
 
-        # Hard floor — ensures the edge exceeds fee cost even before rolling median
-        # stabilises (guards the first 5 ticks per symbol where median falls back to raw)
-        if spread_bps < MIN_EXECUTABLE_PREMIUM_BPS:
+        # Hard floor — ensures the edge exceeds fee cost even before the rolling
+        # median fully stabilises.
+        if excess_bps < MIN_EXECUTABLE_PREMIUM_BPS:
             log.debug(
-                f"{symbol}: excess {spread_bps:.1f}bps below MIN_EXECUTABLE floor "
+                f"{symbol}: excess {excess_bps:.1f}bps below MIN_EXECUTABLE floor "
                 f"({MIN_EXECUTABLE_PREMIUM_BPS}bps), skipping"
             )
             self._entry_streak.pop(symbol, None)
@@ -190,7 +188,7 @@ class Executor:
         self._entry_streak[symbol] = (direction, count)
         if count < ENTRY_CONFIRM_TICKS:
             log.info(
-                f"{symbol}: {direction} excess={spread_bps:.1f}bps (thr={threshold:.0f}) "
+                f"{symbol}: {direction} excess={excess_bps:.1f}bps (thr={threshold:.0f}) "
                 f"confirming {count}/{ENTRY_CONFIRM_TICKS}"
             )
             return False
@@ -210,7 +208,8 @@ class Executor:
         actual_notional = qty * mid
 
         log.info(
-            f"ENTRY {symbol}: {direction} | excess={spread_bps:.1f}bps d={oracle_delta_bps:+.1f}bps | "
+            f"ENTRY {symbol}: {direction} | excess={excess_bps:.1f}bps "
+            f"spread={spread_bps:+.1f}bps base={baseline_bps:+.1f}bps | "
             f"qty={qty} | HL {hl_side} @ {hl_ref_price:.2f} | Aster {aster_side} @ {aster_ref_price:.2f}"
         )
 
@@ -220,7 +219,7 @@ class Executor:
 
         if self.paper_mode:
             log.info(
-                f"[PAPER] ENTRY {symbol}: {direction} | excess={spread_bps:.1f}bps | "
+                f"[PAPER] ENTRY {symbol}: {direction} | excess={excess_bps:.1f}bps | "
                 f"qty={qty} | HL {hl_side} @ {hl_ref_price:.2f} | Aster {aster_side} @ {aster_ref_price:.2f}"
             )
             self.pm.open_entering(
@@ -228,7 +227,7 @@ class Executor:
                 hl_coin=f"xyz:{symbol}",
                 aster_symbol=aster_symbol_for(symbol),
                 direction=direction,
-                entry_spread_bps=spread_bps,
+                entry_spread_bps=excess_bps,
                 hl_entry_price=hl_ref_price,
                 hl_order_id="PAPER",
                 aster_entry_order_id="PAPER",
@@ -240,27 +239,25 @@ class Executor:
             self.pm.confirm_aster_entry(symbol, aster_ref_price)
             return True
 
-        # Pre-trade recheck
+        # Pre-trade recheck — re-confirm the deviation against the rolling baseline
         try:
             fresh_aster, fresh_hl = await self.client.get_both_books(symbol)
             fresh_mid = (fresh_aster.mid + fresh_hl.mid) / 2
             if fresh_mid <= 0:
                 log.warning(f"{symbol}: empty books on recheck, aborting")
                 return False
-            # Both must still be valid (we checked them above, but the cache
-            # could have been invalidated in between).
-            if aster_index <= 0 or hl_oracle <= 0:
-                log.warning(f"{symbol}: oracle vanished on recheck, aborting")
+            fresh_baseline = self.client.get_book_spread_baseline(symbol)
+            if fresh_baseline is None:
+                log.warning(f"{symbol}: baseline vanished on recheck, aborting")
                 return False
-            fresh_raw_delta = (aster_index - hl_oracle) / fresh_mid * 10000
-            fresh_oracle_delta = self.client.get_smoothed_oracle_delta(symbol, fresh_raw_delta)
+            fresh_spread = (fresh_aster.mid - fresh_hl.mid) / fresh_mid * 10000
             if direction == "long_hl_short_aster":
-                fresh_excess = (fresh_aster.bid - fresh_hl.ask) / fresh_mid * 10000 - fresh_oracle_delta
+                fresh_excess = fresh_spread - fresh_baseline
             else:
-                fresh_excess = (fresh_hl.bid - fresh_aster.ask) / fresh_mid * 10000 + fresh_oracle_delta
+                fresh_excess = -(fresh_spread - fresh_baseline)
             if fresh_excess < max(threshold, MIN_EXECUTABLE_PREMIUM_BPS):
                 log.warning(
-                    f"{symbol}: excess spread collapsed to {fresh_excess:.1f}bps on recheck, aborting"
+                    f"{symbol}: excess collapsed to {fresh_excess:.1f}bps on recheck, aborting"
                 )
                 return False
             # Use fresh prices
@@ -411,7 +408,7 @@ class Executor:
             hl_coin=f"xyz:{symbol}",
             aster_symbol=aster_symbol_for(symbol),
             direction=direction,
-            entry_spread_bps=spread_bps,
+            entry_spread_bps=excess_bps,
             hl_entry_price=hl_result.fill_price,
             hl_order_id=hl_result.order_id,
             aster_entry_order_id=aster_result.order_id,
