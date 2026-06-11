@@ -36,14 +36,14 @@ from config import (
     EXIT_THRESHOLD_BPS, MAX_HOLD_HOURS, MAX_CONCURRENT_POSITIONS,
     HEARTBEAT_INTERVAL_MINUTES, PAPER_MODE, DATA_DIR, OUTPUT_DIR,
     BLOCKED_SYMBOLS, ENTRY_CONFIRM_TICKS,
-    ROUND_TRIP_FEE, NOTIONAL_PER_LEG, aster_symbol_for,
+    ROUND_TRIP_FEE, NOTIONAL_PER_LEG, EXIT_TARGET_NET_USD, aster_symbol_for,
 )
 
 SLOW_SCAN_INTERVAL_SECONDS = 300   # re-rank all symbols every 5 min
 FAST_CANDIDATES = 3                # symbols to poll every tick between slow scans
 from database import init_db
 from exchange_client import ExchangeClient
-from position_manager import PositionManager
+from position_manager import PositionManager, estimate_funding_pnl
 from executor import Executor
 from notify import install_handler as install_alert_handler
 from recovery import reconcile_incomplete_intents
@@ -243,13 +243,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 # reversed position wasn't exited until the *opposite* direction
                 # also calmed down — letting losses run (CBRS ran to -24.7bps).
                 mid = (aster_book.mid + hl_book.mid) / 2
-                if mid > 0 and pos.direction == "long_hl_short_aster":
-                    own_excess = (aster_book.bid - hl_book.ask) / mid * 10000 - smoothed_delta_bps
-                elif mid > 0:
-                    own_excess = (hl_book.bid - aster_book.ask) / mid * 10000 + smoothed_delta_bps
-                else:
-                    own_excess = executable_excess_bps
-                # Estimate gross P&L at current book prices
+                # Estimate net P&L at current book prices (gross - fees + funding)
                 if mid > 0 and pos.direction == "long_hl_short_aster":
                     est_gross = ((hl_book.bid - pos.hl_entry_price)
                                  + (pos.aster_entry_price - aster_book.ask)) * pos.qty
@@ -258,17 +252,17 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                                  + (aster_book.bid - pos.aster_entry_price)) * pos.qty
                 else:
                     est_gross = 0.0
+                est_fees = (pos.notional_usd or NOTIONAL_PER_LEG) * ROUND_TRIP_FEE
+                est_funding = estimate_funding_pnl(
+                    pos.direction, elapsed_hours,
+                    pos.notional_usd or NOTIONAL_PER_LEG,
+                    pos.hl_funding_rate, pos.aster_funding_rate,
+                )
+                est_net = est_gross - est_fees + est_funding
 
                 should_exit, reason = False, ""
-                if own_excess <= EXIT_THRESHOLD_BPS:
-                    est_fees = (pos.notional_usd or NOTIONAL_PER_LEG) * ROUND_TRIP_FEE
-                    if est_gross >= est_fees:
-                        should_exit, reason = True, "converged"
-                    else:
-                        log.debug(
-                            f"{symbol}: excess={own_excess:.1f}bps below exit threshold "
-                            f"but est net=${est_gross - est_fees:.2f} < 0 — holding"
-                        )
+                if est_net >= EXIT_TARGET_NET_USD:
+                    should_exit, reason = True, "target"
                 elif elapsed_hours >= MAX_HOLD_HOURS:
                     should_exit, reason = True, "timeout"
                 if should_exit:

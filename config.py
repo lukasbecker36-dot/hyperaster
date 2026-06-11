@@ -44,6 +44,8 @@ MIN_RAW_PREMIUM_BPS = 12.0
 ENTRY_THRESHOLD_BPS = 30.0
 # Exit when spread falls below this (in bps, absolute cross-exchange mid spread)
 EXIT_THRESHOLD_BPS = 8.0
+# Profit-target exit: close when estimated net P&L (gross - fees + funding) reaches this.
+EXIT_TARGET_NET_USD = 2.0
 
 # Number of consecutive qualifying scans the entry signal must persist before we
 # commit capital. A genuine dislocation holds across ticks; a stale-feed/oracle-lag
