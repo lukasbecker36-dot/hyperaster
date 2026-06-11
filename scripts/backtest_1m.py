@@ -183,14 +183,27 @@ async def fetch_1m_candles(
         })
         df["mid"] = (df["hl_close"] + df["ast_close"]) / 2
         df["spread_bps"] = (df["ast_close"] - df["hl_close"]) / df["mid"] * 10000
-        df["structural"] = df["spread_bps"].rolling(60, min_periods=10).median()
-        df["structural"] = df["structural"].bfill()
-        df["aster_excess"] = df["spread_bps"] - df["structural"]
-        df["hl_excess"] = -(df["spread_bps"] - df["structural"])
         panels[canon] = df
 
     print(f"Built panels for {len(panels)} symbols, skipped {len(skipped)}")
     return panels, overlap, hl_perps, aster_perps, tob_notional, tob_spread_bps
+
+
+def apply_baseline(panels: dict, window_min: int):
+    """(Re)compute the rolling-baseline excess columns for a given window.
+
+    Baseline = rolling median of the book-mid spread over `window_min` minutes
+    (1m candles, so window in samples == window in minutes). This is the
+    structural gap the live bot would track; excess is the tradeable deviation.
+
+    Uses a backward-looking rolling window — no future data leaks in, matching
+    what the live bot can compute from its own spread history.
+    """
+    for df in panels.values():
+        df["structural"] = df["spread_bps"].rolling(window_min, min_periods=10).median()
+        df["structural"] = df["structural"].bfill()
+        df["aster_excess"] = df["spread_bps"] - df["structural"]
+        df["hl_excess"] = -(df["spread_bps"] - df["structural"])
 
 
 class Position:
@@ -377,7 +390,10 @@ def main():
     ap.add_argument("--slots", type=int, default=MAX_CONCURRENT_POSITIONS, help="max concurrent positions")
     ap.add_argument("--max-hold", type=int, default=48*60, help="max hold minutes (default 2880 = 48h)")
     ap.add_argument("--confirm", type=int, default=ENTRY_CONFIRM_TICKS, help="confirm ticks (default from config)")
+    ap.add_argument("--window", type=int, default=60, help="rolling baseline window in minutes (default 60)")
     ap.add_argument("--sweep", action="store_true", help="sweep target from $1-$20 and print comparison")
+    ap.add_argument("--window-sweep", action="store_true",
+                    help="sweep baseline window (30m-24h) at fixed target/slots")
     args = ap.parse_args()
 
     async def run():
@@ -398,6 +414,44 @@ def main():
             if n > 0 and sym in panels:
                 cap = "full" if n >= NOTIONAL_PER_LEG else f"${n:.0f}"
                 print(f"  {sym:8s} ${n:>8.0f}  {cap:>8s}  {sp:>8.1f}bps")
+
+        if args.window_sweep:
+            windows = [30, 60, 120, 240, 480, 720, 1440]
+            print(f"\n{'='*72}")
+            print(f"WINDOW SWEEP: {args.hours}h | target=${args.target} | {args.slots} slots")
+            print(f"(rolling-median baseline of book spread, varying window)")
+            print(f"{'='*72}")
+            print(f"  {'Window':>8s}  {'Trades':>6s}  {'Wins':>5s}  {'Win%':>5s}  "
+                  f"{'AvgHold':>8s}  {'Gross':>8s}  {'Costs':>8s}  {'Net':>8s}  {'$/day':>7s}")
+            print(f"  {'-'*8}  {'-'*6}  {'-'*5}  {'-'*5}  "
+                  f"{'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*7}")
+            for win in windows:
+                apply_baseline(panels, win)
+                trades, slot_min, total_min = backtest_portfolio(
+                    panels, tob_notional, tob_spread_bps, args.target, args.slots,
+                    args.max_hold, args.confirm,
+                )
+                label = f"{win}m" if win < 120 else f"{win//60}h"
+                if not trades:
+                    print(f"  {label:>8s}    0 trades")
+                    continue
+                df = pd.DataFrame(trades)
+                completed = df[df["reason"] != "open"]
+                n_closed = len(completed)
+                wins = len(completed[completed["net"] > 0]) if n_closed > 0 else 0
+                win_pct = wins / n_closed * 100 if n_closed > 0 else 0
+                avg_hold = completed["hold_min"].mean() if n_closed > 0 else 0
+                total_net = df["net"].sum()
+                total_gross = df["gross"].sum()
+                total_costs = df["fees"].sum() + df["crossing"].sum()
+                per_day = total_net / (args.hours / 24)
+                print(f"  {label:>8s}  {len(df):>6d}  {wins:>5d}  {win_pct:>4.0f}%  "
+                      f"{avg_hold:>6.0f}m   ${total_gross:>7.2f}  ${total_costs:>7.2f}  "
+                      f"${total_net:>7.2f}  ${per_day:>6.2f}")
+            return
+
+        # Apply the configured baseline window for all non-window-sweep runs
+        apply_baseline(panels, args.window)
 
         if args.sweep:
             sweep_targets = [1, 2, 3, 5, 8, 10, 15, 20]
@@ -460,7 +514,7 @@ def main():
 
         print(f"\n{'='*60}")
         print(f"BACKTEST: {args.hours}h of 1m data | target=${args.target}"
-              f" | {args.slots} slots | per-symbol book spreads")
+              f" | {args.slots} slots | {args.window}m baseline window")
         print(f"{'='*60}")
         print(f"Symbols with data: {len(panels)}")
         print(f"Total trades: {n} ({len(completed)} closed, {len(still_open)} still open)")
