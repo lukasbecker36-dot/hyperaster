@@ -216,16 +216,16 @@ def cmd_status(chat_id: str, _arg: str):
 
 def cmd_positions(chat_id: str, _arg: str):
     try:
-        from config import EXIT_THRESHOLD_BPS, ROUND_TRIP_FEE
-        exit_bps = EXIT_THRESHOLD_BPS
-        fee_bps = ROUND_TRIP_FEE * 10000
+        from config import ROUND_TRIP_FEE, EXIT_TARGET_NET_USD
+        from position_manager import estimate_funding_pnl
     except Exception:
-        exit_bps = 8.0
-        fee_bps = 9.0
+        send(chat_id, "Import error")
+        return
     try:
         rows = query_db(
             "SELECT symbol, status, direction, entry_spread_bps, qty, entry_time, "
-            "paper, notional_usd "
+            "paper, notional_usd, hl_entry_price, aster_entry_price, "
+            "hl_funding_rate, aster_funding_rate "
             "FROM positions WHERE status NOT IN ('closed','error') ORDER BY entry_time"
         )
     except Exception as e:
@@ -236,16 +236,22 @@ def cmd_positions(chat_id: str, _arg: str):
         return
     now = time.time() * 1000
     lines = ["📊 Open positions:"]
-    for sym, status, direction, spread, qty, etime, paper, notional in rows:
+    for (sym, status, direction, spread, qty, etime, paper, notional,
+         hl_px, ast_px, hl_fr, ast_fr) in rows:
         held_h = (now - (etime or now)) / 3_600_000
         tag = " [paper]" if paper else ""
-        entry_bps = spread or 0
+        notional = notional or 1000
+        fees = notional * ROUND_TRIP_FEE
+        funding = estimate_funding_pnl(
+            direction or "long_hl_short_aster", held_h, notional,
+            hl_fr or 0, ast_fr or 0,
+        )
         short_dir = "HL↑ Ast↓" if "long_hl" in (direction or "") else "HL↓ Ast↑"
         lines.append(
             f"• {sym}{tag} [{status}] {short_dir}\n"
-            f"    entry excess={entry_bps:.1f}bps (oracle-adj)  fees={fee_bps:.0f}bps\n"
-            f"    qty={qty or 0}  notional=${notional or 0:.0f}\n"
-            f"    held={held_h:.1f}h"
+            f"    HL:{hl_px:.2f}  Ast:{ast_px:.2f}  qty={qty or 0}\n"
+            f"    funding=${funding:+.2f}  fees=${fees:.2f}  held={held_h:.1f}h\n"
+            f"    target=${EXIT_TARGET_NET_USD:.2f} net → need gross≥${EXIT_TARGET_NET_USD - funding + fees:.2f}"
         )
     send(chat_id, "\n".join(lines))
 
