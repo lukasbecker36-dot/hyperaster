@@ -196,6 +196,22 @@ class Executor:
             log.warning(f"{symbol}: qty snapped to 0 at mid={mid:.2f}")
             return False
 
+        # Liquidity check: best level on both books must accommodate our qty.
+        # Entry buys/sells at top-of-book; if our size exceeds the available
+        # depth we'll get partial fills or walk the book into slippage.
+        if direction == "long_hl_short_aster":
+            hl_avail, ast_avail = hl_book.ask_size, aster_book.bid_size
+        else:
+            hl_avail, ast_avail = hl_book.bid_size, aster_book.ask_size
+        if hl_avail < qty:
+            log.debug(f"{symbol}: HL top-of-book {hl_avail:.2f} < qty {qty:.2f} — skipping")
+            self._entry_streak.pop(symbol, None)
+            return False
+        if ast_avail < qty:
+            log.debug(f"{symbol}: Aster top-of-book {ast_avail:.2f} < qty {qty:.2f} — skipping")
+            self._entry_streak.pop(symbol, None)
+            return False
+
         log.info(
             f"ENTRY {symbol}: {direction} | excess={spread_bps:.1f}bps d={oracle_delta_bps:+.1f}bps | "
             f"qty={qty} | HL {hl_side} @ {hl_ref_price:.2f} | Aster {aster_side} @ {aster_ref_price:.2f}"
