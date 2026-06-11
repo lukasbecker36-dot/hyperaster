@@ -374,6 +374,7 @@ def main():
     ap.add_argument("--slots", type=int, default=MAX_CONCURRENT_POSITIONS, help="max concurrent positions")
     ap.add_argument("--max-hold", type=int, default=48*60, help="max hold minutes (default 2880 = 48h)")
     ap.add_argument("--confirm", type=int, default=ENTRY_CONFIRM_TICKS, help="confirm ticks (default from config)")
+    ap.add_argument("--sweep", action="store_true", help="sweep target from $1-$20 and print comparison")
     args = ap.parse_args()
 
     async def run():
@@ -394,6 +395,38 @@ def main():
             if n > 0 and sym in panels:
                 cap = "full" if n >= NOTIONAL_PER_LEG else f"${n:.0f}"
                 print(f"  {sym:8s} ${n:>8.0f}  {cap:>8s}  {sp:>8.1f}bps")
+
+        if args.sweep:
+            sweep_targets = [1, 2, 3, 5, 8, 10, 15, 20]
+            print(f"\n{'='*70}")
+            print(f"TARGET SWEEP: {args.hours}h | {args.slots} slots | per-symbol book spreads")
+            print(f"{'='*70}")
+            print(f"  {'Target':>7s}  {'Trades':>6s}  {'Wins':>5s}  {'Win%':>5s}  "
+                  f"{'AvgHold':>8s}  {'Gross':>8s}  {'Costs':>8s}  {'Net':>8s}  {'$/day':>7s}")
+            print(f"  {'-'*7}  {'-'*6}  {'-'*5}  {'-'*5}  "
+                  f"{'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*7}")
+            for tgt in sweep_targets:
+                trades, slot_min, total_min = backtest_portfolio(
+                    panels, tob_notional, tob_spread_bps, tgt, args.slots,
+                    args.max_hold, args.confirm,
+                )
+                if not trades:
+                    print(f"  ${tgt:>5.0f}    0 trades")
+                    continue
+                df = pd.DataFrame(trades)
+                completed = df[df["reason"] != "open"]
+                n_closed = len(completed)
+                wins = len(completed[completed["net"] > 0]) if n_closed > 0 else 0
+                win_pct = wins / n_closed * 100 if n_closed > 0 else 0
+                avg_hold = completed["hold_min"].mean() if n_closed > 0 else 0
+                total_net = df["net"].sum()
+                total_gross = df["gross"].sum()
+                total_costs = df["fees"].sum() + df["crossing"].sum()
+                per_day = total_net / (args.hours / 24)
+                print(f"  ${tgt:>5.0f}  {len(df):>6d}  {wins:>5d}  {win_pct:>4.0f}%  "
+                      f"{avg_hold:>6.0f}m   ${total_gross:>7.2f}  ${total_costs:>7.2f}  "
+                      f"${total_net:>7.2f}  ${per_day:>6.2f}")
+            return
 
         trades, slot_min, total_min = backtest_portfolio(
             panels, tob_notional, tob_spread_bps, args.target, args.slots,
