@@ -160,13 +160,7 @@ def aster_symbol_for(base: str) -> str:
 # (catches mismatched instruments where Aster and HL track different underlyings)
 MAX_PRICE_RATIO_DIVERGENCE = 0.20   # 20%
 # Symbols permanently excluded from the scanner and monitor
-BLOCKED_SYMBOLS: set = {"BB", "BIRD"}  # BB: mismatched instruments; BIRD: micro-cap penny stock, $0.01 = 26bps, uncontrollable vol
-
-# Max raw P&L drawdown (dollars) on a position before forced exit.
-# Catches runaway losses on volatile names where the oracle-adjusted adverse
-# stop (ADVERSE_STOP_BPS) fires too late because the raw spread blows out
-# faster than the oracle delta tracks it.
-MAX_POSITION_LOSS_USD = 5.0
+BLOCKED_SYMBOLS: set = {"BB"}  # BB: mismatched instruments vs HL XYZ
 
 # ── Backward-compat aliases (fetch_data.py / live_scan.py) ──
 ASTER_API = ASTER_BASE
