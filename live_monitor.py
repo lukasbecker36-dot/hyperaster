@@ -35,7 +35,8 @@ from config import (
     ENTRY_THRESHOLD_BPS, ENTRY_THRESHOLD_BPS_BY_SYMBOL,
     EXIT_THRESHOLD_BPS, MAX_HOLD_HOURS, MAX_CONCURRENT_POSITIONS,
     HEARTBEAT_INTERVAL_MINUTES, PAPER_MODE, DATA_DIR, OUTPUT_DIR,
-    BLOCKED_SYMBOLS, ADVERSE_STOP_BPS, ENTRY_CONFIRM_TICKS, aster_symbol_for,
+    BLOCKED_SYMBOLS, ADVERSE_STOP_BPS, ENTRY_CONFIRM_TICKS,
+    ROUND_TRIP_FEE, NOTIONAL_PER_LEG, aster_symbol_for,
 )
 
 SLOW_SCAN_INTERVAL_SECONDS = 300   # re-rank all symbols every 5 min
@@ -254,7 +255,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     should_exit, reason = True, "stop"
                 elif own_excess <= EXIT_THRESHOLD_BPS:
                     # Oracle-adjusted spread compressed — but only exit if the
-                    # actual P&L at current prices is non-negative. Without this
+                    # actual P&L at current prices covers fees. Without this
                     # guard, oracle delta shifts create phantom "convergence" and
                     # the position is closed at a loss.
                     if mid > 0 and pos.direction == "long_hl_short_aster":
@@ -266,12 +267,13 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     else:
                         est_hl, est_ast = 0.0, 0.0
                     est_gross = est_hl + est_ast
-                    if est_gross >= 0:
+                    est_fees = (pos.notional_usd or NOTIONAL_PER_LEG) * ROUND_TRIP_FEE
+                    if est_gross >= est_fees:
                         should_exit, reason = True, "converged"
                     else:
                         log.debug(
                             f"{symbol}: excess={own_excess:.1f}bps below exit threshold "
-                            f"but est gross=${est_gross:.2f} < 0 — holding"
+                            f"but est net=${est_gross - est_fees:.2f} < 0 — holding"
                         )
                 elif elapsed_hours >= MAX_HOLD_HOURS:
                     should_exit, reason = True, "timeout"
