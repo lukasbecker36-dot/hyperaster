@@ -36,7 +36,7 @@ from config import (
     EXIT_THRESHOLD_BPS, MAX_HOLD_HOURS, MAX_CONCURRENT_POSITIONS,
     HEARTBEAT_INTERVAL_MINUTES, PAPER_MODE, DATA_DIR, OUTPUT_DIR,
     BLOCKED_SYMBOLS, ADVERSE_STOP_BPS, ENTRY_CONFIRM_TICKS,
-    ROUND_TRIP_FEE, NOTIONAL_PER_LEG, aster_symbol_for,
+    ROUND_TRIP_FEE, NOTIONAL_PER_LEG, MAX_POSITION_LOSS_USD, aster_symbol_for,
 )
 
 SLOW_SCAN_INTERVAL_SECONDS = 300   # re-rank all symbols every 5 min
@@ -249,24 +249,26 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     own_excess = (hl_book.bid - aster_book.ask) / mid * 10000 + smoothed_delta_bps
                 else:
                     own_excess = executable_excess_bps
+                # Estimate gross P&L at current book prices (used by multiple exit checks)
+                if mid > 0 and pos.direction == "long_hl_short_aster":
+                    est_gross = ((hl_book.bid - pos.hl_entry_price)
+                                 + (pos.aster_entry_price - aster_book.ask)) * pos.qty
+                elif mid > 0:
+                    est_gross = ((pos.hl_entry_price - hl_book.ask)
+                                 + (aster_book.bid - pos.aster_entry_price)) * pos.qty
+                else:
+                    est_gross = 0.0
+
                 should_exit, reason = False, ""
-                if own_excess <= -ADVERSE_STOP_BPS:
-                    # Edge inverted hard — phantom entry that reversed. Bail now.
+                if est_gross <= -MAX_POSITION_LOSS_USD:
+                    should_exit, reason = True, "stop"
+                    log.warning(
+                        f"{symbol}: raw P&L ${est_gross:.2f} hit dollar stop "
+                        f"(-${MAX_POSITION_LOSS_USD})"
+                    )
+                elif own_excess <= -ADVERSE_STOP_BPS:
                     should_exit, reason = True, "stop"
                 elif own_excess <= EXIT_THRESHOLD_BPS:
-                    # Oracle-adjusted spread compressed — but only exit if the
-                    # actual P&L at current prices covers fees. Without this
-                    # guard, oracle delta shifts create phantom "convergence" and
-                    # the position is closed at a loss.
-                    if mid > 0 and pos.direction == "long_hl_short_aster":
-                        est_hl = (hl_book.bid - pos.hl_entry_price) * pos.qty
-                        est_ast = (pos.aster_entry_price - aster_book.ask) * pos.qty
-                    elif mid > 0:
-                        est_hl = (pos.hl_entry_price - hl_book.ask) * pos.qty
-                        est_ast = (aster_book.bid - pos.aster_entry_price) * pos.qty
-                    else:
-                        est_hl, est_ast = 0.0, 0.0
-                    est_gross = est_hl + est_ast
                     est_fees = (pos.notional_usd or NOTIONAL_PER_LEG) * ROUND_TRIP_FEE
                     if est_gross >= est_fees:
                         should_exit, reason = True, "converged"

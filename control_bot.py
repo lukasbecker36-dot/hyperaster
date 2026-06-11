@@ -240,12 +240,11 @@ def cmd_positions(chat_id: str, _arg: str):
         held_h = (now - (etime or now)) / 3_600_000
         tag = " [paper]" if paper else ""
         entry_bps = spread or 0
-        net_edge_bps = entry_bps - exit_bps - fee_bps
-        target_pnl = net_edge_bps * (notional or 0) / 10000
+        short_dir = "HL↑ Ast↓" if "long_hl" in (direction or "") else "HL↓ Ast↑"
         lines.append(
-            f"• {sym}{tag} [{status}] {direction or ''}\n"
-            f"    entry={entry_bps:.1f}bps → exit={exit_bps:.0f}bps (fees={fee_bps:.0f}bps)\n"
-            f"    qty={qty or 0}  notional=${notional or 0:.0f}  target P&L=${target_pnl:.2f}\n"
+            f"• {sym}{tag} [{status}] {short_dir}\n"
+            f"    entry excess={entry_bps:.1f}bps (oracle-adj)  fees={fee_bps:.0f}bps\n"
+            f"    qty={qty or 0}  notional=${notional or 0:.0f}\n"
             f"    held={held_h:.1f}h"
         )
     send(chat_id, "\n".join(lines))
