@@ -383,6 +383,100 @@ def backtest_portfolio(panels, tob_notional, tob_spread_bps, target_net, max_slo
     return trades, slot_minutes, total_minutes
 
 
+def peak_analysis(panels, tob_notional, tob_spread_bps, max_hold_min, confirm_ticks):
+    """Per-entry peak-excursion analysis to calibrate per-name profit targets.
+
+    For every qualifying entry signal (same threshold/cost-floor/confirm logic
+    as the live bot), holds INDEPENDENTLY — no slot cap, no early target exit —
+    and records the maximum net P&L (gross - fees - crossing) reached before the
+    spread reverts to baseline or times out. Trades are non-overlapping per name.
+
+    The peak distribution per name is the empirical ceiling of reversion that
+    name offers, which is what a sensible profit target should be set against.
+    Funding is excluded here (negligible over the short pre-peak holds) so the
+    number is pure convergence capture.
+    """
+    rows = []
+    for sym, df in panels.items():
+        max_notional = tob_notional.get(sym, 0)
+        if max_notional <= 0:
+            continue
+        notional = min(NOTIONAL_PER_LEG, max_notional)
+        bo_bps = tob_spread_bps.get(sym, 0)
+        fees = notional * ROUND_TRIP_FEE
+        crossing = notional * bo_bps / 10000
+
+        base_threshold = ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(sym, ENTRY_THRESHOLD_BPS)
+        cost_floor = ROUND_TRIP_FEE * 10000 + bo_bps / 2 + ENTRY_COST_MARGIN_BPS
+        threshold = max(base_threshold, cost_floor)
+
+        n = len(df)
+        ts = df["ts"].values
+        hl = df["hl_close"].values
+        ast = df["ast_close"].values
+        midv = df["mid"].values
+        a_exc = df["aster_excess"].values
+        h_exc = df["hl_excess"].values
+        spread = df["spread_bps"].values
+
+        i = 0
+        streak_dir, streak_n = "", 0
+        while i < n:
+            entered = None
+            for exc_arr, direction in [(a_exc, "long_hl_short_aster"),
+                                       (h_exc, "long_aster_short_hl")]:
+                if exc_arr[i] >= threshold and abs(spread[i]) >= MIN_RAW_PREMIUM_BPS:
+                    streak_n = streak_n + 1 if streak_dir == direction else 1
+                    streak_dir = direction
+                    if streak_n >= confirm_ticks:
+                        entered = direction
+                    break
+            else:
+                streak_dir, streak_n = "", 0
+
+            if not entered:
+                i += 1
+                continue
+
+            entry_hl, entry_ast = hl[i], ast[i]
+            qty = notional / midv[i] if midv[i] > 0 else 0
+            entry_excess = a_exc[i] if entered == "long_hl_short_aster" else h_exc[i]
+            exc_arr = a_exc if entered == "long_hl_short_aster" else h_exc
+
+            max_net, t_peak, reverted = -1e9, 0.0, False
+            j = i + 1
+            last_min = 0.0
+            while j < n:
+                mins = (ts[j] - ts[i]) / MIN_MS
+                if mins > max_hold_min:
+                    break
+                last_min = mins
+                if entered == "long_hl_short_aster":
+                    gross = ((hl[j] - entry_hl) + (entry_ast - ast[j])) * qty
+                else:
+                    gross = ((entry_hl - hl[j]) + (ast[j] - entry_ast)) * qty
+                net = gross - fees - crossing
+                if net > max_net:
+                    max_net, t_peak = net, mins
+                if exc_arr[j] <= 0:   # reverted to baseline — no edge left
+                    reverted = True
+                    break
+                j += 1
+
+            peak_gross_bps = (max_net + fees + crossing) / notional * 10000 if notional > 0 else 0
+            rows.append({
+                "symbol": sym, "direction": entered,
+                "entry_excess_bps": entry_excess,
+                "max_net": max_net, "peak_gross_bps": peak_gross_bps,
+                "t_peak_min": t_peak, "notional": notional,
+                "reverted": reverted, "hold_min": last_min,
+            })
+            i = j + 1
+            streak_dir, streak_n = "", 0
+
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser(description="1m candle backtest with profit-target exit")
     ap.add_argument("--hours", type=int, default=48, help="lookback hours (default 48)")
@@ -394,6 +488,8 @@ def main():
     ap.add_argument("--sweep", action="store_true", help="sweep target from $1-$20 and print comparison")
     ap.add_argument("--window-sweep", action="store_true",
                     help="sweep baseline window (30m-24h) at fixed target/slots")
+    ap.add_argument("--peak-analysis", action="store_true",
+                    help="measure per-name peak reversion to calibrate per-name targets")
     args = ap.parse_args()
 
     async def run():
@@ -452,6 +548,53 @@ def main():
 
         # Apply the configured baseline window for all non-window-sweep runs
         apply_baseline(panels, args.window)
+
+        if args.peak_analysis:
+            rows = peak_analysis(panels, tob_notional, tob_spread_bps,
+                                 args.max_hold, args.confirm)
+            if not rows:
+                print("\nNo entry signals found for peak analysis")
+                return
+            pdf = pd.DataFrame(rows)
+            print(f"\n{'='*86}")
+            print(f"PEAK REVERSION ANALYSIS: {args.hours}h | {args.window}m baseline "
+                  f"| {len(pdf)} independent entries")
+            print(f"(max net P&L each trade reaches before reverting to baseline; "
+                  f"funding excluded)")
+            print(f"{'='*86}")
+            print(f"  {'Symbol':8s} {'N':>3s}  {'peak$ med':>9s} {'p75':>7s} {'max':>7s}  "
+                  f"{'peakbps':>8s}  {'t-peak':>7s}  {'rev%':>5s}  {'$ target':>9s}  {'size':>6s}")
+            print(f"  {'-'*8} {'-'*3}  {'-'*9} {'-'*7} {'-'*7}  {'-'*8}  {'-'*7}  "
+                  f"{'-'*5}  {'-'*9}  {'-'*6}")
+            agg = pdf.groupby("symbol")
+            suggested = {}
+            # Sort by median peak descending
+            order = agg["max_net"].median().sort_values(ascending=False).index
+            for sym in order:
+                g = pdf[pdf["symbol"] == sym]
+                npk = len(g)
+                med = g["max_net"].median()
+                p75 = g["max_net"].quantile(0.75)
+                mx = g["max_net"].max()
+                pbps = g["peak_gross_bps"].median()
+                tpk = g["t_peak_min"].median()
+                revpct = g["reverted"].mean() * 100
+                notional = g["notional"].iloc[0]
+                # Target = 60% of median peak, floored at $3 (cost coverage),
+                # rounded to nearest $0.50. Capture most of the move without
+                # waiting so long that it un-reverts.
+                tgt = max(3.0, round(med * 0.6 * 2) / 2)
+                suggested[sym] = tgt
+                print(f"  {sym:8s} {npk:>3d}  ${med:>7.2f} ${p75:>5.2f} ${mx:>5.2f}  "
+                      f"{pbps:>6.0f}bp  {tpk:>5.0f}m  {revpct:>4.0f}%  ${tgt:>7.2f}  "
+                      f"${notional:>5.0f}")
+
+            print(f"\nSuggested per-name targets (EXIT_TARGET_NET_USD_BY_SYMBOL):")
+            print("{")
+            for sym in sorted(suggested, key=suggested.get, reverse=True):
+                print(f'    "{sym}": {suggested[sym]:.1f},')
+            print("}")
+            return
 
         if args.sweep:
             sweep_targets = [1, 2, 3, 5, 8, 10, 15, 20]
