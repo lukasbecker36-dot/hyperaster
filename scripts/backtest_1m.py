@@ -194,10 +194,11 @@ async def fetch_1m_candles(
 
 
 class Position:
-    def __init__(self, symbol, direction, entry_idx, entry_hl, entry_ast, qty, notional, hl_fr, ast_fr):
+    def __init__(self, symbol, direction, entry_idx, entry_ts, entry_hl, entry_ast, qty, notional, hl_fr, ast_fr):
         self.symbol = symbol
         self.direction = direction
         self.entry_idx = entry_idx
+        self.entry_ts = entry_ts
         self.entry_hl = entry_hl
         self.entry_ast = entry_ast
         self.qty = qty
@@ -274,6 +275,7 @@ def backtest_portfolio(panels, tob_notional, tob_spread_bps, target_net, max_slo
             if reason:
                 trades.append({
                     "symbol": sym, "direction": pos.direction,
+                    "entry_ts": pos.entry_ts,
                     "entry_hl": pos.entry_hl, "entry_ast": pos.entry_ast,
                     "exit_hl": row["hl_close"], "exit_ast": row["ast_close"],
                     "gross": gross, "fees": fees, "crossing": crossing,
@@ -340,7 +342,7 @@ def backtest_portfolio(panels, tob_notional, tob_spread_bps, target_net, max_slo
                 continue
             actual_notional = qty * mid
             positions[sym] = Position(
-                sym, direction, idx,
+                sym, direction, idx, ts,
                 row["hl_close"], row["ast_close"],
                 qty, actual_notional,
                 hl_fr_default, ast_fr_default,
@@ -357,6 +359,7 @@ def backtest_portfolio(panels, tob_notional, tob_spread_bps, target_net, max_slo
             row["hl_close"], row["ast_close"], minutes_held, sym_bo_bps)
         trades.append({
             "symbol": sym, "direction": pos.direction,
+            "entry_ts": pos.entry_ts,
             "entry_hl": pos.entry_hl, "entry_ast": pos.entry_ast,
             "exit_hl": row["hl_close"], "exit_ast": row["ast_close"],
             "gross": gross, "fees": fees, "crossing": crossing,
@@ -498,6 +501,40 @@ def main():
             print(f"  {sym:8s}  {int(row['trades'])}t  net=${row['net']:+7.2f}  "
                   f"gross=${row['gross']:+7.2f}  bo=${row['crossing']:5.2f}  "
                   f"sprd={sp:>5.0f}bp  ${row['avg_notional']:>5.0f}  avg={row['avg_hold']:.0f}min")
+
+        # Time-of-day distribution (ET = UTC-4 during EDT)
+        from datetime import datetime, timezone, timedelta
+        ET = timezone(timedelta(hours=-4))
+        df["entry_hour_et"] = df["entry_ts"].apply(
+            lambda ms: datetime.fromtimestamp(ms / 1000, tz=ET).hour
+        )
+        hourly = df.groupby("entry_hour_et").agg(
+            trades=("net", "count"),
+            net=("net", "sum"),
+        )
+        print(f"\nEntry time-of-day (ET):")
+        print(f"  US market hours: 09:30-16:00 ET")
+        mkt_mask = df["entry_hour_et"].between(9, 15)
+        mkt_trades = mkt_mask.sum()
+        off_trades = len(df) - mkt_trades
+        mkt_net = df.loc[mkt_mask, "net"].sum()
+        off_net = df.loc[~mkt_mask, "net"].sum()
+        print(f"  Market hours:  {mkt_trades} trades  ${mkt_net:+.2f} net")
+        print(f"  Off hours:     {off_trades} trades  ${off_net:+.2f} net")
+        print()
+        max_bar = 30
+        max_count = hourly["trades"].max() if len(hourly) > 0 else 1
+        for hour in range(24):
+            if hour in hourly.index:
+                cnt = int(hourly.loc[hour, "trades"])
+                net = hourly.loc[hour, "net"]
+                bar_len = int(cnt / max_count * max_bar)
+                bar = "█" * bar_len
+                mkt = " *" if 9 <= hour <= 15 else "  "
+                print(f"  {hour:02d}:00{mkt} {bar:>{max_bar}s}  {cnt:>2d}t  ${net:+.2f}")
+            else:
+                mkt = " *" if 9 <= hour <= 15 else "  "
+                print(f"  {hour:02d}:00{mkt} {'':>{max_bar}s}   0t")
 
     asyncio.run(run())
 
