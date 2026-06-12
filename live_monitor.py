@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -94,6 +95,22 @@ def load_symbols(override: list[str] | None) -> list[dict]:
     symbols = df.to_dict("records")
     log.info(f"Loaded {len(symbols)} symbols from overlap_symbols.csv")
     return symbols
+
+
+_SPREADS_FILE = os.path.join(DATA_DIR, "latest_spreads.json")
+
+def _write_latest_spreads(spreads: dict[str, tuple[float, str, float]]):
+    """Atomically write current excess/baseline per symbol for control bot."""
+    tmp = _SPREADS_FILE + ".tmp"
+    try:
+        data = {sym: {"excess": round(exc, 1), "direction": d, "baseline": round(b, 1)}
+                for sym, (exc, d, b) in spreads.items()}
+        data["_ts"] = time.time()
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, _SPREADS_FILE)
+    except Exception:
+        pass
 
 
 async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
@@ -329,6 +346,9 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             fast_results = await asyncio.gather(*[scan_symbol(s) for s in fast_syms])
             for r in fast_results:
                 await process_result(r)
+
+            # ── 3b. Persist latest spreads for control bot ──
+            _write_latest_spreads(latest_spreads)
 
             # ── 4. Periodic tick log ──
             if tick_count % 20 == 0:

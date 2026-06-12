@@ -214,6 +214,16 @@ def cmd_status(chat_id: str, _arg: str):
          f"📈 spreads: {spreads}")
 
 
+def _load_live_spreads() -> dict:
+    """Load latest_spreads.json written by the monitor."""
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "latest_spreads.json")
+        with open(p) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def cmd_positions(chat_id: str, _arg: str):
     try:
         from config import ROUND_TRIP_FEE, EXIT_TARGET_NET_USD, EXIT_TARGET_NET_USD_BY_SYMBOL
@@ -235,6 +245,10 @@ def cmd_positions(chat_id: str, _arg: str):
         send(chat_id, "No open positions.")
         return
     now = time.time() * 1000
+    live = _load_live_spreads()
+    stale = ""
+    if live.get("_ts") and time.time() - live["_ts"] > 30:
+        stale = " ⚠️stale"
     lines = ["📊 Open positions:"]
     for (sym, status, direction, spread, qty, etime, paper, notional,
          hl_px, ast_px, hl_fr, ast_fr) in rows:
@@ -248,14 +262,23 @@ def cmd_positions(chat_id: str, _arg: str):
         )
         short_dir = "HL↑ Ast↓" if "long_hl" in (direction or "") else "HL↓ Ast↑"
         sym_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(sym, EXIT_TARGET_NET_USD)
+
+        # Current excess from live monitor
+        sym_live = live.get(sym, {})
+        if sym_live:
+            cur_excess = sym_live.get("excess", 0)
+            cur_base = sym_live.get("baseline", 0)
+            excess_str = f"now={cur_excess:+.0f}bps{stale}"
+        else:
+            excess_str = "now=?"
+
         lines.append(
             f"• {sym}{tag} [{status}] {short_dir}\n"
-            f"    entry excess={spread:.0f}bps → exit at ≤0bps\n"
+            f"    excess: entry={spread:+.0f}bps  {excess_str}  exit≤0bps\n"
             f"    HL:{hl_px:.2f}  Ast:{ast_px:.2f}  qty={qty or 0}\n"
             f"    funding=${funding:+.2f}  fees=${fees:.2f}  held={held_h:.1f}h\n"
             f"    target=${sym_target:.2f} net | need gross≥${sym_target - funding + fees:.2f}"
         )
-    lines.append("\n(use /spreads for live excess vs baseline)")
     send(chat_id, "\n".join(lines))
 
 
