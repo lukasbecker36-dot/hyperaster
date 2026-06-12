@@ -35,7 +35,7 @@ from config import (
     ENTRY_THRESHOLD_BPS, ENTRY_THRESHOLD_BPS_BY_SYMBOL,
     EXIT_THRESHOLD_BPS, MAX_HOLD_HOURS, MAX_CONCURRENT_POSITIONS,
     HEARTBEAT_INTERVAL_MINUTES, PAPER_MODE, DATA_DIR, OUTPUT_DIR,
-    BLOCKED_SYMBOLS, ENTRY_CONFIRM_TICKS,
+    BLOCKED_SYMBOLS, ENTRY_CONFIRM_TICKS, ADVERSE_STOP_BPS,
     ROUND_TRIP_FEE, NOTIONAL_PER_LEG, EXIT_TARGET_NET_USD,
     EXIT_TARGET_NET_USD_BY_SYMBOL, aster_symbol_for,
 )
@@ -263,8 +263,22 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 sym_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(symbol, EXIT_TARGET_NET_USD)
                 if est_net >= sym_target:
                     should_exit, reason = True, "target"
+                elif symbol in BLOCKED_SYMBOLS:
+                    should_exit, reason = True, "blocked"
+                elif est_net <= -sym_target:
+                    should_exit, reason = True, "stop-loss"
                 elif elapsed_hours >= MAX_HOLD_HOURS:
                     should_exit, reason = True, "timeout"
+                else:
+                    # Convergence exit: the excess in our position's direction
+                    # has reverted back near baseline (the trade thesis is done).
+                    # spread_bps = (aster_mid - hl_mid) / mid * 10000
+                    spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000
+                    raw_excess = spread_bps - (baseline_bps or 0)
+                    pos_dir = pos.direction or "long_hl_short_aster"
+                    own_excess = raw_excess if pos_dir == "long_hl_short_aster" else -raw_excess
+                    if baseline_bps is not None and own_excess <= EXIT_THRESHOLD_BPS:
+                        should_exit, reason = True, "converge"
                 if should_exit:
                     await executor.try_exit(symbol, aster_book, hl_book, reason)
             elif not pos:
