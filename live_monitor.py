@@ -265,19 +265,15 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     should_exit, reason = True, "target"
                 elif symbol in BLOCKED_SYMBOLS:
                     should_exit, reason = True, "blocked"
-                elif est_net <= -sym_target:
-                    should_exit, reason = True, "stop-loss"
                 elif elapsed_hours >= MAX_HOLD_HOURS:
                     should_exit, reason = True, "timeout"
                 else:
-                    # Convergence exit: the excess in our position's direction
-                    # has reverted back near baseline (the trade thesis is done).
-                    # spread_bps = (aster_mid - hl_mid) / mid * 10000
+                    # Convergence exit: spread has reverted to baseline — trade done.
                     spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000
                     raw_excess = spread_bps - (baseline_bps or 0)
                     pos_dir = pos.direction or "long_hl_short_aster"
                     own_excess = raw_excess if pos_dir == "long_hl_short_aster" else -raw_excess
-                    if baseline_bps is not None and own_excess <= EXIT_THRESHOLD_BPS:
+                    if baseline_bps is not None and own_excess <= 0:
                         should_exit, reason = True, "converge"
                 if should_exit:
                     await executor.try_exit(symbol, aster_book, hl_book, reason)
