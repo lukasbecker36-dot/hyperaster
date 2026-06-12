@@ -59,6 +59,12 @@ EXIT_THRESHOLD_BPS = 8.0
 # Profit-target exit: close when estimated net P&L (gross - fees + funding) reaches this.
 EXIT_TARGET_NET_USD = 3.0
 
+# Per-symbol exit targets. Names with high median peak reversion warrant a higher
+# target to capture blowouts. Derived from scripts/backtest_1m.py --peak-analysis.
+EXIT_TARGET_NET_USD_BY_SYMBOL: dict = {
+    "NOW": 5.5,
+}
+
 # Number of consecutive qualifying scans the entry signal must persist before we
 # commit capital. A genuine dislocation holds across ticks; a stale-feed/oracle-lag
 # phantom (e.g. CBRS entering at +41bps then inverting to -25bps within minutes)
@@ -174,7 +180,15 @@ def aster_symbol_for(base: str) -> str:
 # (catches mismatched instruments where Aster and HL track different underlyings)
 MAX_PRICE_RATIO_DIVERGENCE = 0.20   # 20%
 # Symbols permanently excluded from the scanner and monitor
-BLOCKED_SYMBOLS: set = {"BB"}  # BB: mismatched instruments vs HL XYZ
+# BB: mismatched instruments vs HL XYZ
+# Peak-analysis blocklist: names with negative median peak reversion consistently
+# lose money after fees — the spread widens further instead of reverting.
+# Derived from scripts/backtest_1m.py --peak-analysis (48h, 480m baseline).
+BLOCKED_SYMBOLS: set = {
+    "BB",
+    "META", "COIN", "LLY", "IBM", "MSFT", "URNM", "BABA", "AVGO",
+    "CRWV", "EWT", "BX", "USAR", "WDC",
+}
 
 # ── Backward-compat aliases (fetch_data.py / live_scan.py) ──
 ASTER_API = ASTER_BASE

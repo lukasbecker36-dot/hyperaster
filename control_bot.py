@@ -216,7 +216,7 @@ def cmd_status(chat_id: str, _arg: str):
 
 def cmd_positions(chat_id: str, _arg: str):
     try:
-        from config import ROUND_TRIP_FEE, EXIT_TARGET_NET_USD
+        from config import ROUND_TRIP_FEE, EXIT_TARGET_NET_USD, EXIT_TARGET_NET_USD_BY_SYMBOL
         from position_manager import estimate_funding_pnl
     except Exception:
         send(chat_id, "Import error")
@@ -251,7 +251,7 @@ def cmd_positions(chat_id: str, _arg: str):
             f"• {sym}{tag} [{status}] {short_dir}\n"
             f"    HL:{hl_px:.2f}  Ast:{ast_px:.2f}  qty={qty or 0}\n"
             f"    funding=${funding:+.2f}  fees=${fees:.2f}  held={held_h:.1f}h\n"
-            f"    target=${EXIT_TARGET_NET_USD:.2f} net → need gross≥${EXIT_TARGET_NET_USD - funding + fees:.2f}"
+            f"    target=${EXIT_TARGET_NET_USD_BY_SYMBOL.get(sym, EXIT_TARGET_NET_USD):.2f} net → need gross≥${EXIT_TARGET_NET_USD_BY_SYMBOL.get(sym, EXIT_TARGET_NET_USD) - funding + fees:.2f}"
         )
     send(chat_id, "\n".join(lines))
 

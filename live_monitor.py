@@ -36,7 +36,8 @@ from config import (
     EXIT_THRESHOLD_BPS, MAX_HOLD_HOURS, MAX_CONCURRENT_POSITIONS,
     HEARTBEAT_INTERVAL_MINUTES, PAPER_MODE, DATA_DIR, OUTPUT_DIR,
     BLOCKED_SYMBOLS, ENTRY_CONFIRM_TICKS,
-    ROUND_TRIP_FEE, NOTIONAL_PER_LEG, EXIT_TARGET_NET_USD, aster_symbol_for,
+    ROUND_TRIP_FEE, NOTIONAL_PER_LEG, EXIT_TARGET_NET_USD,
+    EXIT_TARGET_NET_USD_BY_SYMBOL, aster_symbol_for,
 )
 
 SLOW_SCAN_INTERVAL_SECONDS = 300   # re-rank all symbols every 5 min
@@ -259,7 +260,8 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 est_net = est_gross - est_fees + est_funding
 
                 should_exit, reason = False, ""
-                if est_net >= EXIT_TARGET_NET_USD:
+                sym_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(symbol, EXIT_TARGET_NET_USD)
+                if est_net >= sym_target:
                     should_exit, reason = True, "target"
                 elif elapsed_hours >= MAX_HOLD_HOURS:
                     should_exit, reason = True, "timeout"
