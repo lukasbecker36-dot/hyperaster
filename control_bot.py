@@ -247,12 +247,15 @@ def cmd_positions(chat_id: str, _arg: str):
             hl_fr or 0, ast_fr or 0,
         )
         short_dir = "HL↑ Ast↓" if "long_hl" in (direction or "") else "HL↓ Ast↑"
+        sym_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(sym, EXIT_TARGET_NET_USD)
         lines.append(
             f"• {sym}{tag} [{status}] {short_dir}\n"
+            f"    entry excess={spread:.0f}bps → exit at ≤0bps\n"
             f"    HL:{hl_px:.2f}  Ast:{ast_px:.2f}  qty={qty or 0}\n"
             f"    funding=${funding:+.2f}  fees=${fees:.2f}  held={held_h:.1f}h\n"
-            f"    target=${EXIT_TARGET_NET_USD_BY_SYMBOL.get(sym, EXIT_TARGET_NET_USD):.2f} net → need gross≥${EXIT_TARGET_NET_USD_BY_SYMBOL.get(sym, EXIT_TARGET_NET_USD) - funding + fees:.2f}"
+            f"    target=${sym_target:.2f} net | need gross≥${sym_target - funding + fees:.2f}"
         )
+    lines.append("\n(use /spreads for live excess vs baseline)")
     send(chat_id, "\n".join(lines))
 
 

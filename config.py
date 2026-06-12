@@ -185,7 +185,7 @@ MAX_PRICE_RATIO_DIVERGENCE = 0.20   # 20%
 # lose money after fees — the spread widens further instead of reverting.
 # Derived from scripts/backtest_1m.py --peak-analysis (48h, 480m baseline).
 BLOCKED_SYMBOLS: set = {
-    "BB",
+    "BB", "BIRD",
     "META", "COIN", "LLY", "IBM", "MSFT", "URNM", "BABA", "AVGO",
     "CRWV", "EWT", "BX", "USAR", "WDC",
 }
