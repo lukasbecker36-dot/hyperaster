@@ -103,8 +103,18 @@ def _write_latest_spreads(spreads: dict[str, tuple[float, str, float]]):
     """Atomically write current excess/baseline per symbol for control bot."""
     tmp = _SPREADS_FILE + ".tmp"
     try:
-        data = {sym: {"excess": round(exc, 1), "direction": d, "baseline": round(b, 1)}
-                for sym, (exc, d, b) in spreads.items()}
+        data = {}
+        for sym, (exc, d, b) in spreads.items():
+            if d == "L-HL/S-AST":
+                hl_short_aster_excess = exc
+            else:
+                hl_short_aster_excess = -exc
+            data[sym] = {
+                "excess": round(exc, 1),
+                "hl_excess": round(hl_short_aster_excess, 1),
+                "direction": d,
+                "baseline": round(b, 1),
+            }
         data["_ts"] = time.time()
         with open(tmp, "w") as f:
             json.dump(data, f)
@@ -144,8 +154,16 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             log.error(f"Cannot start live: {e}")
             return
 
+    # Include symbols with open positions even if blocked (need specs for exit)
+    pm_preload = PositionManager(paper_mode=paper_mode)
+    open_pos_syms = set(pm_preload.positions.keys())
+    blocked_with_positions = open_pos_syms & BLOCKED_SYMBOLS
+    if blocked_with_positions:
+        log.info(f"Blocked symbols with open positions (will scan for exit): {blocked_with_positions}")
+    all_load_syms = list(dict.fromkeys(symbols + list(blocked_with_positions)))
+
     client = ExchangeClient(api_keys)
-    await client.start(symbols)
+    await client.start(all_load_syms)
 
     # Verify all specs loaded
     missing = [s for s in symbols if s not in client.aster_specs or s not in client.hl_specs]
@@ -159,9 +177,9 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
 
     # Seed the rolling book-spread baselines from 1m candles so entries can fire
     # immediately instead of waiting BASELINE_MIN_SAMPLES minutes of live data.
-    await client.warmup_book_spread(symbols)
+    await client.warmup_book_spread(all_load_syms)
 
-    pm = PositionManager(paper_mode=paper_mode)
+    pm = pm_preload
     executor = Executor(client, pm, paper_mode=paper_mode)
 
     # Crash recovery: reconcile any uncompleted intents against venue state.

@@ -263,11 +263,12 @@ def cmd_positions(chat_id: str, _arg: str):
         short_dir = "HL↑ Ast↓" if "long_hl" in (direction or "") else "HL↓ Ast↑"
         sym_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(sym, EXIT_TARGET_NET_USD)
 
-        # Current excess from live monitor
+        # Current excess in the position's own direction
         sym_live = live.get(sym, {})
-        if sym_live:
-            cur_excess = sym_live.get("excess", 0)
-            cur_base = sym_live.get("baseline", 0)
+        if sym_live and isinstance(sym_live, dict):
+            hl_exc = sym_live.get("hl_excess", 0)
+            pos_dir = direction or "long_hl_short_aster"
+            cur_excess = hl_exc if "long_hl" in pos_dir else -hl_exc
             excess_str = f"now={cur_excess:+.0f}bps{stale}"
         else:
             excess_str = "now=?"
