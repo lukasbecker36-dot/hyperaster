@@ -109,7 +109,6 @@ class Executor:
                 f"{symbol}: baseline not ready "
                 f"({self.client.book_spread_sample_count(symbol)} samples) — skipping"
             )
-            self._entry_streak.pop(symbol, None)
             return False
 
         # raw_premium guard uses the absolute book gap (matches the backtest's
@@ -167,7 +166,6 @@ class Executor:
                 f"{symbol}: raw gap {raw_premium_bps:.1f}bps below MIN_RAW floor "
                 f"({MIN_RAW_PREMIUM_BPS}bps), excess={excess_bps:.1f}bps — skipping"
             )
-            self._entry_streak.pop(symbol, None)
             return False
 
         # Hard floor — ensures the edge exceeds fee cost even before the rolling
@@ -177,7 +175,6 @@ class Executor:
                 f"{symbol}: excess {excess_bps:.1f}bps below MIN_EXECUTABLE floor "
                 f"({MIN_EXECUTABLE_PREMIUM_BPS}bps), skipping"
             )
-            self._entry_streak.pop(symbol, None)
             return False
 
         # Persistence filter — the signal must hold the same direction for
