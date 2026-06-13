@@ -266,6 +266,7 @@ def cmd_positions(chat_id: str, _arg: str):
 
         # Current excess vs ENTRY baseline (what convergence exit uses)
         sym_live = live.get(sym, {})
+        est_net_str = ""
         if sym_live and isinstance(sym_live, dict):
             # Recover raw spread: hl_excess = spread_bps - rolling_baseline
             raw_spread = sym_live.get("baseline", 0) + sym_live.get("hl_excess", 0)
@@ -274,6 +275,8 @@ def cmd_positions(chat_id: str, _arg: str):
             pos_dir = direction or "long_hl_short_aster"
             own_excess = excess_vs_entry if "long_hl" in pos_dir else -excess_vs_entry
             excess_str = f"now={own_excess:+.0f}bps{stale}"
+            if "est_net" in sym_live:
+                est_net_str = f"  est_net=${sym_live['est_net']:+.2f} (executable)"
         else:
             excess_str = "now=?"
 
@@ -281,7 +284,7 @@ def cmd_positions(chat_id: str, _arg: str):
             f"• {sym}{tag} [{status}] {short_dir}\n"
             f"    excess: entry={spread:+.0f}bps  {excess_str}  exit≤0bps\n"
             f"    HL:{hl_px:.2f}  Ast:{ast_px:.2f}  qty={qty or 0}\n"
-            f"    funding=${funding:+.2f}  fees=${fees:.2f}  held={held_h:.1f}h\n"
+            f"    funding=${funding:+.2f}  fees=${fees:.2f}  held={held_h:.1f}h{est_net_str}\n"
             f"    target=${sym_target:.2f} net | need gross≥${sym_target - funding + fees:.2f}"
         )
     send(chat_id, "\n".join(lines))

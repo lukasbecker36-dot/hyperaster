@@ -99,9 +99,11 @@ def load_symbols(override: list[str] | None) -> list[dict]:
 
 _SPREADS_FILE = os.path.join(DATA_DIR, "latest_spreads.json")
 
-def _write_latest_spreads(spreads: dict[str, tuple[float, str, float]]):
+def _write_latest_spreads(spreads: dict[str, tuple[float, str, float]],
+                          est_net: dict[str, float] | None = None):
     """Atomically write current excess/baseline per symbol for control bot."""
     tmp = _SPREADS_FILE + ".tmp"
+    est_net = est_net or {}
     try:
         data = {}
         for sym, (exc, d, b) in spreads.items():
@@ -109,12 +111,15 @@ def _write_latest_spreads(spreads: dict[str, tuple[float, str, float]]):
                 hl_short_aster_excess = exc
             else:
                 hl_short_aster_excess = -exc
-            data[sym] = {
+            entry = {
                 "excess": round(exc, 1),
                 "hl_excess": round(hl_short_aster_excess, 1),
                 "direction": d,
                 "baseline": round(b, 1),
             }
+            if sym in est_net:
+                entry["est_net"] = round(est_net[sym], 2)
+            data[sym] = entry
         data["_ts"] = time.time()
         with open(tmp, "w") as f:
             json.dump(data, f)
@@ -222,6 +227,8 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     consecutive_errors = 0
     # symbol -> (excess_bps, direction_str, baseline_bps) from last scan
     latest_spreads: dict[str, tuple[float, str, float]] = {}
+    # symbol -> est_net USD (executable bid/ask P&L) for open positions
+    latest_est_net: dict[str, float] = {}
     # top N candidates polled every fast tick
     candidates: list[str] = []
 
@@ -293,6 +300,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     pos.hl_funding_rate, pos.aster_funding_rate,
                 )
                 est_net = est_gross - est_fees + est_funding
+                latest_est_net[symbol] = est_net
 
                 should_exit, reason = False, ""
                 sym_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(symbol, EXIT_TARGET_NET_USD)
@@ -316,14 +324,28 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                         raw_excess = spread_bps - entry_base
                         pos_dir = pos.direction or "long_hl_short_aster"
                         own_excess = raw_excess if pos_dir == "long_hl_short_aster" else -raw_excess
-                        if own_excess <= 0 and elapsed_hours >= 0.5:
+                        # Gate on est_net (executable bid/ask P&L), NOT just the mid
+                        # spread. A thin book can balloon at exit time: the mid says
+                        # "converged, take profit" while the executable price would
+                        # lose money crossing a blown-out bid/ask. We're mid-neutral
+                        # once converged, so there's no directional urgency — hold
+                        # until the book tightens (est_net >= 0) or the timeout fires.
+                        if own_excess <= 0 and elapsed_hours >= 0.5 and est_net >= 0:
                             log.info(
                                 f"CONVERGE {symbol}: own_excess={own_excess:.1f} "
                                 f"spread={spread_bps:.1f} entry_base={entry_base:.1f} "
-                                f"dir={pos_dir} held={elapsed_hours:.1f}h "
+                                f"est_net=${est_net:.2f} dir={pos_dir} held={elapsed_hours:.1f}h "
                                 f"HL={hl_book.mid:.2f} Ast={aster_book.mid:.2f}"
                             )
                             should_exit, reason = True, "converge"
+                        elif own_excess <= 0 and elapsed_hours >= 0.5:
+                            # Mids converged but executable P&L is negative (wide
+                            # book) — hold for the book to tighten, don't dump at a loss.
+                            log.debug(
+                                f"CONVERGE-WAIT {symbol}: mids converged "
+                                f"(own_excess={own_excess:.1f}) but est_net=${est_net:.2f} "
+                                f"<0 — holding | held={elapsed_hours:.1f}h"
+                            )
                 if should_exit:
                     await executor.try_exit(symbol, aster_book, hl_book, reason)
             elif not pos:
@@ -380,7 +402,11 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 await process_result(r)
 
             # ── 3b. Persist latest spreads for control bot ──
-            _write_latest_spreads(latest_spreads)
+            # Drop est_net for symbols no longer holding a position
+            for s in list(latest_est_net.keys()):
+                if s not in pm.positions:
+                    latest_est_net.pop(s, None)
+            _write_latest_spreads(latest_spreads, latest_est_net)
 
             # ── 4. Periodic tick log ──
             if tick_count % 20 == 0:
