@@ -30,6 +30,7 @@ from config import (
     NOTIONAL_PER_LEG, ENTRY_TIMEOUT_MINUTES, EXIT_TIMEOUT_MINUTES,
     MAX_PRICE_RATIO_DIVERGENCE, BLOCKED_SYMBOLS, MIN_EXECUTABLE_PREMIUM_BPS,
     ENTRY_CONFIRM_TICKS, ENTRY_COST_MARGIN_BPS, ROUND_TRIP_FEE,
+    EXIT_TARGET_NET_USD, EXIT_TARGET_NET_USD_BY_SYMBOL,
     aster_symbol_for,
 )
 from auth import now_ms
@@ -195,6 +196,19 @@ class Executor:
             self._entry_streak.pop(symbol, None)
             return False
         actual_notional = qty * mid
+
+        # Reject if max theoretical profit can't reach target. Full reversion
+        # of excess_bps on this notional is the ceiling; require 1.5× target
+        # so we're not entering trades that can only breakeven at best.
+        sym_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(symbol, EXIT_TARGET_NET_USD)
+        est_fees = actual_notional * ROUND_TRIP_FEE
+        max_gross = actual_notional * excess_bps / 10000
+        if max_gross < sym_target * 1.5 + est_fees:
+            log.debug(
+                f"{symbol}: max gross ${max_gross:.2f} < 1.5×target+fees "
+                f"${sym_target * 1.5 + est_fees:.2f} on ${actual_notional:.0f} notional — skipping"
+            )
+            return False
 
         log.info(
             f"ENTRY {symbol}: {direction} | excess={excess_bps:.1f}bps "
