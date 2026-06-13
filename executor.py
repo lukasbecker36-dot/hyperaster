@@ -29,7 +29,7 @@ from config import (
     ENTRY_THRESHOLD_BPS, ENTRY_THRESHOLD_BPS_BY_SYMBOL, EXIT_THRESHOLD_BPS,
     NOTIONAL_PER_LEG, ENTRY_TIMEOUT_MINUTES, EXIT_TIMEOUT_MINUTES,
     MAX_PRICE_RATIO_DIVERGENCE, BLOCKED_SYMBOLS, MIN_EXECUTABLE_PREMIUM_BPS,
-    MIN_RAW_PREMIUM_BPS, ENTRY_CONFIRM_TICKS, ENTRY_COST_MARGIN_BPS, ROUND_TRIP_FEE,
+    ENTRY_CONFIRM_TICKS, ENTRY_COST_MARGIN_BPS, ROUND_TRIP_FEE,
     aster_symbol_for,
 )
 from auth import now_ms
@@ -111,9 +111,10 @@ class Executor:
             )
             return False
 
-        # raw_premium guard uses the absolute book gap (matches the backtest's
-        # MIN_RAW filter on abs(spread_bps)).
-        raw_premium_bps = abs(spread_bps)
+        # raw_premium_bps removed — the cost floor (fees + book spreads) is the
+        # real protection. The old abs(spread) guard blocked legitimate baseline-
+        # deviation trades on names with negative baselines (e.g. AMZN at 69bps
+        # excess but only 10bps raw spread due to -59bps baseline).
 
         aster_excess_bps = spread_bps - baseline_bps   # long_hl_short_aster
         hl_excess_bps = -(spread_bps - baseline_bps)    # long_aster_short_hl
@@ -157,15 +158,6 @@ class Executor:
         else:
             # No qualifying direction this tick — reset the persistence streak.
             self._entry_streak.pop(symbol, None)
-            return False
-
-        # Raw gap guard — there must be at least some absolute dislocation between
-        # the venues, not just a baseline-relative wiggle on a near-zero spread.
-        if raw_premium_bps < MIN_RAW_PREMIUM_BPS:
-            log.debug(
-                f"{symbol}: raw gap {raw_premium_bps:.1f}bps below MIN_RAW floor "
-                f"({MIN_RAW_PREMIUM_BPS}bps), excess={excess_bps:.1f}bps — skipping"
-            )
             return False
 
         # Hard floor — ensures the edge exceeds fee cost even before the rolling
