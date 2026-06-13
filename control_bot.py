@@ -235,7 +235,8 @@ def cmd_positions(chat_id: str, _arg: str):
         rows = query_db(
             "SELECT symbol, status, direction, entry_spread_bps, qty, entry_time, "
             "paper, notional_usd, hl_entry_price, aster_entry_price, "
-            "hl_funding_rate, aster_funding_rate "
+            "hl_funding_rate, aster_funding_rate, "
+            "COALESCE(entry_baseline_bps, 0) "
             "FROM positions WHERE status NOT IN ('closed','error') ORDER BY entry_time"
         )
     except Exception as e:
@@ -251,7 +252,7 @@ def cmd_positions(chat_id: str, _arg: str):
         stale = " ⚠️stale"
     lines = ["📊 Open positions:"]
     for (sym, status, direction, spread, qty, etime, paper, notional,
-         hl_px, ast_px, hl_fr, ast_fr) in rows:
+         hl_px, ast_px, hl_fr, ast_fr, entry_base) in rows:
         held_h = (now - (etime or now)) / 3_600_000
         tag = " [paper]" if paper else ""
         notional = notional or 1000
@@ -263,13 +264,16 @@ def cmd_positions(chat_id: str, _arg: str):
         short_dir = "HL↑ Ast↓" if "long_hl" in (direction or "") else "HL↓ Ast↑"
         sym_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(sym, EXIT_TARGET_NET_USD)
 
-        # Current excess in the position's own direction
+        # Current excess vs ENTRY baseline (what convergence exit uses)
         sym_live = live.get(sym, {})
         if sym_live and isinstance(sym_live, dict):
-            hl_exc = sym_live.get("hl_excess", 0)
+            # Recover raw spread: hl_excess = spread_bps - rolling_baseline
+            raw_spread = sym_live.get("baseline", 0) + sym_live.get("hl_excess", 0)
+            # Excess vs the baseline that existed at entry time
+            excess_vs_entry = raw_spread - (entry_base or 0)
             pos_dir = direction or "long_hl_short_aster"
-            cur_excess = hl_exc if "long_hl" in pos_dir else -hl_exc
-            excess_str = f"now={cur_excess:+.0f}bps{stale}"
+            own_excess = excess_vs_entry if "long_hl" in pos_dir else -excess_vs_entry
+            excess_str = f"now={own_excess:+.0f}bps{stale}"
         else:
             excess_str = "now=?"
 

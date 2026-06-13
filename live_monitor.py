@@ -303,16 +303,17 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 elif elapsed_hours >= MAX_HOLD_HOURS:
                     should_exit, reason = True, "timeout"
                 else:
-                    # Convergence exit: spread has reverted to baseline — trade done.
-                    # Require minimum 30min hold to avoid exiting on transient noise.
-                    # Don't require positive P&L: the trade thesis (mean reversion)
-                    # has played out — holding further just bleeds funding with no
-                    # reason to expect improvement.
+                    # Convergence exit: spread has reverted to the baseline that
+                    # existed AT ENTRY TIME. Using the current rolling baseline
+                    # would let the goalposts shift — a spread that stays wide for
+                    # 8h+ gets absorbed into the rolling median, making excess drop
+                    # to 0 even though the spread never actually reverted.
                     spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000
-                    raw_excess = spread_bps - (baseline_bps or 0)
+                    entry_base = pos.entry_baseline_bps or 0
+                    raw_excess = spread_bps - entry_base
                     pos_dir = pos.direction or "long_hl_short_aster"
                     own_excess = raw_excess if pos_dir == "long_hl_short_aster" else -raw_excess
-                    if baseline_bps is not None and own_excess <= 0 and elapsed_hours >= 0.5:
+                    if own_excess <= 0 and elapsed_hours >= 0.5:
                         should_exit, reason = True, "converge"
                 if should_exit:
                     await executor.try_exit(symbol, aster_book, hl_book, reason)

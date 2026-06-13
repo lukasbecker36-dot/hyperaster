@@ -224,6 +224,7 @@ class Executor:
                 notional_usd=actual_notional,
                 hl_funding_rate=hl_fr,
                 aster_funding_rate=aster_fr,
+                entry_baseline_bps=baseline_bps,
             )
             self.pm.confirm_aster_entry(symbol, aster_ref_price)
             return True
@@ -405,6 +406,7 @@ class Executor:
             notional_usd=actual_notional,
             hl_funding_rate=hl_fr,
             aster_funding_rate=aster_fr,
+            entry_baseline_bps=baseline_bps,
         )
         self.pm.log_trade(
             pos.id, "hl", hl_side, "ioc_limit",

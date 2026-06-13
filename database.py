@@ -54,9 +54,17 @@ def init_db():
             -- Funding (snapshotted at entry, accrued over hold)
             hl_funding_rate     REAL DEFAULT 0,        -- HL hourly funding rate at entry
             aster_funding_rate  REAL DEFAULT 0,        -- Aster 8h funding rate at entry
-            funding_pnl         REAL DEFAULT 0         -- estimated net carry over the hold
+            funding_pnl         REAL DEFAULT 0,        -- estimated net carry over the hold
+            entry_baseline_bps  REAL DEFAULT 0          -- rolling baseline at entry (for convergence exit)
         );
 
+        -- Migration: add entry_baseline_bps if missing (existing DBs)
+    """)
+    try:
+        conn.execute("ALTER TABLE positions ADD COLUMN entry_baseline_bps REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS trade_log (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             position_id INTEGER REFERENCES positions(id),
