@@ -308,13 +308,22 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     # would let the goalposts shift — a spread that stays wide for
                     # 8h+ gets absorbed into the rolling median, making excess drop
                     # to 0 even though the spread never actually reverted.
-                    spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000
-                    entry_base = pos.entry_baseline_bps or 0
-                    raw_excess = spread_bps - entry_base
-                    pos_dir = pos.direction or "long_hl_short_aster"
-                    own_excess = raw_excess if pos_dir == "long_hl_short_aster" else -raw_excess
-                    if own_excess <= 0 and elapsed_hours >= 0.5:
-                        should_exit, reason = True, "converge"
+                    entry_base = pos.entry_baseline_bps
+                    if not entry_base:
+                        log.warning(f"{symbol}: entry_baseline_bps=0 — skipping convergence check")
+                    else:
+                        spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000
+                        raw_excess = spread_bps - entry_base
+                        pos_dir = pos.direction or "long_hl_short_aster"
+                        own_excess = raw_excess if pos_dir == "long_hl_short_aster" else -raw_excess
+                        if own_excess <= 0 and elapsed_hours >= 0.5:
+                            log.info(
+                                f"CONVERGE {symbol}: own_excess={own_excess:.1f} "
+                                f"spread={spread_bps:.1f} entry_base={entry_base:.1f} "
+                                f"dir={pos_dir} held={elapsed_hours:.1f}h "
+                                f"HL={hl_book.mid:.2f} Ast={aster_book.mid:.2f}"
+                            )
+                            should_exit, reason = True, "converge"
                 if should_exit:
                     await executor.try_exit(symbol, aster_book, hl_book, reason)
             elif not pos:
