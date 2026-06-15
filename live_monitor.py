@@ -38,7 +38,8 @@ from config import (
     HEARTBEAT_INTERVAL_MINUTES, PAPER_MODE, DATA_DIR, OUTPUT_DIR,
     BLOCKED_SYMBOLS, NON_EQUITY_SYMBOLS, ENTRY_CONFIRM_TICKS, ADVERSE_STOP_BPS,
     ROUND_TRIP_FEE, NOTIONAL_PER_LEG, EXIT_TARGET_NET_USD,
-    EXIT_TARGET_NET_USD_BY_SYMBOL, MAX_FUNDING_DRAG_USD, aster_symbol_for,
+    EXIT_TARGET_NET_USD_BY_SYMBOL, MAX_FUNDING_DRAG_USD,
+    FUNDING_MAX_HOLD_HOURS, FUNDING_ADVERSE_STOP_USD, aster_symbol_for,
 )
 
 SLOW_SCAN_INTERVAL_SECONDS = 300   # re-rank all symbols every 5 min
@@ -47,7 +48,7 @@ from database import init_db
 from exchange_client import ExchangeClient
 from position_manager import PositionManager, estimate_funding_pnl
 from executor import Executor
-from notify import install_handler as install_alert_handler
+from notify import install_handler as install_alert_handler, send_alert
 from recovery import reconcile_incomplete_intents
 
 # ── Logging ──
@@ -98,6 +99,25 @@ def load_symbols(override: list[str] | None) -> list[dict]:
 
 
 _SPREADS_FILE = os.path.join(DATA_DIR, "latest_spreads.json")
+# Runtime auto-entry kill switch. When this file contains "off" the monitor runs
+# (and manages exits + manual entries) but never auto-opens a basis arb. Lets you
+# go live for a manual funding trade without the auto-scanner also trading live.
+_AUTO_ENTRY_FILE = os.path.join(DATA_DIR, "auto_entry")
+# Manual command inbox: the control bot drops one JSON file per request here
+# ({"action":"enter","symbol":..,"direction":..,"notional":..} or
+# {"action":"close","symbol":..}). The monitor is the single order-placing
+# process, so all manual entries/exits are funnelled through it (no races).
+_MANUAL_CMD_DIR = os.path.join(DATA_DIR, "manual_cmds")
+
+
+def _auto_entry_enabled() -> bool:
+    """Read the runtime auto-entry flag. Missing/unreadable file = enabled (default)."""
+    try:
+        return Path(_AUTO_ENTRY_FILE).read_text().strip().lower() != "off"
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return True
 
 def _write_latest_spreads(spreads: dict[str, tuple[float, str, float]],
                           est_net: dict[str, float] | None = None):
@@ -230,6 +250,8 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     latest_spreads: dict[str, tuple[float, str, float]] = {}
     # symbol -> est_net USD (executable bid/ask P&L) for open positions
     latest_est_net: dict[str, float] = {}
+    # Runtime flags refreshed once per tick from their control files.
+    runtime_flags = {"auto_entry": True}
     # top N candidates polled every fast tick
     candidates: list[str] = []
 
@@ -305,7 +327,21 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
 
                 should_exit, reason = False, ""
                 sym_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(symbol, EXIT_TARGET_NET_USD)
-                if est_net >= sym_target:
+                if pos.hold_for_funding:
+                    # Manual funding-carry hold: held for carry, never the basis
+                    # target/convergence exits (those would close it the moment the
+                    # basis reverts). Only safety exits apply.
+                    if symbol in BLOCKED_SYMBOLS:
+                        should_exit, reason = True, "blocked"
+                    elif est_net <= -FUNDING_ADVERSE_STOP_USD:
+                        log.warning(
+                            f"FUNDING-STOP {symbol}: est_net=${est_net:.2f} <= "
+                            f"-${FUNDING_ADVERSE_STOP_USD} — bailing | held={elapsed_hours:.1f}h"
+                        )
+                        should_exit, reason = True, "funding_stop"
+                    elif elapsed_hours >= FUNDING_MAX_HOLD_HOURS:
+                        should_exit, reason = True, "funding_timeout"
+                elif est_net >= sym_target:
                     should_exit, reason = True, "target"
                 elif symbol in BLOCKED_SYMBOLS:
                     should_exit, reason = True, "blocked"
@@ -357,17 +393,75 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 if should_exit:
                     await executor.try_exit(symbol, aster_book, hl_book, reason)
             elif not pos:
-                if pm.active_count < MAX_CONCURRENT_POSITIONS:
+                if runtime_flags["auto_entry"] and pm.active_count < MAX_CONCURRENT_POSITIONS:
                     await executor.try_entry(symbol, aster_book, hl_book)
         except Exception as e:
             log.error(f"Error processing {symbol}: {e}")
             consecutive_errors += 1
+
+    async def process_manual_commands():
+        """Consume manual /enter and /close requests dropped by the control bot.
+
+        The monitor is the single order-placing process, so funnelling manual
+        actions through here (rather than the stdlib control bot) keeps one
+        writer on the venues and reuses the tested leg-risk flow. Each request
+        file is consumed exactly once; the outcome is alerted to Telegram.
+        """
+        try:
+            os.makedirs(_MANUAL_CMD_DIR, exist_ok=True)
+            files = sorted(Path(_MANUAL_CMD_DIR).glob("*.json"))
+        except Exception:
+            return
+        for f in files:
+            try:
+                cmd = json.loads(f.read_text())
+            except Exception:
+                cmd = None
+            # Consume the request once, regardless of outcome, so a bad/looping
+            # command can't be retried forever.
+            try:
+                f.unlink()
+            except Exception:
+                pass
+            if not cmd:
+                continue
+            action = cmd.get("action")
+            symbol = cmd.get("symbol", "")
+            try:
+                if action == "enter":
+                    direction = cmd.get("direction", "")
+                    notional = float(cmd.get("notional", 0) or 0)
+                    ok, msg = await executor.force_entry(
+                        symbol, direction, notional, hold_for_funding=True
+                    )
+                    send_alert(f"/enter {symbol}: {'OK' if ok else 'FAILED'} — {msg}")
+                elif action == "close":
+                    pos = pm.get(symbol)
+                    if not pos:
+                        send_alert(f"/close {symbol}: no open position")
+                        continue
+                    aster_book, hl_book = await client.get_both_books(symbol)
+                    await executor.try_exit(symbol, aster_book, hl_book, "manual")
+                    send_alert(f"/close {symbol}: exit submitted")
+                else:
+                    log.warning(f"manual cmd: unknown action {action!r}")
+            except Exception as e:
+                log.error(f"manual cmd {action} {symbol} failed: {e}")
+                send_alert(f"/{action} {symbol}: ERROR {e}")
 
     try:
         while True:
             tick_start = time.time()
             tick_count += 1
             now = now_ms()
+
+            # ── 0. Runtime controls: auto-entry flag + manual command inbox ──
+            prev_auto = runtime_flags["auto_entry"]
+            runtime_flags["auto_entry"] = _auto_entry_enabled()
+            if runtime_flags["auto_entry"] != prev_auto:
+                state = "ENABLED" if runtime_flags["auto_entry"] else "DISABLED"
+                log.warning(f"Auto-entry {state} (runtime flag changed)")
+            await process_manual_commands()
 
             # ── 1. Poll Aster maker orders (entering/exiting) ──
             if now - last_aster_poll >= ASTER_FILL_POLL_SECONDS * 1000:

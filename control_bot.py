@@ -51,6 +51,12 @@ PYTHON = str(VENV_PY) if VENV_PY.exists() else "python3"
 # EnvironmentFile=-/opt/hyperaster/data/mode.env. Not version controlled.
 MODE_FILE = BASE_DIR / "data" / "mode.env"
 
+# Runtime auto-entry kill switch + manual command inbox (consumed by the monitor).
+# The monitor is the only process that places orders, so manual entries/exits are
+# enqueued as files here rather than executed by this stdlib-only control bot.
+AUTO_ENTRY_FILE = BASE_DIR / "data" / "auto_entry"
+MANUAL_CMD_DIR = BASE_DIR / "data" / "manual_cmds"
+
 TOKEN = os.getenv("ALERT_TELEGRAM_BOT_TOKEN", "")
 SERVICE = os.getenv("CONTROL_SERVICE_NAME", "hyperaster")
 BRANCH = os.getenv("CONTROL_BRANCH", "")
@@ -64,6 +70,10 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 
 # Pending destructive confirmations: chat_id -> (command, expires_at)
 _PENDING: dict[str, tuple[str, float]] = {}
+# Pending manual live entries: chat_id -> (request_dict, expires_at). Kept
+# separate because these carry args (symbol/direction/notional) that the simple
+# action-name confirm flow can't round-trip.
+_PENDING_ENTER: dict[str, tuple[dict, float]] = {}
 _CONFIRM_TTL = 60  # seconds
 
 
@@ -487,6 +497,108 @@ def cmd_trades(chat_id: str, arg: str):
     send(chat_id, "\n".join(lines))
 
 
+_DIR_ALIASES = {
+    "long_hl_short_aster": "long_hl_short_aster",
+    "buy_hl": "long_hl_short_aster", "long_hl": "long_hl_short_aster",
+    "l-hl/s-ast": "long_hl_short_aster", "hl": "long_hl_short_aster",
+    "long_aster_short_hl": "long_aster_short_hl",
+    "buy_aster": "long_aster_short_hl", "long_aster": "long_aster_short_hl",
+    "l-ast/s-hl": "long_aster_short_hl", "aster": "long_aster_short_hl",
+}
+
+
+def _enqueue_manual(cmd: dict):
+    """Atomically drop a manual command file for the monitor to consume."""
+    MANUAL_CMD_DIR.mkdir(parents=True, exist_ok=True)
+    cid = str(int(time.time() * 1000))
+    dest = MANUAL_CMD_DIR / f"{cid}.json"
+    tmp = MANUAL_CMD_DIR / f"{cid}.json.tmp"
+    tmp.write_text(json.dumps(cmd))
+    tmp.replace(dest)
+
+
+def cmd_autoentry(chat_id: str, arg: str):
+    """Toggle the auto basis-arb entry scanner. Exits/manual entries unaffected."""
+    a = arg.strip().lower()
+    if a not in ("on", "off"):
+        cur = "off" if (AUTO_ENTRY_FILE.exists()
+                        and AUTO_ENTRY_FILE.read_text().strip().lower() == "off") else "on"
+        send(chat_id,
+             f"auto-entry is currently {cur.upper()}.\n"
+             "/autoentry off — stop auto-opening basis arbs (exits still run)\n"
+             "/autoentry on — resume auto entry")
+        return
+    AUTO_ENTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    AUTO_ENTRY_FILE.write_text(a + "\n")
+    if a == "off":
+        send(chat_id, "🛑 auto-entry DISABLED — the scanner won't open new basis arbs. "
+                      "Exits and manual /enter still work. (takes effect within ~1s, no restart)")
+    else:
+        send(chat_id, "✅ auto-entry ENABLED — scanner will auto-open basis arbs again.")
+
+
+def cmd_enter(chat_id: str, arg: str):
+    """Manually open ONE delta-neutral funding-carry hold via the monitor.
+
+    Usage: /enter SYMBOL DIRECTION NOTIONAL
+      DIRECTION: long_hl_short_aster | long_aster_short_hl
+                 (aliases: buy_hl / buy_aster / L-HL/S-AST / L-AST/S-HL)
+      NOTIONAL : USD per leg
+
+    Held for funding carry — the bot won't close it on basis convergence, only
+    on safety stops (mark-to-market loss / 1-week timeout) or manual /close.
+    In live mode this places REAL orders and requires a typed YES.
+    """
+    toks = arg.split()
+    if len(toks) != 3:
+        send(chat_id,
+             "Usage: /enter SYMBOL DIRECTION NOTIONAL\n"
+             "e.g. /enter SMSN long_hl_short_aster 1000\n"
+             "DIRECTION aliases: buy_hl / buy_aster / L-HL/S-AST / L-AST/S-HL")
+        return
+    symbol = toks[0].upper()
+    direction = _DIR_ALIASES.get(toks[1].lower())
+    if not direction:
+        send(chat_id, f"Bad direction {toks[1]!r}. Use long_hl_short_aster or long_aster_short_hl "
+                      "(or buy_hl / buy_aster).")
+        return
+    try:
+        notional = float(toks[2])
+        if notional <= 0:
+            raise ValueError
+    except ValueError:
+        send(chat_id, f"Bad notional {toks[2]!r} — must be a positive number of USD.")
+        return
+
+    req = {"action": "enter", "symbol": symbol, "direction": direction, "notional": notional}
+    rc, active = run(["systemctl", "is-active", SERVICE], timeout=10)
+    if active.strip() != "active":
+        send(chat_id, f"⚠️ trader service is {active.strip()} — start it first (/start), "
+                      "the monitor is what places the order.")
+        return
+
+    short = "L-HL/S-AST" if direction == "long_hl_short_aster" else "L-AST/S-HL"
+    if read_mode() == "live":
+        _PENDING_ENTER[chat_id] = (req, time.time() + _CONFIRM_TTL)
+        send(chat_id,
+             f"⚠️ LIVE order: enter {symbol} {short} ${notional:.0f}/leg as a funding hold.\n"
+             "This places REAL orders. Reply YES within 60s to confirm.")
+        return
+    _enqueue_manual(req)
+    send(chat_id, f"📩 queued [PAPER] entry: {symbol} {short} ${notional:.0f}. "
+                  "You'll get an alert when it's placed.")
+
+
+def cmd_close(chat_id: str, arg: str):
+    """Manually close one open position (any symbol) via the monitor."""
+    symbol = arg.strip().upper()
+    if not symbol:
+        send(chat_id, "Usage: /close SYMBOL")
+        return
+    _enqueue_manual({"action": "close", "symbol": symbol})
+    send(chat_id, f"📩 queued close for {symbol}. You'll get an alert when the exit is submitted.")
+
+
 def cmd_funding(chat_id: str, arg: str):
     """Rank funding-carry opportunities across the equity universe.
 
@@ -507,6 +619,9 @@ def cmd_help(chat_id: str, _arg: str):
          "/status — service state + spreads + positions\n"
          "/spreads — current spread vs threshold detail\n"
          "/funding [n] — top funding-carry opportunities\n"
+         "/enter SYM DIR NOTIONAL — manually open a funding hold (live needs YES)\n"
+         "/close SYM — manually close one position\n"
+         "/autoentry on|off — toggle auto basis-arb entry (exits unaffected)\n"
          "/positions — open positions detail\n"
          "/trades [n] — last n closed trades with P&L detail\n"
          "/pnl — realised P&L (today + all-time)\n"
@@ -524,6 +639,7 @@ HANDLERS = {
     "/status": cmd_status, "/positions": cmd_positions, "/pos": cmd_positions,
     "/pnl": cmd_pnl, "/trades": cmd_trades,
     "/funding": cmd_funding, "/carry": cmd_funding,
+    "/enter": cmd_enter, "/close": cmd_close, "/autoentry": cmd_autoentry,
     "/log": cmd_log, "/logs": cmd_log,
     "/spreads": cmd_spreads, "/spread": cmd_spreads,
     "/mode": cmd_mode, "/paper": cmd_paper, "/live": cmd_live,
@@ -550,6 +666,16 @@ def handle_message(msg: dict):
 
     # Resolve a pending confirmation if they reply with a bare YES
     if text.upper() == "YES":
+        # Manual live entry (carries args) takes priority over action-name confirms.
+        pend_enter = _PENDING_ENTER.pop(chat_id, None)
+        if pend_enter and pend_enter[1] > time.time():
+            req = pend_enter[0]
+            _enqueue_manual(req)
+            short = "L-HL/S-AST" if req["direction"] == "long_hl_short_aster" else "L-AST/S-HL"
+            send(chat_id,
+                 f"📩 queued LIVE entry: {req['symbol']} {short} ${req['notional']:.0f}. "
+                 "You'll get an alert when it's placed.")
+            return
         pend = _PENDING.pop(chat_id, None)
         if pend and pend[1] > time.time():
             action = pend[0]  # 'stop' | 'flatten'

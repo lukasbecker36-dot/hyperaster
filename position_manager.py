@@ -82,6 +82,11 @@ class Position:
     aster_funding_rate: float = 0.0
     funding_pnl: float = 0.0
 
+    # True for manual funding-carry holds — the monitor holds these for carry
+    # and only applies safety exits (timeout, mark-to-market stop), never the
+    # basis target/convergence exits.
+    hold_for_funding: bool = False
+
 
 class PositionManager:
     def __init__(self, paper_mode: bool = False):
@@ -100,7 +105,7 @@ class PositionManager:
             "hl_entry_order_id, aster_entry_order_id, qty, notional_usd, "
             "exit_time, hl_exit_order_id, aster_exit_order_id, "
             "hl_funding_rate, aster_funding_rate, "
-            "COALESCE(entry_baseline_bps, 0) "
+            "COALESCE(entry_baseline_bps, 0), COALESCE(hold_for_funding, 0) "
             "FROM positions WHERE status NOT IN ('closed', 'error') AND paper=?",
             (paper_val,)
         ).fetchall()
@@ -117,6 +122,7 @@ class PositionManager:
                 hl_exit_order_id=r[15] or "", aster_exit_order_id=r[16] or "",
                 hl_funding_rate=r[17] or 0.0, aster_funding_rate=r[18] or 0.0,
                 entry_baseline_bps=r[19] or 0.0,
+                hold_for_funding=bool(r[20]),
             )
             self.positions[p.symbol] = p
             log.warning(
@@ -142,6 +148,7 @@ class PositionManager:
         qty: float, notional_usd: float,
         hl_funding_rate: float = 0.0, aster_funding_rate: float = 0.0,
         entry_baseline_bps: float = 0.0,
+        hold_for_funding: bool = False,
     ) -> Position:
         entry_time = now_ms()
         conn = get_connection()
@@ -150,13 +157,14 @@ class PositionManager:
             "(symbol, hl_coin, aster_symbol, direction, status, entry_time, "
             "entry_spread_bps, hl_entry_price, hl_entry_order_id, "
             "aster_entry_order_id, qty, notional_usd, paper, "
-            "hl_funding_rate, aster_funding_rate, entry_baseline_bps) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "hl_funding_rate, aster_funding_rate, entry_baseline_bps, hold_for_funding) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (symbol, hl_coin, aster_symbol, direction, "entering", entry_time,
              entry_spread_bps, hl_entry_price, hl_order_id,
              aster_entry_order_id, qty, notional_usd,
              1 if self.paper_mode else 0,
-             hl_funding_rate, aster_funding_rate, entry_baseline_bps),
+             hl_funding_rate, aster_funding_rate, entry_baseline_bps,
+             1 if hold_for_funding else 0),
         )
         conn.commit()
         pid = cur.lastrowid
@@ -171,6 +179,7 @@ class PositionManager:
             aster_entry_order_id=aster_entry_order_id,
             qty=qty, notional_usd=notional_usd,
             hl_funding_rate=hl_funding_rate, aster_funding_rate=aster_funding_rate,
+            hold_for_funding=hold_for_funding,
         )
         self.positions[symbol] = pos
         log.info(

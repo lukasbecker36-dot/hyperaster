@@ -95,6 +95,14 @@ MAX_HOLD_HOURS = 12
 # slow bleed on positions where carry eats the entire potential profit.
 MAX_FUNDING_DRAG_USD = 2.0
 
+# ── Manual funding-carry holds ──
+# Positions opened via the manual /enter command (hold_for_funding=1) are held
+# for funding carry, NOT basis convergence: the target/converge exits are
+# disabled so they don't close the moment the basis reverts. Only safety exits
+# apply — a longer max-hold timeout and a hard mark-to-market stop.
+FUNDING_MAX_HOLD_HOURS = 168          # 1 week safety timeout for a funding hold
+FUNDING_ADVERSE_STOP_USD = 25.0       # bail a funding hold if executable loss exceeds this
+
 # ── Position sizing ──
 NOTIONAL_PER_LEG = 1000          # USD per leg
 MAX_CONCURRENT_POSITIONS = 8     # max simultaneous positions across all symbols

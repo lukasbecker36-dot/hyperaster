@@ -432,6 +432,190 @@ class Executor:
         )
         return True
 
+    # ── Manual forced entry (funding-carry holds) ──
+
+    async def force_entry(
+        self, symbol: str, direction: str, notional: float,
+        hold_for_funding: bool = True,
+    ) -> tuple[bool, str]:
+        """
+        Place ONE delta-neutral position on demand, bypassing all signal gating
+        (no threshold, no cost floor, no confirm streak). Used by the manual
+        /enter command for funding-carry trades. Reuses the same leg-risk flow
+        as try_entry: HL IOC taker first, then Aster GTX maker; emergency-close
+        HL if the Aster leg can't be placed.
+
+        Returns (ok, message). `message` is surfaced to the operator via alerting.
+        """
+        if direction not in ("long_hl_short_aster", "long_aster_short_hl"):
+            return False, f"bad direction {direction!r}"
+        if self.pm.has_position(symbol):
+            return False, f"{symbol}: position already open"
+        if notional <= 0:
+            return False, f"{symbol}: notional must be > 0"
+
+        try:
+            aster_book, hl_book = await self.client.get_both_books(symbol)
+        except Exception as e:
+            return False, f"{symbol}: book fetch failed ({e})"
+        if aster_book.bid <= 0 or hl_book.bid <= 0:
+            return False, f"{symbol}: empty book"
+        mid = (aster_book.mid + hl_book.mid) / 2
+        if mid <= 0:
+            return False, f"{symbol}: bad mid"
+
+        price_ratio = abs(aster_book.mid - hl_book.mid) / min(aster_book.mid, hl_book.mid)
+        if price_ratio > MAX_PRICE_RATIO_DIVERGENCE:
+            return False, (
+                f"{symbol}: price mismatch {aster_book.mid:.4f} (Ast) vs "
+                f"{hl_book.mid:.4f} (HL), {price_ratio*100:.0f}% apart — refusing"
+            )
+
+        if direction == "long_hl_short_aster":
+            hl_side, aster_side = "buy", "sell"
+            hl_ref_price, aster_ref_price = hl_book.ask, aster_book.bid
+            hl_avail, ast_avail = hl_book.ask_size, aster_book.bid_size
+        else:
+            hl_side, aster_side = "sell", "buy"
+            hl_ref_price, aster_ref_price = hl_book.bid, aster_book.ask
+            hl_avail, ast_avail = hl_book.bid_size, aster_book.ask_size
+
+        # Size from notional, capped by HL taker-side top-of-book (the leg that
+        # must fill immediately). The Aster maker leg rests, so it can exceed
+        # Aster's top-of-book size.
+        target_qty = notional / mid
+        capped = min(target_qty, hl_avail) if hl_avail > 0 else target_qty
+        qty = self.client.snap_aster_qty(symbol, capped)
+        if qty <= 0:
+            return False, f"{symbol}: qty snapped to 0 (HL avail {hl_avail:.2f})"
+        actual_notional = qty * mid
+
+        baseline = self.client.get_book_spread_baseline(symbol)
+        baseline_bps = baseline if baseline is not None else 0.0
+        spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000
+        hl_fr = self.client.get_hl_funding_rate(symbol)
+        aster_fr = self.client.get_aster_funding_rate(symbol)
+
+        log.warning(
+            f"MANUAL ENTRY {symbol}: {direction} | notional≈${actual_notional:.0f} "
+            f"qty={qty} | HL {hl_side} @ {hl_ref_price:.2f} | "
+            f"Aster {aster_side} @ {aster_ref_price:.2f} | hold_for_funding={hold_for_funding}"
+        )
+
+        if self.paper_mode:
+            self.pm.open_entering(
+                symbol=symbol, hl_coin=f"xyz:{symbol}",
+                aster_symbol=aster_symbol_for(symbol),
+                direction=direction, entry_spread_bps=spread_bps,
+                hl_entry_price=hl_ref_price, hl_order_id="PAPER",
+                aster_entry_order_id="PAPER", qty=qty, notional_usd=actual_notional,
+                hl_funding_rate=hl_fr, aster_funding_rate=aster_fr,
+                entry_baseline_bps=baseline_bps, hold_for_funding=hold_for_funding,
+            )
+            self.pm.confirm_aster_entry(symbol, aster_ref_price)
+            return True, (
+                f"[PAPER] entered {symbol} {direction} ${actual_notional:.0f} "
+                f"(hold_for_funding={hold_for_funding})"
+            )
+
+        # ── Live placement (same leg-risk flow as try_entry) ──
+        try:
+            pre_pos = await self.client.get_hl_position(symbol)
+            baseline_szi = float(pre_pos.get("szi", 0) or 0)
+        except Exception as e:
+            return False, f"{symbol}: HL pre-position snapshot failed ({e}) — aborted"
+
+        hl_intent_id = record_intent(
+            symbol=symbol, venue="hl", action="entry_ioc",
+            direction=direction, side=hl_side, qty=qty,
+            ref_price=hl_ref_price, baseline_szi=baseline_szi, paper=False,
+        )
+        hl_result = await self.client.place_hl_ioc(symbol, hl_side, qty, hl_ref_price)
+
+        if hl_result.ambiguous:
+            expected_signed = qty if hl_side == "buy" else -qty
+            filled, actual_signed, current_szi = await self.client.reconcile_hl_position_delta(
+                symbol, baseline_szi, expected_signed,
+            )
+            if not filled:
+                complete_intent(hl_intent_id, "no_fill", notes="ambiguous reconciled as unfilled")
+                return False, f"{symbol}: HL ambiguous, reconciled as NOT filled — aborted"
+            hl_result = OrderResult(
+                success=True, order_id="RECONCILED",
+                filled_qty=abs(actual_signed), fill_price=hl_ref_price, ambiguous=False,
+            )
+
+        if not hl_result.success or hl_result.filled_qty <= 0:
+            complete_intent(hl_intent_id, "no_fill", notes=hl_result.error[:200])
+            return False, f"{symbol}: HL IOC did not fill ({hl_result.error}) — aborted"
+
+        complete_intent(hl_intent_id, "filled",
+                        notes=f"order_id={hl_result.order_id} qty={hl_result.filled_qty}")
+        actual_qty = hl_result.filled_qty
+        log.warning(f"{symbol}: HL {hl_side} filled {actual_qty} @ {hl_result.fill_price:.2f}")
+
+        aster_result = await self.client.place_aster_gtx(
+            symbol, aster_side, actual_qty, aster_ref_price
+        )
+        if aster_result.ambiguous:
+            await asyncio.sleep(1.5)
+            try:
+                open_orders = await self.client.get_aster_open_orders(symbol)
+            except Exception:
+                open_orders = []
+            matching = [o for o in open_orders
+                        if str(o.get("side", "")).upper() == aster_side.upper()]
+            if matching:
+                o = matching[0]
+                aster_result = OrderResult(
+                    success=True, order_id=str(o.get("orderId", "")),
+                    filled_qty=float(o.get("executedQty", 0) or 0),
+                    fill_price=float(o.get("price", 0) or aster_ref_price), ambiguous=False,
+                )
+            else:
+                aster_pos = await self.client.get_aster_position(symbol)
+                aster_qty = float(aster_pos.get("positionAmt", 0) or 0)
+                expected_sign = -1 if aster_side == "sell" else 1
+                if aster_qty * expected_sign > 0 and abs(aster_qty) >= actual_qty * 0.95:
+                    aster_result = OrderResult(
+                        success=True, order_id="RECONCILED",
+                        filled_qty=abs(aster_qty), fill_price=aster_ref_price, ambiguous=False,
+                    )
+
+        if not aster_result.success:
+            log.error(f"{symbol}: Aster GTX failed after HL fill — emergency closing HL")
+            close_side = "sell" if hl_side == "buy" else "buy"
+            close_result = await self.client.place_hl_ioc(
+                symbol, close_side, actual_qty, hl_result.fill_price
+            )
+            if not close_result.success:
+                log.critical(f"{symbol}: HL emergency close also FAILED — manual intervention!")
+                return False, f"{symbol}: Aster failed AND HL emergency close failed — MANUAL FIX"
+            return False, f"{symbol}: Aster leg failed, HL emergency-closed — no position"
+
+        pos = self.pm.open_entering(
+            symbol=symbol, hl_coin=f"xyz:{symbol}",
+            aster_symbol=aster_symbol_for(symbol),
+            direction=direction, entry_spread_bps=spread_bps,
+            hl_entry_price=hl_result.fill_price, hl_order_id=hl_result.order_id,
+            aster_entry_order_id=aster_result.order_id, qty=actual_qty,
+            notional_usd=actual_notional, hl_funding_rate=hl_fr,
+            aster_funding_rate=aster_fr, entry_baseline_bps=baseline_bps,
+            hold_for_funding=hold_for_funding,
+        )
+        self.pm.log_trade(
+            pos.id, "hl", hl_side, "ioc_limit",
+            hl_result.order_id, actual_qty, hl_result.fill_price, notes="manual entry",
+        )
+        self.pm.log_trade(
+            pos.id, "aster", aster_side, "gtx_limit",
+            aster_result.order_id, actual_qty, aster_ref_price, notes="manual entry resting",
+        )
+        return True, (
+            f"entered {symbol} {direction} ${actual_notional:.0f} qty={actual_qty} "
+            f"(Aster maker resting; you'll get a fill confirmation)"
+        )
+
     # ── Poll Aster maker fill (entering / exiting states) ──
 
     async def poll_aster_maker(self, symbol: str):
