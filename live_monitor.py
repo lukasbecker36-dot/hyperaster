@@ -36,7 +36,7 @@ from config import (
     ENTRY_THRESHOLD_BPS, ENTRY_THRESHOLD_BPS_BY_SYMBOL,
     EXIT_THRESHOLD_BPS, MAX_HOLD_HOURS, MAX_CONCURRENT_POSITIONS,
     HEARTBEAT_INTERVAL_MINUTES, PAPER_MODE, DATA_DIR, OUTPUT_DIR,
-    BLOCKED_SYMBOLS, ENTRY_CONFIRM_TICKS, ADVERSE_STOP_BPS,
+    BLOCKED_SYMBOLS, NON_EQUITY_SYMBOLS, ENTRY_CONFIRM_TICKS, ADVERSE_STOP_BPS,
     ROUND_TRIP_FEE, NOTIONAL_PER_LEG, EXIT_TARGET_NET_USD,
     EXIT_TARGET_NET_USD_BY_SYMBOL, MAX_FUNDING_DRAG_USD, aster_symbol_for,
 )
@@ -130,8 +130,9 @@ def _write_latest_spreads(spreads: dict[str, tuple[float, str, float]],
 
 async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     symbol_rows = load_symbols(symbol_filter)
-    symbols = [r["coin"] for r in symbol_rows if r["coin"] not in BLOCKED_SYMBOLS]
-    blocked = [r["coin"] for r in symbol_rows if r["coin"] in BLOCKED_SYMBOLS]
+    exclude = BLOCKED_SYMBOLS | NON_EQUITY_SYMBOLS
+    symbols = [r["coin"] for r in symbol_rows if r["coin"] not in exclude]
+    blocked = [r["coin"] for r in symbol_rows if r["coin"] in exclude]
     if blocked:
         log.info(f"Excluded blocked symbols: {blocked}")
 
@@ -162,7 +163,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     # Include symbols with open positions even if blocked (need specs for exit)
     pm_preload = PositionManager(paper_mode=paper_mode)
     open_pos_syms = set(pm_preload.positions.keys())
-    blocked_with_positions = open_pos_syms & BLOCKED_SYMBOLS
+    blocked_with_positions = open_pos_syms & exclude
     if blocked_with_positions:
         log.info(f"Blocked symbols with open positions (will scan for exit): {blocked_with_positions}")
     all_load_syms = list(dict.fromkeys(symbols + list(blocked_with_positions)))

@@ -149,10 +149,17 @@ ENTRY_THRESHOLD_BPS_BY_SYMBOL: dict = {
     "SNDK":     35,  # excess p75=37bps   oracle_delta=+4bps
     "AAPL":     30,  # (default)
     "AMZN":     30,  # (default)
+    "BE":       30,  # (default) — Bloom Energy, new listing
+    "COST":     30,  # (default) — Costco, new listing
     "CRCL":     30,  # (default)
+    "EBAY":     30,  # (default) — eBay, new listing
+    "GME":      30,  # (default) — GameStop, new listing
     "GOOGL":    30,  # (default)
     "MU":       30,  # (default)
+    "NFLX":     30,  # (default) — Netflix, new listing
+    "NOK":      30,  # (default) — Nokia, new listing
     "NVDA":     30,  # (default)
+    "RIVN":     30,  # (default) — Rivian, new listing
     "TSLA":     30,  # (default)
     "TSM":      30,  # (default)
 }
@@ -177,6 +184,22 @@ def aster_symbol_for(base: str) -> str:
     """Aster API symbol for a canonical base, honouring cross-venue aliases."""
     return f"{ASTER_BASE_ALIAS.get(base, base)}USDT"
 
+
+# ── Non-equity exclusions ──
+# Commodities, FX, indices, ETFs, and tokens that appear in the XYZ/Aster
+# overlap but are not single-stock equity perps.
+NON_EQUITY_SYMBOLS: set = {
+    # Commodities & FX
+    "ALUMINIUM", "BRENTOIL", "CL", "COPPER", "CORN", "DXY", "EUR", "GBP",
+    "GOLD", "JPY", "KRW", "NATGAS", "PALLADIUM", "PLATINUM", "SILVER",
+    "TTF", "URANIUM", "WHEAT", "VIX", "VOL",
+    # Indices
+    "SP500", "JP225", "NIFTY", "IBOV", "KR200", "XYZ100", "SPCX",
+    # ETFs
+    "EWJ", "EWT", "EWY", "EWZ", "URNM", "XLE", "USAR",
+    # Tokens / non-equity
+    "MINIMAX",
+}
 
 # ── Sanity / blocklist ──
 # Reject entry if the two exchange mids differ by more than this fraction
