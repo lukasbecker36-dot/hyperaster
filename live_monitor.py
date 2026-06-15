@@ -38,7 +38,7 @@ from config import (
     HEARTBEAT_INTERVAL_MINUTES, PAPER_MODE, DATA_DIR, OUTPUT_DIR,
     BLOCKED_SYMBOLS, ENTRY_CONFIRM_TICKS, ADVERSE_STOP_BPS,
     ROUND_TRIP_FEE, NOTIONAL_PER_LEG, EXIT_TARGET_NET_USD,
-    EXIT_TARGET_NET_USD_BY_SYMBOL, aster_symbol_for,
+    EXIT_TARGET_NET_USD_BY_SYMBOL, MAX_FUNDING_DRAG_USD, aster_symbol_for,
 )
 
 SLOW_SCAN_INTERVAL_SECONDS = 300   # re-rank all symbols every 5 min
@@ -308,6 +308,13 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     should_exit, reason = True, "target"
                 elif symbol in BLOCKED_SYMBOLS:
                     should_exit, reason = True, "blocked"
+                elif est_funding < -MAX_FUNDING_DRAG_USD and elapsed_hours >= 1.0:
+                    log.info(
+                        f"FUNDING-DRAG {symbol}: funding=${est_funding:.2f} "
+                        f"exceeds -${MAX_FUNDING_DRAG_USD} | est_net=${est_net:.2f} "
+                        f"held={elapsed_hours:.1f}h"
+                    )
+                    should_exit, reason = True, "funding_drag"
                 elif elapsed_hours >= MAX_HOLD_HOURS:
                     should_exit, reason = True, "timeout"
                 else:

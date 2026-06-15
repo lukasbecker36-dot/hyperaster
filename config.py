@@ -91,7 +91,10 @@ ENTRY_TIMEOUT_MINUTES = 60
 # (pays ~0.9bps Aster taker once, but escapes being stuck one-legged while spread runs away)
 EXIT_TIMEOUT_MINUTES = 30
 # Force-close position after this many hours regardless of spread
-MAX_HOLD_HOURS = 48
+MAX_HOLD_HOURS = 12
+# Bail early if cumulative funding cost exceeds this USD amount — prevents
+# slow bleed on positions where carry eats the entire potential profit.
+MAX_FUNDING_DRAG_USD = 2.0
 
 # ── Position sizing ──
 NOTIONAL_PER_LEG = 1000          # USD per leg
