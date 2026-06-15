@@ -62,7 +62,6 @@ EXIT_TARGET_NET_USD = 3.0
 # Per-symbol exit targets. Names with high median peak reversion warrant a higher
 # target to capture blowouts. Derived from scripts/backtest_1m.py --peak-analysis.
 EXIT_TARGET_NET_USD_BY_SYMBOL: dict = {
-    "NOW": 5.5,
 }
 
 # Number of consecutive qualifying scans the entry signal must persist before we
@@ -117,53 +116,28 @@ HEARTBEAT_INTERVAL_MINUTES = 60
 # Derived from p75 of historical cross-exchange spread, rounded to nearest 5bps.
 # Symbols not listed fall back to ENTRY_THRESHOLD_BPS.
 ENTRY_THRESHOLD_BPS_BY_SYMBOL: dict = {
-    "BIRD":    240,  # excess p75=239bps  oracle_delta=-115bps
-    "HIMS":    195,  # excess p75=196bps  oracle_delta=+25bps
     "NBIS":    195,  # excess p75=193bps  oracle_delta=-58bps
-    "CRWV":    170,  # excess p75=168bps  oracle_delta=-6bps
-    "HYUNDAI": 135,  # excess p75=137bps  oracle_delta=-23bps
     "ARM":     105,  # excess p75=103bps  oracle_delta=-23bps
-    "NOW":     100,  # excess p75=98bps   oracle_delta=-1bps
     "RKLB":     95,  # excess p75=97bps   oracle_delta=-4bps
-    "COIN":     85,  # excess p75=83bps   oracle_delta=-12bps
     "PLTR":     85,  # excess p75=87bps   oracle_delta=+3bps
     "SKHX":     85,  # excess p75=87bps   oracle_delta=-53bps  (Korean: SK Hynix)
     "SMSN":     85,  # excess p75=85bps   oracle_delta=-43bps  (Korean: Samsung)
     "DRAM":     80,  # excess p75=78bps   oracle_delta=-18bps
-    "LITE":     80,  # excess p75=82bps   oracle_delta=-17bps
     "DELL":     75,  # excess p75=77bps   oracle_delta=-8bps
     "AMD":      70,  # excess p75=69bps   oracle_delta=-4bps
     "ORCL":     70,  # excess p75=71bps   oracle_delta=+1bps
-    "HOOD":     65,  # excess p75=65bps   oracle_delta=-0bps
-    "WDC":      60,  # excess p75=60bps   oracle_delta=-1bps
-    "BABA":     55,  # excess p75=56bps   oracle_delta=-15bps
-    "IBM":      55,  # excess p75=55bps   oracle_delta=-16bps
-    "AVGO":     45,  # excess p75=46bps   oracle_delta=+2bps
-    "LLY":      45,  # excess p75=46bps   oracle_delta=-27bps
-    "META":     45,  # excess p75=43bps   oracle_delta=-2bps
     "MRVL":     45,  # excess p75=47bps   oracle_delta=-5bps
     "CBRS":     40,  # excess p75=41bps   oracle_delta=-16bps
     "INTC":     40,  # excess p75=38bps   oracle_delta=-0bps
     "MSTR":     40,  # excess p75=40bps   oracle_delta=-4bps
-    "MSFT":     35,  # excess p75=35bps   oracle_delta=-3bps
     "SNDK":     35,  # excess p75=37bps   oracle_delta=+4bps
     "AAPL":     30,  # (default)
     "AMZN":     30,  # (default)
-    "BE":       30,  # (default) — Bloom Energy, new listing
-    "COST":     30,  # (default) — Costco, new listing
     "CRCL":     30,  # (default)
-    "EBAY":     30,  # (default) — eBay, new listing
-    "GME":      30,  # (default) — GameStop, new listing
     "GOOGL":    30,  # (default)
-    "MINIMAX":  30,  # (default) — MiniMax (Chinese AI), new listing
     "MU":       30,  # (default)
-    "NFLX":     30,  # (default) — Netflix, new listing
-    "NOK":      30,  # (default) — Nokia, new listing
     "NVDA":     30,  # (default)
-    "RIVN":     30,  # (default) — Rivian, new listing
-    "SPCX":     30,  # (default) — SpaceX, new listing
     "TSLA":     30,  # (default)
-    "TSM":      30,  # (default)
 }
 
 # ── Cross-venue ticker aliases ──
@@ -214,6 +188,11 @@ BLOCKED_SYMBOLS: set = {
     "BB", "BIRD",
     "META", "COIN", "LLY", "IBM", "MSFT", "URNM", "BABA", "AVGO",
     "CRWV", "EWT", "BX", "USAR", "WDC",
+    # 2026-06-15 peak-analysis blocklist refresh (48h, 480m baseline):
+    # Negative median peak reversion — spread widens instead of reverting
+    "NFLX", "RIVN", "LITE", "HYUNDAI", "NOW", "TSM", "HOOD", "HIMS",
+    # New listings with no data, unusable spreads, or no liquidity
+    "GME", "EBAY", "COST", "BE", "NOK", "MINIMAX", "SPCX",
 }
 
 # ── Backward-compat aliases (fetch_data.py / live_scan.py) ──
