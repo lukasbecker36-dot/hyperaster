@@ -109,7 +109,7 @@ def find_overlapping_equity_perps():
         "GOLD", "JPY", "KRW", "NATGAS", "PALLADIUM", "PLATINUM", "SILVER",
         "TTF", "URANIUM", "WHEAT", "VIX", "VOL",
     }
-    indices = {"SP500", "JP225", "NIFTY", "IBOV", "KR200", "XYZ100", "SPCX"}
+    indices = {"SP500", "JP225", "NIFTY", "IBOV", "KR200", "XYZ100"}
     etfs = {"EWJ", "EWT", "EWY", "EWZ", "URNM", "XLE", "USAR"}
 
     hl_equity = {

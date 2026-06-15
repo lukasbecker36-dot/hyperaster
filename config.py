@@ -155,11 +155,13 @@ ENTRY_THRESHOLD_BPS_BY_SYMBOL: dict = {
     "EBAY":     30,  # (default) — eBay, new listing
     "GME":      30,  # (default) — GameStop, new listing
     "GOOGL":    30,  # (default)
+    "MINIMAX":  30,  # (default) — MiniMax (Chinese AI), new listing
     "MU":       30,  # (default)
     "NFLX":     30,  # (default) — Netflix, new listing
     "NOK":      30,  # (default) — Nokia, new listing
     "NVDA":     30,  # (default)
     "RIVN":     30,  # (default) — Rivian, new listing
+    "SPCX":     30,  # (default) — SpaceX, new listing
     "TSLA":     30,  # (default)
     "TSM":      30,  # (default)
 }
@@ -194,11 +196,9 @@ NON_EQUITY_SYMBOLS: set = {
     "GOLD", "JPY", "KRW", "NATGAS", "PALLADIUM", "PLATINUM", "SILVER",
     "TTF", "URANIUM", "WHEAT", "VIX", "VOL",
     # Indices
-    "SP500", "JP225", "NIFTY", "IBOV", "KR200", "XYZ100", "SPCX",
+    "SP500", "JP225", "NIFTY", "IBOV", "KR200", "XYZ100",
     # ETFs
     "EWJ", "EWT", "EWY", "EWZ", "URNM", "XLE", "USAR",
-    # Tokens / non-equity
-    "MINIMAX",
 }
 
 # ── Sanity / blocklist ──
