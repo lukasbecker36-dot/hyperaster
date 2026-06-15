@@ -487,11 +487,26 @@ def cmd_trades(chat_id: str, arg: str):
     send(chat_id, "\n".join(lines))
 
 
+def cmd_funding(chat_id: str, arg: str):
+    """Rank funding-carry opportunities across the equity universe.
+
+    Shells out to scripts/funding_scan.py (needs the venv + live API egress)
+    so the always-on control bot stays stdlib-only and the trading loop is
+    untouched. Optional arg = how many to show (default 12).
+    """
+    top = arg.strip() if arg.strip().isdigit() else "12"
+    script = BASE_DIR / "scripts" / "funding_scan.py"
+    send(chat_id, "⏳ scanning funding rates…")
+    code, out = run([PYTHON, str(script), "--top", top], timeout=90)
+    send(chat_id, out or f"(no output, exit {code})")
+
+
 def cmd_help(chat_id: str, _arg: str):
     send(chat_id,
          "Commands:\n"
          "/status — service state + spreads + positions\n"
          "/spreads — current spread vs threshold detail\n"
+         "/funding [n] — top funding-carry opportunities\n"
          "/positions — open positions detail\n"
          "/trades [n] — last n closed trades with P&L detail\n"
          "/pnl — realised P&L (today + all-time)\n"
@@ -508,6 +523,7 @@ def cmd_help(chat_id: str, _arg: str):
 HANDLERS = {
     "/status": cmd_status, "/positions": cmd_positions, "/pos": cmd_positions,
     "/pnl": cmd_pnl, "/trades": cmd_trades,
+    "/funding": cmd_funding, "/carry": cmd_funding,
     "/log": cmd_log, "/logs": cmd_log,
     "/spreads": cmd_spreads, "/spread": cmd_spreads,
     "/mode": cmd_mode, "/paper": cmd_paper, "/live": cmd_live,
