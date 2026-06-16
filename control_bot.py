@@ -256,7 +256,10 @@ def _pending_gate_lines() -> list[str]:
     out = ["⏳ Pending basis gates:"]
     for sym, r in entries.items():
         short = "L-HL/S-AST" if r.get("direction") == "long_hl_short_aster" else "L-AST/S-HL"
-        out.append(f"  • {sym} ENTER {short} ${r.get('notional', 0):.0f} "
+        remaining = r.get("notional", 0)
+        orig = r.get("orig_notional", remaining)
+        size_str = f"${remaining:.0f}" if abs(remaining - orig) < 1 else f"${remaining:.0f}/${orig:.0f} remaining"
+        out.append(f"  • {sym} ENTER {short} {size_str} "
                    f"— waiting entry basis ≥ {r.get('target_bps', 0):+.0f}bps")
     for sym, r in exits.items():
         out.append(f"  • {sym} CLOSE — waiting exit basis ≥ {r.get('target_bps', 0):+.0f}bps")

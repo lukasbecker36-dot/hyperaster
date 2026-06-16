@@ -120,6 +120,7 @@ def _write_pending_gates(pending_entries: dict, pending_exits: dict):
         data = {
             "entries": {
                 s: {"direction": r["direction"], "notional": r["notional"],
+                    "orig_notional": r.get("orig_notional", r["notional"]),
                     "target_bps": r["target_bps"]}
                 for s, r in pending_entries.items()
             },
@@ -491,6 +492,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                         # the target instead of crossing now.
                         pending_entries[symbol] = {
                             "direction": direction, "notional": notional,
+                            "orig_notional": notional,
                             "target_bps": float(target),
                             "expires_ms": now_ms() + MANUAL_ENTRY_GATE_TIMEOUT_MIN * 60_000,
                         }
@@ -531,11 +533,14 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
 
     async def evaluate_gated_orders():
         """Fire basis-gated manual entries/exits once their target level is met."""
-        # Entries: execute when the executable entry basis clears the target.
         for symbol in list(pending_entries):
             req = pending_entries[symbol]
-            if pm.has_position(symbol):
+            pos = pm.get(symbol)
+            if pos and pos.status not in ("open", None):
+                continue
+            if pos and pos.direction != req["direction"]:
                 pending_entries.pop(symbol, None)
+                send_alert(f"/enter {symbol}: cancelled — position open in opposite direction")
                 continue
             if now_ms() >= req["expires_ms"]:
                 pending_entries.pop(symbol, None)
@@ -550,12 +555,28 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             if basis is None:
                 continue
             if basis >= req["target_bps"]:
-                pending_entries.pop(symbol, None)
                 ok, msg = await executor.force_entry(
                     symbol, req["direction"], req["notional"], hold_for_funding=True
                 )
-                send_alert(f"/enter {symbol}: basis {basis:.0f}bps ≥ target — "
-                           f"{'OK' if ok else 'FAILED'} — {msg}")
+                if ok:
+                    filled_pos = pm.get(symbol)
+                    filled_notional = filled_pos.notional_usd if filled_pos else 0
+                    orig_notional = req.get("orig_notional", req["notional"])
+                    remaining = orig_notional - filled_notional
+                    if remaining > 10:
+                        req["notional"] = remaining
+                        req["orig_notional"] = orig_notional
+                        send_alert(
+                            f"/enter {symbol}: basis {basis:.0f}bps ≥ target — "
+                            f"OK — {msg} | ${remaining:.0f} remaining, gate stays active"
+                        )
+                    else:
+                        pending_entries.pop(symbol, None)
+                        send_alert(f"/enter {symbol}: basis {basis:.0f}bps ≥ target — "
+                                   f"OK — {msg} | fully filled")
+                else:
+                    send_alert(f"/enter {symbol}: basis {basis:.0f}bps ≥ target — "
+                               f"FAILED — {msg}")
 
         # Exits: close when the executable exit basis clears the target. No expiry —
         # the position's own safety stops close it if the basis stays unfavourable.

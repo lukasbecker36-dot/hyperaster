@@ -189,6 +189,38 @@ class PositionManager:
         )
         return pos
 
+    def scale_in(
+        self, symbol: str, add_qty: float, add_notional: float,
+        hl_price: float, aster_price: float,
+        hl_funding_rate: float = 0.0, aster_funding_rate: float = 0.0,
+    ):
+        """Add to an existing open position (blended VWAP entry prices)."""
+        pos = self.positions.get(symbol)
+        if not pos or pos.status != "open":
+            return
+        old_n = pos.notional_usd or 1.0
+        new_n = old_n + add_notional
+        w_old, w_new = old_n / new_n, add_notional / new_n
+        pos.hl_entry_price = pos.hl_entry_price * w_old + hl_price * w_new
+        pos.aster_entry_price = pos.aster_entry_price * w_old + aster_price * w_new
+        pos.hl_funding_rate = pos.hl_funding_rate * w_old + hl_funding_rate * w_new
+        pos.aster_funding_rate = pos.aster_funding_rate * w_old + aster_funding_rate * w_new
+        pos.qty += add_qty
+        pos.notional_usd = new_n
+        conn = get_connection()
+        conn.execute(
+            "UPDATE positions SET qty=?, notional_usd=?, hl_entry_price=?, "
+            "aster_entry_price=?, hl_funding_rate=?, aster_funding_rate=? WHERE id=?",
+            (pos.qty, pos.notional_usd, pos.hl_entry_price, pos.aster_entry_price,
+             pos.hl_funding_rate, pos.aster_funding_rate, pos.id),
+        )
+        conn.commit()
+        conn.close()
+        log.warning(
+            f"Position #{pos.id} SCALE-IN: {symbol} +{add_qty} qty +${add_notional:.0f} → "
+            f"total qty={pos.qty} ${pos.notional_usd:.0f}"
+        )
+
     def confirm_aster_entry(self, symbol: str, aster_fill_price: float):
         """Called when the Aster GTX maker order fills. Position becomes open."""
         pos = self.positions.get(symbol)

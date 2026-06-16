@@ -449,8 +449,11 @@ class Executor:
         """
         if direction not in ("long_hl_short_aster", "long_aster_short_hl"):
             return False, f"bad direction {direction!r}"
-        if self.pm.has_position(symbol):
-            return False, f"{symbol}: position already open"
+        existing = self.pm.get(symbol)
+        if existing and existing.status != "open":
+            return False, f"{symbol}: position in {existing.status} state — wait"
+        if existing and existing.direction != direction:
+            return False, f"{symbol}: already open in opposite direction"
         if notional <= 0:
             return False, f"{symbol}: notional must be > 0"
 
@@ -480,14 +483,10 @@ class Executor:
             hl_ref_price, aster_ref_price = hl_book.bid, aster_book.ask
             hl_avail, ast_avail = hl_book.bid_size, aster_book.ask_size
 
-        # Size from notional, capped by HL taker-side top-of-book (the leg that
-        # must fill immediately). The Aster maker leg rests, so it can exceed
-        # Aster's top-of-book size.
         target_qty = notional / mid
-        capped = min(target_qty, hl_avail) if hl_avail > 0 else target_qty
-        qty = self.client.snap_aster_qty(symbol, capped)
+        qty = self.client.snap_aster_qty(symbol, target_qty)
         if qty <= 0:
-            return False, f"{symbol}: qty snapped to 0 (HL avail {hl_avail:.2f})"
+            return False, f"{symbol}: qty snapped to 0 (lot size too large for ${notional:.0f})"
         actual_notional = qty * mid
 
         baseline = self.client.get_book_spread_baseline(symbol)
@@ -503,6 +502,15 @@ class Executor:
         )
 
         if self.paper_mode:
+            if existing:
+                self.pm.scale_in(
+                    symbol, qty, actual_notional, hl_ref_price, aster_ref_price,
+                    hl_funding_rate=hl_fr, aster_funding_rate=aster_fr,
+                )
+                return True, (
+                    f"[PAPER] scaled in {symbol} +${actual_notional:.0f} → "
+                    f"${existing.notional_usd:.0f} total"
+                )
             self.pm.open_entering(
                 symbol=symbol, hl_coin=f"xyz:{symbol}",
                 aster_symbol=aster_symbol_for(symbol),
@@ -597,6 +605,25 @@ class Executor:
                 return False, f"{symbol}: Aster failed AND HL emergency close failed — MANUAL FIX"
             return False, f"{symbol}: Aster leg failed, HL emergency-closed — no position"
 
+        actual_notional = actual_qty * mid
+        if existing:
+            self.pm.scale_in(
+                symbol, actual_qty, actual_notional,
+                hl_result.fill_price, aster_ref_price,
+                hl_funding_rate=hl_fr, aster_funding_rate=aster_fr,
+            )
+            self.pm.log_trade(
+                existing.id, "hl", hl_side, "ioc_limit",
+                hl_result.order_id, actual_qty, hl_result.fill_price, notes="scale-in",
+            )
+            self.pm.log_trade(
+                existing.id, "aster", aster_side, "gtx_limit",
+                aster_result.order_id, actual_qty, aster_ref_price, notes="scale-in resting",
+            )
+            return True, (
+                f"scaled in {symbol} +${actual_notional:.0f} qty={actual_qty} → "
+                f"${existing.notional_usd:.0f} total"
+            )
         pos = self.pm.open_entering(
             symbol=symbol, hl_coin=f"xyz:{symbol}",
             aster_symbol=aster_symbol_for(symbol),
