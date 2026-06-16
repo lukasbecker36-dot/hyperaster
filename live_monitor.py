@@ -544,6 +544,11 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             req = pending_entries[symbol]
             pos = pm.get(symbol)
             if pos and pos.status not in ("open", None):
+                pending_entries.pop(symbol, None)
+                send_alert(
+                    f"/enter {symbol}: cancelled — existing position in "
+                    f"status '{pos.status}' (close/drop it first)"
+                )
                 continue
             if pos and pos.direction != req["direction"]:
                 pending_entries.pop(symbol, None)
@@ -561,9 +566,11 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             basis = _carry_basis_bps(req["direction"], "enter", aster_book, hl_book)
             if basis is None:
                 continue
+            log.info(
+                f"gate {symbol}: basis={basis:.1f}bps target={req['target_bps']:.0f}bps "
+                f"HL={hl_book.bid:.2f}/{hl_book.ask:.2f} AST={aster_book.bid:.2f}/{aster_book.ask:.2f}"
+            )
             if basis >= req["target_bps"]:
-                # Maker-first: the full notional rests as an HL maker once the
-                # gate clears, so there's no top-of-book cap to scale around.
                 ok, msg = await executor.force_entry_maker(
                     symbol, req["direction"], req["notional"]
                 )
