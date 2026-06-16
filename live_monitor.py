@@ -160,8 +160,10 @@ def _carry_basis_bps(direction: str, action: str, aster_book, hl_book):
         return None
     buy_hl_leg = (direction == "long_hl_short_aster") == (action == "enter")
     if buy_hl_leg:
-        return (aster_book.bid - hl_book.ask) / mid * 10000
-    return (hl_book.bid - aster_book.ask) / mid * 10000
+        # buy HL @ ask (taker), sell Aster @ ask (maker)
+        return (aster_book.ask - hl_book.ask) / mid * 10000
+    # sell HL @ bid (taker), buy Aster @ bid (maker)
+    return (hl_book.bid - aster_book.bid) / mid * 10000
 
 def _write_latest_spreads(spreads: dict[str, tuple[float, str, float]],
                           est_net: dict[str, float] | None = None):

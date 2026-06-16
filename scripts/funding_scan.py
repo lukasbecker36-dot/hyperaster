@@ -174,17 +174,17 @@ async def scan(top: int, lookback_h: int) -> str:
         else:
             continue  # no carry edge
 
-        # Executable basis (USDC->USDT normalised) — what you'd actually cross
-        # at the touch when entering in the carry direction.
+        # Executable basis (USDC->USDT normalised). HL is taker (IOC), Aster is
+        # maker (GTX). Maker gets the favourable side: sell@ask, buy@bid.
         hl_ask_usdt = hl_book.ask * usdc_rate
         hl_bid_usdt = hl_book.bid * usdc_rate
         ref = (hl_book.mid * usdc_rate + aster_book.mid) / 2
         if direction == "BUY_HL":
-            # buy HL @ ask, sell Aster @ bid
-            basis_credit = (aster_book.bid - hl_ask_usdt) / ref * BPS
+            # buy HL @ ask (taker), sell Aster @ ask (maker)
+            basis_credit = (aster_book.ask - hl_ask_usdt) / ref * BPS
         else:
-            # buy Aster @ ask, sell HL @ bid
-            basis_credit = (hl_bid_usdt - aster_book.ask) / ref * BPS
+            # sell HL @ bid (taker), buy Aster @ bid (maker)
+            basis_credit = (hl_bid_usdt - aster_book.bid) / ref * BPS
 
         # Funding stability: how many recent Aster settlements share the avg's sign.
         if ast_rates:
