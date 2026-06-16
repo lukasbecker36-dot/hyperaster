@@ -45,13 +45,14 @@ from src.history import (
     hl_candles, aster_candles, hl_funding_history, aster_funding_history, now_ms,
 )
 from config import (
-    BLOCKED_SYMBOLS, NON_EQUITY_SYMBOLS, HL_TAKER_FEE, ASTER_MAKER_FEE,
+    BLOCKED_SYMBOLS, NON_EQUITY_SYMBOLS, HL_MAKER_FEE, ASTER_TAKER_FEE,
 )
 
 BPS = Decimal("10000")
 HOUR_MS = 3_600_000
 ZERO = Decimal("0")
-ROUND_TRIP_FEE_BPS = (Decimal(str(HL_TAKER_FEE)) * 2 + Decimal(str(ASTER_MAKER_FEE)) * 2) * BPS
+# Carry trades: HL maker on both entry+exit, Aster taker on both.
+ROUND_TRIP_FEE_BPS = (Decimal(str(HL_MAKER_FEE)) * 2 + Decimal(str(ASTER_TAKER_FEE)) * 2) * BPS
 
 
 async def fetch_usdc_usdt_rate(session) -> Decimal:
@@ -146,8 +147,9 @@ async def run(days: int, notional_usd: float, top: int) -> str:
             basis_pnl_bps = exit_basis - entry_basis
         basis_pnl = basis_pnl_bps / BPS * notional
 
-        hl_bk = hl_tickers.get(sym)
-        crossing_bps = hl_bk.spread_bps if hl_bk else Decimal("10")
+        # Aster is the taker leg, so we cross its spread (HL rests as maker).
+        aster_bk = aster_tickers.get(sym)
+        crossing_bps = aster_bk.spread_bps if aster_bk else Decimal("10")
         costs = (ROUND_TRIP_FEE_BPS + crossing_bps) / BPS * notional
         total = funding_pnl + basis_pnl - costs
 
