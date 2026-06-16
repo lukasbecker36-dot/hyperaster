@@ -795,7 +795,12 @@ def main():
         _api("setMyCommands", {"commands": json.dumps([
             {"command": "status", "description": "Service state + spreads + positions"},
             {"command": "spreads", "description": "Current spread vs threshold"},
-            {"command": "positions", "description": "Open positions detail"},
+            {"command": "funding", "description": "Top funding-carry opportunities"},
+            {"command": "positions", "description": "Open positions + pending basis gates"},
+            {"command": "enter", "description": "Open a funding hold: SYM DIR NOTIONAL [basis_bps]"},
+            {"command": "close", "description": "Close a position: SYM [basis_bps]"},
+            {"command": "cancel", "description": "Cancel a pending basis-gated order: SYM"},
+            {"command": "autoentry", "description": "Toggle auto basis-arb entry: on|off"},
             {"command": "trades", "description": "Last N closed trades with P&L"},
             {"command": "pnl", "description": "Realised P&L today + all-time"},
             {"command": "log", "description": "Last n journal lines"},
