@@ -329,13 +329,24 @@ def cmd_positions(chat_id: str, _arg: str):
         else:
             excess_str = "now=?"
 
-        lines.append(
-            f"• {sym}{tag} [{status}] {short_dir}\n"
-            f"    excess: entry={spread:+.0f}bps  {excess_str}  exit≤0bps\n"
-            f"    HL:{hl_px:.2f}  Ast:{ast_px:.2f}  qty={qty or 0}\n"
-            f"    funding=${funding:+.2f}  fees=${fees:.2f}  held={held_h:.1f}h{est_net_str}\n"
-            f"    target=${sym_target:.2f} net | need gross≥${sym_target - funding + fees:.2f}"
-        )
+        qty_str = f"{qty or 0}"
+        if hold_for_funding and notional:
+            qty_str += f" (${notional:.0f})"
+
+        if hold_for_funding:
+            lines.append(
+                f"• {sym}{tag} [{status}] {short_dir}\n"
+                f"    HL:{hl_px:.2f}  Ast:{ast_px:.2f}  qty={qty_str}\n"
+                f"    funding=${funding:+.2f}  fees=${fees:.2f}  held={held_h:.1f}h{est_net_str}"
+            )
+        else:
+            lines.append(
+                f"• {sym}{tag} [{status}] {short_dir}\n"
+                f"    excess: entry={spread:+.0f}bps  {excess_str}  exit≤0bps\n"
+                f"    HL:{hl_px:.2f}  Ast:{ast_px:.2f}  qty={qty_str}\n"
+                f"    funding=${funding:+.2f}  fees=${fees:.2f}  held={held_h:.1f}h{est_net_str}\n"
+                f"    target=${sym_target:.2f} net | need gross≥${sym_target - funding + fees:.2f}"
+            )
     if gate_lines:
         lines.append("")
         lines.extend(gate_lines)

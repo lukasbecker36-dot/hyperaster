@@ -39,7 +39,7 @@ from config import (
     BLOCKED_SYMBOLS, NON_EQUITY_SYMBOLS, ENTRY_CONFIRM_TICKS, ADVERSE_STOP_BPS,
     ROUND_TRIP_FEE, NOTIONAL_PER_LEG, EXIT_TARGET_NET_USD,
     EXIT_TARGET_NET_USD_BY_SYMBOL, MAX_FUNDING_DRAG_USD,
-    FUNDING_MAX_HOLD_HOURS, FUNDING_ADVERSE_STOP_USD,
+    FUNDING_ADVERSE_STOP_USD,
     MANUAL_ENTRY_GATE_TIMEOUT_MIN, aster_symbol_for,
 )
 
@@ -394,8 +394,8 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                             f"-${FUNDING_ADVERSE_STOP_USD} — bailing | held={elapsed_hours:.1f}h"
                         )
                         should_exit, reason = True, "funding_stop"
-                    elif elapsed_hours >= FUNDING_MAX_HOLD_HOURS:
-                        should_exit, reason = True, "funding_timeout"
+                    # No timeout — funding-carry trades are held indefinitely
+                    # (only the adverse stop closes them automatically).
                 elif est_net >= sym_target:
                     should_exit, reason = True, "target"
                 elif symbol in BLOCKED_SYMBOLS:
