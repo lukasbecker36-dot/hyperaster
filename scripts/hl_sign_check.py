@@ -12,10 +12,14 @@ Run on the server with the project venv:
     .venv/bin/python scripts/hl_sign_check.py
 """
 
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from dotenv import load_dotenv
+load_dotenv(os.path.join(Path(__file__).parent.parent, ".env"))
 
 import msgpack
 from eth_account import Account
