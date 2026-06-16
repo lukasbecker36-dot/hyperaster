@@ -89,11 +89,14 @@ def _api(method: str, params: dict, timeout: int = 35) -> dict:
         return json.loads(r.read().decode())
 
 
-def send(chat_id: str, text: str):
+def send(chat_id: str, text: str, parse_mode: str | None = None):
     # Telegram caps messages at 4096 chars
     for i in range(0, len(text), 3900):
+        params = {"chat_id": chat_id, "text": text[i:i + 3900]}
+        if parse_mode:
+            params["parse_mode"] = parse_mode
         try:
-            _api("sendMessage", {"chat_id": chat_id, "text": text[i:i + 3900]}, timeout=15)
+            _api("sendMessage", params, timeout=15)
         except Exception as e:
             print(f"send failed: {e}", flush=True)
 
@@ -714,11 +717,29 @@ def cmd_funding(chat_id: str, arg: str):
     send(chat_id, out or f"(no output, exit {code})")
 
 
+def cmd_book(chat_id: str, arg: str):
+    """Top-5 order-book snapshot for one name on both venues.
+
+    Shells out to scripts/book_snapshot.py (venv + live API egress).
+    Usage: /book SYMBOL
+    """
+    symbol = arg.strip().split()[0].upper() if arg.strip() else ""
+    if not symbol:
+        send(chat_id, "Usage: /book SYMBOL  (e.g. /book NBIS)")
+        return
+    script = BASE_DIR / "scripts" / "book_snapshot.py"
+    send(chat_id, f"⏳ fetching {symbol} books…")
+    code, out = run([PYTHON, str(script), symbol], timeout=30)
+    send(chat_id, f"<pre>{out}</pre>" if out else f"(no output, exit {code})",
+         parse_mode="HTML")
+
+
 def cmd_help(chat_id: str, _arg: str):
     send(chat_id,
          "Commands:\n"
          "/status — service state + spreads + positions\n"
          "/spreads — current spread vs threshold detail\n"
+         "/book SYM — top-5 order book on both venues\n"
          "/funding [n] — top funding-carry opportunities\n"
          "/enter SYM DIR NOTIONAL [basis_bps] — open a funding hold; basis_bps waits for a fill level\n"
          "/close SYM [basis_bps] — close a position; basis_bps waits for a fill level\n"
@@ -740,6 +761,7 @@ def cmd_help(chat_id: str, _arg: str):
 HANDLERS = {
     "/status": cmd_status, "/positions": cmd_positions, "/pos": cmd_positions,
     "/pnl": cmd_pnl, "/trades": cmd_trades,
+    "/book": cmd_book,
     "/funding": cmd_funding, "/carry": cmd_funding,
     "/enter": cmd_enter, "/close": cmd_close, "/cancel": cmd_cancel,
     "/autoentry": cmd_autoentry,
@@ -809,6 +831,7 @@ def main():
         _api("setMyCommands", {"commands": json.dumps([
             {"command": "status", "description": "Service state + spreads + positions"},
             {"command": "spreads", "description": "Current spread vs threshold"},
+            {"command": "book", "description": "Top-5 order book on both venues: SYM"},
             {"command": "funding", "description": "Top funding-carry opportunities"},
             {"command": "positions", "description": "Open positions + pending basis gates"},
             {"command": "enter", "description": "Open a funding hold: SYM DIR NOTIONAL [basis_bps]"},

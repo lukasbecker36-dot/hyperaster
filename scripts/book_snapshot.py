@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""
+Top-of-book snapshot for one equity name on both venues.
+
+Prints the top 5 levels of the Hyperliquid (USDC) and Aster (USDT) order
+books side by side, plus the mid prices, each venue's own bid/ask spread, and
+the cross-venue basis. Used by the /book Telegram command.
+
+Run on the server (needs the venv's aiohttp + live API egress):
+    .venv/bin/python scripts/book_snapshot.py NBIS
+    .venv/bin/python scripts/book_snapshot.py NBIS --levels 5
+"""
+
+import argparse
+import asyncio
+import sys
+from decimal import Decimal
+from pathlib import Path
+
+import aiohttp
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+HL_URL = "https://api.hyperliquid.xyz/info"
+ASTER_URL = "https://fapi.asterdex.com/fapi/v1/depth"
+
+# canonical (HL) base -> Aster's tradeable base, when they differ.
+_CANON_TO_ASTER = {"SMSN": "SAMSUNG", "SKHX": "SKHYNIX"}
+
+
+async def hl_depth(session, coin: str, levels: int):
+    async with session.post(HL_URL, json={"type": "l2Book", "coin": coin}) as r:
+        book = await r.json()
+    lv = book.get("levels") or [[], []]
+    bids = [(Decimal(x["px"]), Decimal(x["sz"])) for x in lv[0][:levels]]
+    asks = [(Decimal(x["px"]), Decimal(x["sz"])) for x in lv[1][:levels]]
+    return bids, asks
+
+
+async def aster_depth(session, aster_sym: str, levels: int):
+    async with session.get(
+        ASTER_URL, params={"symbol": aster_sym, "limit": max(levels, 5)}
+    ) as r:
+        book = await r.json()
+    bids = [(Decimal(p), Decimal(q)) for p, q in book.get("bids", [])[:levels]]
+    asks = [(Decimal(p), Decimal(q)) for p, q in book.get("asks", [])[:levels]]
+    return bids, asks
+
+
+async def usdc_usdt_rate(session) -> Decimal:
+    try:
+        async with session.get(
+            "https://api.binance.com/api/v3/ticker/price",
+            params={"symbol": "USDCUSDT"},
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as r:
+            return Decimal((await r.json())["price"])
+    except Exception:
+        return Decimal("1")
+
+
+def _spread_bps(bid: Decimal, ask: Decimal) -> Decimal:
+    if bid <= 0 or ask <= 0:
+        return Decimal(0)
+    return (ask - bid) / ((ask + bid) / 2) * 10000
+
+
+async def run(symbol: str, levels: int) -> str:
+    canon = symbol.upper()
+    hl_coin = f"xyz:{canon}"
+    aster_sym = _CANON_TO_ASTER.get(canon, canon) + "USDT"
+
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            (hl_b, hl_a), (ast_b, ast_a), usdc = await asyncio.gather(
+                hl_depth(session, hl_coin, levels),
+                aster_depth(session, aster_sym, levels),
+                usdc_usdt_rate(session),
+            )
+        except Exception as e:
+            return f"📕 {canon}: book fetch failed — {e}"
+
+    if not hl_b or not hl_a:
+        return f"📕 {canon}: no Hyperliquid book ({hl_coin})."
+    if not ast_b or not ast_a:
+        return f"📕 {canon}: no Aster book ({aster_sym})."
+
+    hl_bid, hl_ask = hl_b[0][0], hl_a[0][0]
+    ast_bid, ast_ask = ast_b[0][0], ast_a[0][0]
+    hl_mid = (hl_bid + hl_ask) / 2
+    ast_mid = (ast_bid + ast_ask) / 2
+    hl_mid_usdt = hl_mid * usdc
+    ref = (hl_mid_usdt + ast_mid) / 2
+
+    def col(rows, n):
+        # pad/truncate to n rows of "px×size"
+        out = []
+        for i in range(n):
+            if i < len(rows):
+                px, sz = rows[i]
+                out.append(f"{float(px):>10.3f} × {float(sz):<7.3f}")
+            else:
+                out.append(" " * 20)
+        return out
+
+    n = levels
+    # asks shown high→low (top of stack = best ask nearest mid at the bottom)
+    hl_ask_col = col(list(reversed(hl_a[:n])), n)
+    ast_ask_col = col(list(reversed(ast_a[:n])), n)
+    hl_bid_col = col(hl_b[:n], n)
+    ast_bid_col = col(ast_b[:n], n)
+
+    lines = [
+        f"📕 {canon} order book (top {n})",
+        f"{'HYPERLIQUID (USDC)':<24} | {'ASTER (USDT)':<24}",
+        "─" * 51,
+        "asks ↑",
+    ]
+    for h, a in zip(hl_ask_col, ast_ask_col):
+        lines.append(f"{h:<24} | {a:<24}")
+    lines.append("─" * 51)
+    for h, a in zip(hl_bid_col, ast_bid_col):
+        lines.append(f"{h:<24} | {a:<24}")
+    lines.append("bids ↓")
+    lines.append("─" * 51)
+
+    # Executable cross basis (aggressive touch, matching the bot's execution:
+    # HL taker, Aster leg crosses since it's 0% maker AND taker).
+    #   buy-HL  leg: sell Aster @ bid, buy HL @ ask  -> (ast_bid - hl_ask_usdt)
+    #   buy-AST leg: buy Aster @ ask, sell HL @ bid  -> (hl_bid_usdt - ast_ask)
+    hl_ask_usdt = hl_ask * usdc
+    hl_bid_usdt = hl_bid * usdc
+    basis_buy_hl = (ast_bid - hl_ask_usdt) / ref * 10000
+    basis_buy_ast = (hl_bid_usdt - ast_ask) / ref * 10000
+
+    lines += [
+        f"mid: HL {float(hl_mid):.3f} (≈{float(hl_mid_usdt):.3f} USDT)  "
+        f"Ast {float(ast_mid):.3f}",
+        f"spread: HL {float(_spread_bps(hl_bid, hl_ask)):.0f}bp  "
+        f"Ast {float(_spread_bps(ast_bid, ast_ask)):.0f}bp  "
+        f"USDC/USDT {float(usdc):.4f}",
+        f"exec basis: buy-HL/sell-AST {float(basis_buy_hl):+.0f}bp  |  "
+        f"buy-AST/sell-HL {float(basis_buy_ast):+.0f}bp",
+    ]
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Order-book snapshot for one name")
+    ap.add_argument("symbol")
+    ap.add_argument("--levels", type=int, default=5)
+    args = ap.parse_args()
+    print(asyncio.run(run(args.symbol, max(1, min(args.levels, 10)))))
+
+
+if __name__ == "__main__":
+    main()
