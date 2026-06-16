@@ -31,7 +31,7 @@ from config import (
     MAX_PRICE_RATIO_DIVERGENCE, BLOCKED_SYMBOLS, MIN_EXECUTABLE_PREMIUM_BPS,
     ENTRY_CONFIRM_TICKS, ENTRY_COST_MARGIN_BPS, ROUND_TRIP_FEE,
     EXIT_TARGET_NET_USD, EXIT_TARGET_NET_USD_BY_SYMBOL,
-    MAKER_ENTRY_TIMEOUT_SEC, MAKER_EXIT_TIMEOUT_SEC, MAKER_REPRICE_TICK_FRAC,
+    MAKER_ENTRY_TIMEOUT_SEC, MAKER_REPRICE_TICK_FRAC,
     aster_symbol_for,
 )
 from auth import now_ms
@@ -987,7 +987,9 @@ class Executor:
         """Per-tick driver for a maker-first carry exit. Detects HL closes via the
         position szi delta, closes each new increment on Aster with an IOC taker,
         reprices the resting HL maker if the touch moves (before any fill), and
-        finalises on full close or by taker-completing the remainder at timeout.
+        finalises on full close. No timeout — the maker rests indefinitely. If the
+        basis moves so favorably that a taker-taker exit is net-positive after fees
+        and bid/offer, escalates to taker-taker to capture the windfall now.
         Only ever closes as much Aster as HL has closed — no naked exposure."""
         pos = self.pm.get(symbol)
         if (not pos or pos.status != "exiting" or not pos.hold_for_funding
@@ -1054,20 +1056,59 @@ class Executor:
                 pos.exit_reason or "manual")
             return
 
-        elapsed = (now_ms() - pos.exit_time) / 1000
-        if elapsed >= MAKER_EXIT_TIMEOUT_SEC:
-            await self._complete_maker_exit_taker(pos, closing_long, hl_side, aster_hedge_side)
-            return
+        # Taker-taker escalation: if the basis has moved so favorably that crossing
+        # both books as taker (worst fills + conservative 9bps taker-model fees) is
+        # still net-positive, stop waiting and take the money now. This is the
+        # "unlikely but possible" windfall the user described.
+        await self._check_taker_escalation(pos, closing_long, hl_side, aster_hedge_side)
 
         # Reprice the resting exit maker if the touch drifted — only before any
         # fill, so the recorded exit price stays clean.
         if hl_closed <= 0:
             await self._reprice_hl_maker_exit(pos, hl_side)
 
+    async def _check_taker_escalation(self, pos, closing_long, hl_side, aster_hedge_side):
+        """If the taker-taker exit is net-positive after fees+b/o, escalate from
+        the patient maker exit to an immediate taker-taker close."""
+        symbol = pos.symbol
+        try:
+            aster_book, hl_book = await self.client.get_both_books(symbol)
+        except Exception:
+            return
+        mid = (aster_book.mid + hl_book.mid) / 2
+        if mid <= 0:
+            return
+        # Taker-taker gross: both legs cross the book (worst-case fills).
+        if closing_long:
+            taker_gross = ((hl_book.bid - pos.hl_entry_price)
+                           + (pos.aster_entry_price - aster_book.ask)) * pos.qty
+        else:
+            taker_gross = ((pos.hl_entry_price - hl_book.ask)
+                           + (aster_book.bid - pos.aster_entry_price)) * pos.qty
+        # Use the convergence (taker) fee model (9bps) — more conservative than the
+        # actual mixed trip (entry-maker + exit-taker ≈ 7.8bps). This ensures we
+        # only escalate when it's clearly worth it.
+        from config import ROUND_TRIP_FEE
+        taker_fees = (pos.notional_usd or pos.qty * mid) * ROUND_TRIP_FEE
+        elapsed_hours = max(0.0, (now_ms() - pos.entry_time) / 3_600_000)
+        from position_manager import estimate_funding_pnl
+        taker_funding = estimate_funding_pnl(
+            pos.direction, elapsed_hours, pos.notional_usd or pos.qty * mid,
+            pos.hl_funding_rate, pos.aster_funding_rate,
+        )
+        taker_est_net = taker_gross - taker_fees + taker_funding
+        if taker_est_net >= 0:
+            log.warning(
+                f"{symbol}: taker-taker exit viable (est_net=${taker_est_net:.2f}, "
+                f"gross=${taker_gross:.2f}, fees=${taker_fees:.2f}, "
+                f"funding=${taker_funding:.2f}) — escalating from maker to taker"
+            )
+            await self._complete_maker_exit_taker(pos, closing_long, hl_side, aster_hedge_side)
+
     async def _complete_maker_exit_taker(self, pos, closing_long, hl_side, aster_hedge_side):
-        """Exit maker timed out: cancel it, cross the unclosed HL remainder as a
-        taker, close the matching Aster, and finalise. We asked to get out, so we
-        complete the exit rather than re-opening the carry hold."""
+        """Escalate from the patient maker exit to a taker-taker close. Cancel the
+        resting HL maker, cross the unclosed HL remainder as a taker IOC, close the
+        matching Aster, and finalise."""
         symbol = pos.symbol
         if pos.hl_exit_order_id and pos.hl_exit_order_id != "PAPER":
             await self.client.cancel_hl_order(symbol, pos.hl_exit_order_id)
