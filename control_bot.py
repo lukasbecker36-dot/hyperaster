@@ -272,7 +272,10 @@ def _pending_gate_lines() -> list[str]:
 
 def cmd_positions(chat_id: str, _arg: str):
     try:
-        from config import ROUND_TRIP_FEE, EXIT_TARGET_NET_USD, EXIT_TARGET_NET_USD_BY_SYMBOL
+        from config import (
+            ROUND_TRIP_FEE, CARRY_ROUND_TRIP_FEE,
+            EXIT_TARGET_NET_USD, EXIT_TARGET_NET_USD_BY_SYMBOL,
+        )
         from position_manager import estimate_funding_pnl
     except Exception:
         send(chat_id, "Import error")
@@ -308,7 +311,8 @@ def cmd_positions(chat_id: str, _arg: str):
         if hold_for_funding:
             tag += " 💰carry"
         notional = notional or 1000
-        fees = notional * ROUND_TRIP_FEE
+        # Carry holds pay HL-maker/Aster-taker; convergence pays HL-taker/Aster-maker.
+        fees = notional * (CARRY_ROUND_TRIP_FEE if hold_for_funding else ROUND_TRIP_FEE)
         funding = estimate_funding_pnl(
             direction or "long_hl_short_aster", held_h, notional,
             hl_fr or 0, ast_fr or 0,
