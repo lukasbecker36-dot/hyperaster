@@ -15,7 +15,9 @@ from typing import Optional
 
 from auth import now_ms
 from database import get_connection
-from config import ASTER_MAKER_FEE, HL_TAKER_FEE
+from config import (
+    ASTER_MAKER_FEE, ASTER_TAKER_FEE, HL_MAKER_FEE, HL_TAKER_FEE,
+)
 
 log = logging.getLogger(__name__)
 
@@ -485,9 +487,12 @@ class PositionManager:
             aster_pnl = (aster_exit_price - pos.aster_entry_price) * pos.qty
         gross = hl_pnl + aster_pnl
 
-        # Fees: 2x HL taker (entry+exit) + 2x Aster maker (entry+exit = 0 during sprint)
+        # Carry trades use HL-maker/Aster-taker; convergence uses HL-taker/Aster-maker.
         notional = pos.notional_usd
-        fees = notional * 2 * HL_TAKER_FEE + notional * 2 * ASTER_MAKER_FEE
+        if pos.hold_for_funding:
+            fees = notional * 2 * HL_MAKER_FEE + notional * 2 * ASTER_TAKER_FEE
+        else:
+            fees = notional * 2 * HL_TAKER_FEE + notional * 2 * ASTER_MAKER_FEE
 
         # Funding carry over the hold (estimated from entry-snapshot rates).
         hours_held = max(0.0, (pos.exit_time - pos.entry_time) / 3_600_000)

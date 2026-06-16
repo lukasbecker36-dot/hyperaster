@@ -37,7 +37,7 @@ from config import (
     EXIT_THRESHOLD_BPS, MAX_HOLD_HOURS, MAX_CONCURRENT_POSITIONS,
     HEARTBEAT_INTERVAL_MINUTES, PAPER_MODE, DATA_DIR, OUTPUT_DIR,
     BLOCKED_SYMBOLS, NON_EQUITY_SYMBOLS, ENTRY_CONFIRM_TICKS, ADVERSE_STOP_BPS,
-    ROUND_TRIP_FEE, NOTIONAL_PER_LEG, EXIT_TARGET_NET_USD,
+    ROUND_TRIP_FEE, CARRY_ROUND_TRIP_FEE, NOTIONAL_PER_LEG, EXIT_TARGET_NET_USD,
     EXIT_TARGET_NET_USD_BY_SYMBOL, MAX_FUNDING_DRAG_USD,
     FUNDING_ADVERSE_STOP_USD,
     MANUAL_ENTRY_GATE_TIMEOUT_MIN, aster_symbol_for,
@@ -374,7 +374,8 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                                  + (aster_book.bid - pos.aster_entry_price)) * pos.qty
                 else:
                     est_gross = 0.0
-                est_fees = (pos.notional_usd or NOTIONAL_PER_LEG) * ROUND_TRIP_FEE
+                rt_fee = CARRY_ROUND_TRIP_FEE if pos.hold_for_funding else ROUND_TRIP_FEE
+                est_fees = (pos.notional_usd or NOTIONAL_PER_LEG) * rt_fee
                 est_funding = estimate_funding_pnl(
                     pos.direction, elapsed_hours,
                     pos.notional_usd or NOTIONAL_PER_LEG,

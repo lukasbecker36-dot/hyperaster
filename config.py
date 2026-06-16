@@ -34,8 +34,10 @@ HL_MAKER_FEE = 0.00015
 ASTER_MAKER_FEE = 0.0
 ASTER_TAKER_FEE = 0.00009
 
-# Round-trip: aster maker both legs + HL taker both legs
+# Round-trip: convergence arb pays HL taker + Aster maker on both legs
 ROUND_TRIP_FEE = 2 * ASTER_MAKER_FEE + 2 * HL_TAKER_FEE  # ~0.09% = 9bps
+# Carry trades execute HL maker + Aster taker on both legs
+CARRY_ROUND_TRIP_FEE = 2 * HL_MAKER_FEE + 2 * ASTER_TAKER_FEE  # ~0.048% ≈ 4.8bps
 
 # Minimum net executable premium (bps) after subtracting smoothed oracle delta.
 # Belt-and-suspenders floor: prevents entries where oracle delta noise inflates the

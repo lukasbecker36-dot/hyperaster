@@ -38,15 +38,15 @@ from src import aster, hyperliquid as hl
 from src.history import hl_funding_history, aster_funding_history, now_ms
 from config import (
     BLOCKED_SYMBOLS, NON_EQUITY_SYMBOLS,
-    HL_TAKER_FEE, ASTER_MAKER_FEE,
+    HL_MAKER_FEE, ASTER_TAKER_FEE,
 )
 
 BPS = Decimal("10000")
 HOUR_MS = 3_600_000
 ZERO = Decimal("0")
 
-# Maker/taker round trip: HL taker on both entry+exit, Aster maker on both.
-ROUND_TRIP_FEE_BPS = (Decimal(str(HL_TAKER_FEE)) * 2 + Decimal(str(ASTER_MAKER_FEE)) * 2) * BPS
+# Carry trades: HL maker on both entry+exit, Aster taker on both.
+ROUND_TRIP_FEE_BPS = (Decimal(str(HL_MAKER_FEE)) * 2 + Decimal(str(ASTER_TAKER_FEE)) * 2) * BPS
 
 
 async def fetch_usdc_usdt_rate(session: aiohttp.ClientSession) -> Decimal:
@@ -88,9 +88,9 @@ def build_opp(
     o.basis_credit = basis_credit
     o.hl_bo = hl_bo
     o.aster_bo = aster_bo
-    # Crossing cost: cross HL's full spread once per round trip (taker leg);
-    # Aster is the maker leg so we rest, not cross.
-    crossing = hl_bo
+    # Crossing cost: Aster is the taker leg so we cross its spread once per
+    # round trip; HL rests as maker (no crossing cost).
+    crossing = aster_bo
     hurdle = ROUND_TRIP_FEE_BPS + crossing - basis_credit
     if hurdle <= ZERO:
         o.hours = ZERO  # basis alone already covers costs — carry is pure gravy
@@ -232,7 +232,7 @@ async def scan(top: int, lookback_h: int) -> str:
     lines.append(
         "net = 24h-avg net funding (bps/hr) in the shown direction. "
         "basis>0 = convergence tailwind, <0 = entry cost. "
-        "hrs-to-profit = (fees+HL b/o-basis)/net. "
+        "hrs-to-profit = (fees+Ast b/o-basis)/net. "
         "stable = Aster settlements matching the avg sign."
     )
     return "\n".join(lines)
