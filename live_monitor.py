@@ -145,28 +145,23 @@ def _auto_entry_enabled() -> bool:
 
 
 def _carry_basis_bps(direction: str, action: str, aster_book, hl_book):
-    """Basis (bps) in the position's FAVOUR for the given action, from MID prices.
+    """Executable basis (bps) in the position's FAVOUR for the given action.
 
-    Deliberately mid-based so it matches the `basis` column shown by /funding —
-    a /enter or /close basis target then means exactly what you see there.
-    Higher = better:
+    Uses touch bid/ask prices — what you'd actually cross — so the gate
+    matches the basis column shown by /funding. Higher = better:
 
-      enter long_hl_short_aster / exit long_aster_short_hl  (you buy HL, sell Aster)
-          favourable when Aster is rich vs HL = (aster_mid - hl_mid) / mid
-      enter long_aster_short_hl / exit long_hl_short_aster  (you buy Aster, sell HL)
-          favourable when HL is rich vs Aster = (hl_mid - aster_mid) / mid
-
-    Note: the actual fill also crosses the HL touch (taker) while Aster rests as a
-    maker, so the realised level is a few bps worse than this mid basis on wide
-    books — build that into your target if you want a cushion.
+      buy-HL leg  (enter L-HL/S-AST or exit L-AST/S-HL):
+          buy HL @ ask, sell Aster @ bid  →  (aster_bid - hl_ask) / mid
+      buy-AST leg (enter L-AST/S-HL or exit L-HL/S-AST):
+          buy Aster @ ask, sell HL @ bid  →  (hl_bid - aster_ask) / mid
     """
     mid = (aster_book.mid + hl_book.mid) / 2
     if mid <= 0:
         return None
     buy_hl_leg = (direction == "long_hl_short_aster") == (action == "enter")
     if buy_hl_leg:
-        return (aster_book.mid - hl_book.mid) / mid * 10000
-    return (hl_book.mid - aster_book.mid) / mid * 10000
+        return (aster_book.bid - hl_book.ask) / mid * 10000
+    return (hl_book.bid - aster_book.ask) / mid * 10000
 
 def _write_latest_spreads(spreads: dict[str, tuple[float, str, float]],
                           est_net: dict[str, float] | None = None):

@@ -174,13 +174,17 @@ async def scan(top: int, lookback_h: int) -> str:
         else:
             continue  # no carry edge
 
-        # Basis (USDC->USDT normalised). Positive mid_spread = Aster richer.
-        hl_mid_usdt = hl_book.mid * usdc_rate
-        ref = (hl_mid_usdt + aster_book.mid) / 2
-        mid_spread_bps = (aster_book.mid - hl_mid_usdt) / ref * BPS
-        # Convergence credit in the CARRY direction: long-HL/short-Aster gains on
-        # convergence when Aster is richer (spread>0); reverse for the other side.
-        basis_credit = mid_spread_bps if direction == "BUY_HL" else -mid_spread_bps
+        # Executable basis (USDC->USDT normalised) — what you'd actually cross
+        # at the touch when entering in the carry direction.
+        hl_ask_usdt = hl_book.ask * usdc_rate
+        hl_bid_usdt = hl_book.bid * usdc_rate
+        ref = (hl_book.mid * usdc_rate + aster_book.mid) / 2
+        if direction == "BUY_HL":
+            # buy HL @ ask, sell Aster @ bid
+            basis_credit = (aster_book.bid - hl_ask_usdt) / ref * BPS
+        else:
+            # buy Aster @ ask, sell HL @ bid
+            basis_credit = (hl_bid_usdt - aster_book.ask) / ref * BPS
 
         # Funding stability: how many recent Aster settlements share the avg's sign.
         if ast_rates:
