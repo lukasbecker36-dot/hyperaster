@@ -56,7 +56,10 @@ def init_db():
             aster_funding_rate  REAL DEFAULT 0,        -- Aster 8h funding rate at entry
             funding_pnl         REAL DEFAULT 0,        -- estimated net carry over the hold
             entry_baseline_bps  REAL DEFAULT 0,         -- rolling baseline at entry (for convergence exit)
-            hold_for_funding    INTEGER DEFAULT 0       -- 1 = manual funding-carry hold (skip converge/target exits)
+            hold_for_funding    INTEGER DEFAULT 0,      -- 1 = manual funding-carry hold (skip converge/target exits)
+            entry_maker_venue   TEXT DEFAULT '',        -- 'hl' = maker-first carry execution
+            hl_baseline_szi     REAL DEFAULT 0,         -- HL signed size before the resting maker order
+            aster_hedged_qty    REAL DEFAULT 0          -- Aster qty already hedged against HL fills
         );
 
         -- Migration: add entry_baseline_bps if missing (existing DBs)
@@ -69,6 +72,15 @@ def init_db():
         conn.execute("ALTER TABLE positions ADD COLUMN hold_for_funding INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
         pass  # column already exists
+    for _col, _type in (
+        ("entry_maker_venue", "TEXT DEFAULT ''"),
+        ("hl_baseline_szi", "REAL DEFAULT 0"),
+        ("aster_hedged_qty", "REAL DEFAULT 0"),
+    ):
+        try:
+            conn.execute(f"ALTER TABLE positions ADD COLUMN {_col} {_type}")
+        except sqlite3.OperationalError:
+            pass
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS trade_log (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,

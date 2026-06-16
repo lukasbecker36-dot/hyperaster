@@ -87,6 +87,13 @@ class Position:
     # basis target/convergence exits.
     hold_for_funding: bool = False
 
+    # Maker-first execution (carry trades): "hl" means the HL leg rests as a
+    # post-only maker and the Aster leg crosses (IOC) to hedge each HL fill.
+    # "" = legacy flow (HL IOC taker first, Aster GTX maker rests).
+    entry_maker_venue: str = ""
+    hl_baseline_szi: float = 0.0   # HL signed size before the resting maker order
+    aster_hedged_qty: float = 0.0  # Aster qty already hedged against HL fills
+
 
 class PositionManager:
     def __init__(self, paper_mode: bool = False):
@@ -105,7 +112,9 @@ class PositionManager:
             "hl_entry_order_id, aster_entry_order_id, qty, notional_usd, "
             "exit_time, hl_exit_order_id, aster_exit_order_id, "
             "hl_funding_rate, aster_funding_rate, "
-            "COALESCE(entry_baseline_bps, 0), COALESCE(hold_for_funding, 0) "
+            "COALESCE(entry_baseline_bps, 0), COALESCE(hold_for_funding, 0), "
+            "COALESCE(entry_maker_venue, ''), COALESCE(hl_baseline_szi, 0), "
+            "COALESCE(aster_hedged_qty, 0) "
             "FROM positions WHERE status NOT IN ('closed', 'error') AND paper=?",
             (paper_val,)
         ).fetchall()
@@ -123,6 +132,9 @@ class PositionManager:
                 hl_funding_rate=r[17] or 0.0, aster_funding_rate=r[18] or 0.0,
                 entry_baseline_bps=r[19] or 0.0,
                 hold_for_funding=bool(r[20]),
+                entry_maker_venue=r[21] or "",
+                hl_baseline_szi=r[22] or 0.0,
+                aster_hedged_qty=r[23] or 0.0,
             )
             self.positions[p.symbol] = p
             log.warning(
@@ -188,6 +200,101 @@ class PositionManager:
             f"HL filled @ {hl_entry_price:.2f} | Aster GTX resting {aster_entry_order_id}"
         )
         return pos
+
+    def open_hl_maker_entering(
+        self, *, symbol: str, aster_symbol: str, direction: str,
+        hl_maker_order_id: str, hl_baseline_szi: float, qty: float,
+        notional_usd: float, entry_spread_bps: float, hl_ref_price: float,
+        hl_funding_rate: float = 0.0, aster_funding_rate: float = 0.0,
+    ) -> Position:
+        """Record a maker-first carry entry: HL post-only order resting, nothing
+        filled yet. poll_hl_maker advances it as the HL leg fills and the Aster
+        taker hedges each increment."""
+        entry_time = now_ms()
+        conn = get_connection()
+        cur = conn.execute(
+            "INSERT INTO positions "
+            "(symbol, hl_coin, aster_symbol, direction, status, entry_time, "
+            "entry_spread_bps, hl_entry_price, hl_entry_order_id, "
+            "aster_entry_order_id, qty, notional_usd, paper, "
+            "hl_funding_rate, aster_funding_rate, hold_for_funding, "
+            "entry_maker_venue, hl_baseline_szi, aster_hedged_qty) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (symbol, f"xyz:{symbol}", aster_symbol, direction, "entering", entry_time,
+             entry_spread_bps, hl_ref_price, hl_maker_order_id,
+             "", qty, notional_usd, 1 if self.paper_mode else 0,
+             hl_funding_rate, aster_funding_rate, 1,
+             "hl", hl_baseline_szi, 0.0),
+        )
+        conn.commit()
+        pid = cur.lastrowid
+        conn.close()
+        pos = Position(
+            id=pid, symbol=symbol, hl_coin=f"xyz:{symbol}", aster_symbol=aster_symbol,
+            direction=direction, status="entering", entry_time=entry_time,
+            entry_spread_bps=entry_spread_bps, hl_entry_price=hl_ref_price,
+            hl_entry_order_id=hl_maker_order_id, qty=qty, notional_usd=notional_usd,
+            hl_funding_rate=hl_funding_rate, aster_funding_rate=aster_funding_rate,
+            hold_for_funding=True, entry_maker_venue="hl",
+            hl_baseline_szi=hl_baseline_szi, aster_hedged_qty=0.0,
+        )
+        self.positions[symbol] = pos
+        log.info(
+            f"Position #{pid} ENTERING (HL maker): {symbol} {direction} | "
+            f"qty target={qty} | HL maker resting {hl_maker_order_id} @ {hl_ref_price:.2f}"
+        )
+        return pos
+
+    def record_hl_maker_progress(
+        self, symbol: str, hl_filled: float, aster_hedged: float,
+        hl_avg_price: float, aster_avg_price: float,
+    ):
+        """Persist running fill/hedge state for an in-flight maker-first entry."""
+        pos = self.positions.get(symbol)
+        if not pos:
+            return
+        pos.aster_hedged_qty = aster_hedged
+        if hl_avg_price > 0:
+            pos.hl_entry_price = hl_avg_price
+        if aster_avg_price > 0:
+            pos.aster_entry_price = aster_avg_price
+        conn = get_connection()
+        conn.execute(
+            "UPDATE positions SET aster_hedged_qty=?, hl_entry_price=?, "
+            "aster_entry_price=? WHERE id=?",
+            (aster_hedged, pos.hl_entry_price, pos.aster_entry_price, pos.id),
+        )
+        conn.commit()
+        conn.close()
+
+    def confirm_hl_maker_open(
+        self, symbol: str, final_qty: float, hl_avg_price: float, aster_avg_price: float,
+    ):
+        """Finalize a maker-first entry once the HL leg is filled and hedged."""
+        pos = self.positions.get(symbol)
+        if not pos:
+            return
+        pos.qty = final_qty
+        pos.aster_hedged_qty = final_qty
+        if hl_avg_price > 0:
+            pos.hl_entry_price = hl_avg_price
+        if aster_avg_price > 0:
+            pos.aster_entry_price = aster_avg_price
+        pos.notional_usd = final_qty * ((pos.hl_entry_price + pos.aster_entry_price) / 2)
+        pos.status = "open"
+        conn = get_connection()
+        conn.execute(
+            "UPDATE positions SET status='open', qty=?, aster_hedged_qty=?, "
+            "hl_entry_price=?, aster_entry_price=?, notional_usd=? WHERE id=?",
+            (final_qty, final_qty, pos.hl_entry_price, pos.aster_entry_price,
+             pos.notional_usd, pos.id),
+        )
+        conn.commit()
+        conn.close()
+        log.info(
+            f"Position #{pos.id} OPEN (HL maker): {symbol} | qty={final_qty} | "
+            f"HL @ {pos.hl_entry_price:.2f} | Aster @ {pos.aster_entry_price:.2f}"
+        )
 
     def scale_in(
         self, symbol: str, add_qty: float, add_notional: float,
@@ -352,6 +459,21 @@ class PositionManager:
         conn.commit()
         conn.close()
         log.error(f"Position #{pos.id} ERROR: {symbol} | {reason}")
+        del self.positions[symbol]
+
+    def drop_entering(self, symbol: str, reason: str = "maker_entry_unfilled"):
+        """Close out a never-filled entry record (no exposure was ever taken)."""
+        pos = self.positions.get(symbol)
+        if not pos:
+            return
+        conn = get_connection()
+        conn.execute(
+            "UPDATE positions SET status='closed', exit_reason=?, net_pnl=0 WHERE id=?",
+            (reason, pos.id),
+        )
+        conn.commit()
+        conn.close()
+        log.info(f"Position #{pos.id} dropped ({reason}): {symbol}")
         del self.positions[symbol]
 
     def log_trade(self, position_id: int, exchange: str, side: str,

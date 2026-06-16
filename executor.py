@@ -31,6 +31,7 @@ from config import (
     MAX_PRICE_RATIO_DIVERGENCE, BLOCKED_SYMBOLS, MIN_EXECUTABLE_PREMIUM_BPS,
     ENTRY_CONFIRM_TICKS, ENTRY_COST_MARGIN_BPS, ROUND_TRIP_FEE,
     EXIT_TARGET_NET_USD, EXIT_TARGET_NET_USD_BY_SYMBOL,
+    MAKER_ENTRY_TIMEOUT_SEC, MAKER_REPRICE_TICK_FRAC,
     aster_symbol_for,
 )
 from auth import now_ms
@@ -646,6 +647,262 @@ class Executor:
             f"entered {symbol} {direction} ${actual_notional:.0f} qty={actual_qty} "
             f"(Aster maker resting; you'll get a fill confirmation)"
         )
+
+    # ── Maker-first carry entry (HL post-only maker, Aster IOC taker hedge) ──
+
+    async def force_entry_maker(
+        self, symbol: str, direction: str, notional: float,
+    ) -> tuple[bool, str]:
+        """
+        Open a funding-carry hold maker-first: rest a post-only HL order (the
+        more-liquid venue) and let poll_hl_maker hedge each HL fill with an
+        Aster IOC taker. Patient by design — you only pay the Aster spread, and
+        capture the HL spread. Scale-in adds to an existing open position.
+
+        Returns (ok, message). The HL maker rests across ticks; the operator
+        gets a separate alert when it fully fills.
+        """
+        if direction not in ("long_hl_short_aster", "long_aster_short_hl"):
+            return False, f"bad direction {direction!r}"
+        if self.pm.has_position(symbol):
+            # Maker-first rests the full notional (no top-of-book cap), so there's
+            # no scale-in need — one position per symbol. Close it to resize.
+            return False, f"{symbol}: position already exists — close it first to resize"
+        if notional <= 0:
+            return False, f"{symbol}: notional must be > 0"
+
+        try:
+            aster_book, hl_book = await self.client.get_both_books(symbol)
+        except Exception as e:
+            return False, f"{symbol}: book fetch failed ({e})"
+        if aster_book.bid <= 0 or hl_book.bid <= 0:
+            return False, f"{symbol}: empty book"
+        mid = (aster_book.mid + hl_book.mid) / 2
+        if mid <= 0:
+            return False, f"{symbol}: bad mid"
+        price_ratio = abs(aster_book.mid - hl_book.mid) / min(aster_book.mid, hl_book.mid)
+        if price_ratio > MAX_PRICE_RATIO_DIVERGENCE:
+            return False, (
+                f"{symbol}: price mismatch {aster_book.mid:.4f} (Ast) vs "
+                f"{hl_book.mid:.4f} (HL), {price_ratio*100:.0f}% apart — refusing"
+            )
+
+        # HL leg is the maker. Long HL -> buy resting at the bid; short HL ->
+        # sell resting at the ask. (Aster taker hedges later, in poll_hl_maker.)
+        if direction == "long_hl_short_aster":
+            hl_side, hl_ref_price = "buy", hl_book.bid
+        else:
+            hl_side, hl_ref_price = "sell", hl_book.ask
+
+        qty = self.client.snap_aster_qty(symbol, notional / mid)
+        if qty <= 0:
+            return False, f"{symbol}: qty snapped to 0 (lot too large for ${notional:.0f})"
+        spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000
+        hl_fr = self.client.get_hl_funding_rate(symbol)
+        aster_fr = self.client.get_aster_funding_rate(symbol)
+
+        log.warning(
+            f"MAKER ENTRY {symbol}: {direction} | notional≈${qty*mid:.0f} qty={qty} | "
+            f"HL {hl_side} maker @ {hl_ref_price:.2f}"
+        )
+
+        if self.paper_mode:
+            # Paper: assume the maker fills at its resting price and the Aster
+            # taker hedges instantly at the touch.
+            aster_fill = aster_book.bid if direction == "long_hl_short_aster" else aster_book.ask
+            self.pm.open_hl_maker_entering(
+                symbol=symbol, aster_symbol=aster_symbol_for(symbol),
+                direction=direction, hl_maker_order_id="PAPER",
+                hl_baseline_szi=0.0, qty=qty, notional_usd=qty * mid,
+                entry_spread_bps=spread_bps, hl_ref_price=hl_ref_price,
+                hl_funding_rate=hl_fr, aster_funding_rate=aster_fr,
+            )
+            self.pm.confirm_hl_maker_open(symbol, qty, hl_ref_price, aster_fill)
+            return True, f"[PAPER] entered {symbol} {direction} ${qty*mid:.0f} (maker-first)"
+
+        # ── Live: rest the HL post-only maker; poll_hl_maker advances it ──
+        await self.client.ensure_perp_margin(symbol)
+        try:
+            pre_pos = await self.client.get_hl_position(symbol)
+            baseline_szi = float(pre_pos.get("szi", 0) or 0)
+        except Exception as e:
+            return False, f"{symbol}: HL pre-position snapshot failed ({e})"
+
+        alo = await self.client.place_hl_alo(symbol, hl_side, qty, hl_ref_price)
+        if not alo.success:
+            return False, f"{symbol}: HL maker not placed ({alo.error})"
+
+        self.pm.open_hl_maker_entering(
+            symbol=symbol, aster_symbol=aster_symbol_for(symbol),
+            direction=direction, hl_maker_order_id=alo.order_id,
+            hl_baseline_szi=baseline_szi, qty=qty, notional_usd=qty * mid,
+            entry_spread_bps=spread_bps, hl_ref_price=hl_ref_price,
+            hl_funding_rate=hl_fr, aster_funding_rate=aster_fr,
+        )
+        return True, (
+            f"resting HL maker for {symbol} {direction} ${qty*mid:.0f} @ {hl_ref_price:.2f} "
+            f"— hedging on fill"
+        )
+
+    async def poll_hl_maker(self, symbol: str):
+        """
+        Per-tick driver for a maker-first carry entry. Detects HL fills via the
+        position szi delta, hedges each new increment with an Aster IOC taker,
+        reprices the resting HL maker if the touch moves, and finalises on full
+        fill or timeout. Only ever hedges what HL has actually filled, so there
+        is no naked Aster exposure.
+        """
+        pos = self.pm.get(symbol)
+        if not pos or pos.status != "entering" or pos.entry_maker_venue != "hl":
+            return
+
+        long_hl = pos.direction == "long_hl_short_aster"
+        hl_side = "buy" if long_hl else "sell"
+        aster_hedge_side = "sell" if long_hl else "buy"
+
+        # How much of the HL maker has filled (signed szi delta from baseline).
+        try:
+            hlp = await self.client.get_hl_position(symbol)
+            current_szi = float(hlp.get("szi", 0) or 0)
+        except Exception as e:
+            log.warning(f"{symbol}: maker poll szi fetch failed ({e})")
+            return
+        signed_delta = current_szi - pos.hl_baseline_szi
+        hl_filled = signed_delta if long_hl else -signed_delta
+        hl_filled = max(0.0, hl_filled)
+
+        # Hedge any newly-filled HL qty with an Aster IOC taker.
+        new_fill = hl_filled - pos.aster_hedged_qty
+        min_lot = self.client.snap_aster_qty(symbol, new_fill) if new_fill > 0 else 0.0
+        if min_lot > 0:
+            try:
+                aster_book = await self.client._get_aster_book(symbol)
+            except Exception:
+                aster_book = None
+            if aster_book and aster_book.bid > 0:
+                touch = aster_book.bid if aster_hedge_side == "sell" else aster_book.ask
+                hedge_intent = record_intent(
+                    symbol=symbol, venue="aster", action="maker_hedge_ioc",
+                    direction=pos.direction, side=aster_hedge_side, qty=min_lot,
+                    ref_price=touch, position_id=pos.id, paper=False,
+                )
+                res = await self.client.place_aster_ioc(symbol, aster_hedge_side, min_lot, touch)
+                if res.success and res.filled_qty > 0:
+                    complete_intent(hedge_intent, "filled",
+                                    notes=f"qty={res.filled_qty} px={res.fill_price}",
+                                    position_id=pos.id)
+                    new_hedged = pos.aster_hedged_qty + res.filled_qty
+                    # Running VWAPs: HL at its resting price, Aster at the fill.
+                    old = pos.aster_hedged_qty
+                    a_avg = ((pos.aster_entry_price * old + res.fill_price * res.filled_qty)
+                             / new_hedged) if new_hedged > 0 else res.fill_price
+                    h_avg = ((pos.hl_entry_price * old + pos.hl_entry_price * res.filled_qty)
+                             / new_hedged) if new_hedged > 0 else pos.hl_entry_price
+                    self.pm.record_hl_maker_progress(symbol, hl_filled, new_hedged, h_avg, a_avg)
+                    self.pm.log_trade(pos.id, "aster", aster_hedge_side, "ioc_hedge",
+                                      res.order_id, res.filled_qty, res.fill_price,
+                                      notes="maker-entry hedge")
+                    log.warning(f"{symbol}: hedged {res.filled_qty} on Aster @ {res.fill_price:.2f} "
+                                f"({new_hedged}/{pos.qty})")
+                else:
+                    complete_intent(hedge_intent, "rejected",
+                                    notes=(res.error or "no_fill")[:120], position_id=pos.id)
+                    log.error(f"{symbol}: Aster hedge IOC failed ({res.error}) — will retry next tick")
+                    return  # don't advance until the fill is hedged
+
+        # Fully filled and hedged → open.
+        if hl_filled >= pos.qty * 0.999 and pos.aster_hedged_qty >= hl_filled * 0.999:
+            if pos.hl_entry_order_id:
+                await self.client.cancel_hl_order(symbol, pos.hl_entry_order_id)
+            self.pm.confirm_hl_maker_open(symbol, hl_filled, pos.hl_entry_price, pos.aster_entry_price)
+            return
+
+        elapsed = (now_ms() - pos.entry_time) / 1000
+        if elapsed >= MAKER_ENTRY_TIMEOUT_SEC:
+            # Give up the unfilled remainder. Cancel the maker, re-check szi for
+            # any last fill, hedge it, and open at the partial qty (or drop the
+            # record if nothing filled — no exposure was ever taken).
+            if pos.hl_entry_order_id:
+                await self.client.cancel_hl_order(symbol, pos.hl_entry_order_id)
+            await asyncio.sleep(0.5)
+            try:
+                hlp = await self.client.get_hl_position(symbol)
+                signed_delta = float(hlp.get("szi", 0) or 0) - pos.hl_baseline_szi
+                hl_filled = max(0.0, signed_delta if long_hl else -signed_delta)
+            except Exception:
+                pass
+            if hl_filled <= 0:
+                log.warning(f"{symbol}: maker entry timed out unfilled — cancelling record")
+                self.pm.drop_entering(symbol)
+                return
+            # Hedge any residual then open at the delta-neutral (hedged) qty.
+            residual = self.client.snap_aster_qty(symbol, hl_filled - pos.aster_hedged_qty)
+            if residual > 0:
+                try:
+                    aster_book = await self.client._get_aster_book(symbol)
+                    touch = aster_book.bid if aster_hedge_side == "sell" else aster_book.ask
+                    res = await self.client.place_aster_ioc(symbol, aster_hedge_side, residual, touch)
+                    if res.success and res.filled_qty > 0:
+                        new_hedged = pos.aster_hedged_qty + res.filled_qty
+                        self.pm.record_hl_maker_progress(
+                            symbol, hl_filled, new_hedged, pos.hl_entry_price, res.fill_price)
+                except Exception as e:
+                    log.critical(f"{symbol}: timeout residual hedge failed ({e}) — CHECK MANUALLY")
+            # Open at the matched (hedged) qty so the record stays delta-neutral.
+            final_qty = min(hl_filled, pos.aster_hedged_qty)
+            naked_hl = hl_filled - final_qty
+            if naked_hl > residual * 0.001 + 1e-9:
+                log.critical(
+                    f"{symbol}: maker entry timeout left {naked_hl:.4f} HL UNHEDGED "
+                    f"(filled {hl_filled}, hedged {pos.aster_hedged_qty}) — CHECK MANUALLY"
+                )
+            if final_qty <= 0:
+                self.pm.drop_entering(symbol, "maker_entry_unhedged")
+                return
+            log.warning(f"{symbol}: maker entry partial {final_qty}/{pos.qty} — opening")
+            self.pm.confirm_hl_maker_open(symbol, final_qty, pos.hl_entry_price, pos.aster_entry_price)
+            return
+
+        # Reprice the resting maker if the touch has drifted away — but only
+        # before any fill, so the recorded entry price stays clean and we don't
+        # chase a moving market on a partially-filled order (the timeout opens
+        # whatever filled).
+        if hl_filled <= 0:
+            await self._reprice_hl_maker(pos, hl_side, hl_filled)
+
+    async def _reprice_hl_maker(self, pos, hl_side: str, hl_filled: float):
+        """Cancel + repost the resting HL maker at the new touch for the unfilled
+        remainder, if it has drifted more than a fraction of a tick."""
+        symbol = pos.symbol
+        try:
+            _, hl_book = await self.client.get_both_books(symbol)
+        except Exception:
+            return
+        touch = hl_book.bid if hl_side == "buy" else hl_book.ask
+        if touch <= 0:
+            return
+        spec = self.client.hl_specs.get(symbol)
+        tick = 10 ** (-spec.price_precision) if spec else 0.01
+        if abs(touch - pos.hl_entry_price) < tick * MAKER_REPRICE_TICK_FRAC:
+            return
+        remainder = self.client.snap_aster_qty(symbol, pos.qty - hl_filled)
+        if remainder <= 0:
+            return
+        if pos.hl_entry_order_id:
+            await self.client.cancel_hl_order(symbol, pos.hl_entry_order_id)
+        alo = await self.client.place_hl_alo(symbol, hl_side, remainder, touch)
+        if alo.success:
+            pos.hl_entry_order_id = alo.order_id
+            pos.hl_entry_price = touch
+            from database import get_connection
+            conn = get_connection()
+            conn.execute("UPDATE positions SET hl_entry_order_id=?, hl_entry_price=? WHERE id=?",
+                         (alo.order_id, touch, pos.id))
+            conn.commit()
+            conn.close()
+            log.info(f"{symbol}: repriced HL maker -> {alo.order_id} @ {touch:.2f} (rem {remainder})")
+        else:
+            log.warning(f"{symbol}: HL maker reprice failed ({alo.error})")
 
     # ── Poll Aster maker fill (entering / exiting states) ──
 

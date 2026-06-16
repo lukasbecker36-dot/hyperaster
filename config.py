@@ -111,6 +111,13 @@ MAX_FUNDING_DRAG_USD = 2.0
 FUNDING_MAX_HOLD_HOURS = 168          # 1 week safety timeout for a funding hold
 FUNDING_ADVERSE_STOP_USD = 25.0       # bail a funding hold if executable loss exceeds this
 
+# Carry trades execute maker-first: the HL leg rests as a post-only maker and
+# the Aster leg crosses (IOC) to hedge each HL fill. If the HL maker hasn't
+# fully filled within this long, cancel the resting remainder (any filled
+# portion is kept, already hedged on Aster).
+MAKER_ENTRY_TIMEOUT_SEC = 300         # 5 min to fill the resting HL maker, else give up the rest
+MAKER_REPRICE_TICK_FRAC = 0.5         # reprice the HL maker if it drifts > this×tick from the touch
+
 # A manual /enter or /close can carry a basis target (bps) — the trade only
 # executes once the executable basis (from bid/ask, in the position's favour) is
 # at or better than the target, so you don't cross at a bad level. A gated entry

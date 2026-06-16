@@ -894,6 +894,109 @@ class ExchangeClient:
             log.error(f"HL IOC exception: {e}")
             return OrderResult(success=False, error=str(e), ambiguous=True)
 
+    async def place_hl_alo(
+        self, symbol: str, side: str, qty: float, price: float
+    ) -> OrderResult:
+        """
+        Place a post-only (Alo = Add Liquidity Only) limit order on HL XYZ.
+        Rests as a maker at exactly `price` — rejected if it would cross.
+        On success returns the resting order id (filled_qty=0); if it somehow
+        fills immediately, returns the fill. Used for maker-leg-first entries.
+        """
+        hl_coin = f"xyz:{symbol}"
+        asset_idx = self._hl_xyz_indices.get(hl_coin)
+        if asset_idx is None:
+            return OrderResult(success=False, error=f"HL asset index not found for {hl_coin}")
+
+        is_buy = side.lower() == "buy"
+        limit_px = round(price, self.hl_specs.get(symbol, ContractSpec()).price_precision)
+        order = {
+            "a": asset_idx,
+            "b": is_buy,
+            "p": self.format_hl_price(symbol, limit_px),
+            "s": self.format_hl_qty(symbol, qty),
+            "r": False,
+            "t": {"limit": {"tif": "Alo"}},
+        }
+        action = {"type": "order", "orders": [order], "grouping": "na"}
+        nonce = int(time.time() * 1000)
+        try:
+            payload = self._hl_sign_action(action, nonce)
+            async with self.session.post(
+                HL_EXCHANGE_URL, json=payload, timeout=self.timeout
+            ) as r:
+                if r.content_type != "application/json":
+                    text = await r.text()
+                    log.error(f"HL ALO non-JSON response ({r.status}): {text}")
+                    return OrderResult(success=False, error=f"HTTP {r.status}: {text}", ambiguous=True)
+                data = await r.json()
+
+            if data.get("status") != "ok":
+                err = str(data.get("response", data))
+                log.error(f"HL ALO failed: {err}")
+                return OrderResult(success=False, error=err, raw=data)
+
+            statuses = data.get("response", {}).get("data", {}).get("statuses", [{}])
+            s = statuses[0] if statuses else {}
+            if "resting" in s:
+                oid = str(s["resting"].get("oid", ""))
+                log.info(f"HL ALO resting: {side.upper()} {qty} {hl_coin} @ {limit_px} -> {oid}")
+                return OrderResult(success=True, order_id=oid, filled_qty=0.0,
+                                   fill_price=limit_px, raw=data)
+            if "filled" in s:
+                f = s["filled"]
+                log.info(f"HL ALO filled immediately: {side.upper()} {hl_coin} -> {f.get('oid')}")
+                return OrderResult(
+                    success=True, order_id=str(f.get("oid", "")),
+                    filled_qty=float(f.get("totalSz", 0)),
+                    fill_price=float(f.get("avgPx", 0)), raw=data,
+                )
+            err = s.get("error", str(s))
+            # Post-only that would cross is rejected — caller can reprice/retry.
+            log.warning(f"HL ALO not rested: {err}")
+            return OrderResult(success=False, error=err, raw=data)
+        except Exception as e:
+            log.error(f"HL ALO exception: {e}")
+            return OrderResult(success=False, error=str(e), ambiguous=True)
+
+    async def query_hl_order(self, order_id: str) -> dict:
+        """Return HL order status dict (info `orderStatus`). Empty on failure."""
+        try:
+            async with self.session.post(
+                HYPERLIQUID_API,
+                json={
+                    "type": "orderStatus",
+                    "user": self.api_keys["hl_wallet_address"],
+                    "oid": int(order_id),
+                },
+                timeout=self.timeout,
+            ) as r:
+                return await r.json()
+        except Exception as e:
+            log.warning(f"HL order query error {order_id}: {e}")
+            return {}
+
+    async def cancel_hl_order(self, symbol: str, order_id: str) -> bool:
+        """Cancel a resting HL XYZ order by oid."""
+        hl_coin = f"xyz:{symbol}"
+        asset_idx = self._hl_xyz_indices.get(hl_coin)
+        if asset_idx is None:
+            return False
+        action = {"type": "cancel", "cancels": [{"a": asset_idx, "o": int(order_id)}]}
+        nonce = int(time.time() * 1000)
+        try:
+            payload = self._hl_sign_action(action, nonce)
+            async with self.session.post(
+                HL_EXCHANGE_URL, json=payload, timeout=self.timeout
+            ) as r:
+                data = await r.json()
+            ok = data.get("status") == "ok"
+            log.info(f"HL cancel {order_id}: {'ok' if ok else data}")
+            return ok
+        except Exception as e:
+            log.error(f"HL cancel error {order_id}: {e}")
+            return False
+
     async def reconcile_hl_position_delta(
         self, symbol: str, baseline_szi: float, expected_signed_qty: float, tolerance_frac: float = 0.05,
     ) -> tuple[bool, float, float]:

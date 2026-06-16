@@ -505,8 +505,8 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                             f"(expires {MANUAL_ENTRY_GATE_TIMEOUT_MIN}min)"
                         )
                     else:
-                        ok, msg = await executor.force_entry(
-                            symbol, direction, notional, hold_for_funding=True
+                        ok, msg = await executor.force_entry_maker(
+                            symbol, direction, notional
                         )
                         send_alert(f"/enter {symbol}: {'OK' if ok else 'FAILED'} — {msg}")
                 elif action == "close":
@@ -559,28 +559,14 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             if basis is None:
                 continue
             if basis >= req["target_bps"]:
-                ok, msg = await executor.force_entry(
-                    symbol, req["direction"], req["notional"], hold_for_funding=True
+                # Maker-first: the full notional rests as an HL maker once the
+                # gate clears, so there's no top-of-book cap to scale around.
+                ok, msg = await executor.force_entry_maker(
+                    symbol, req["direction"], req["notional"]
                 )
-                if ok:
-                    filled_pos = pm.get(symbol)
-                    filled_notional = filled_pos.notional_usd if filled_pos else 0
-                    orig_notional = req.get("orig_notional", req["notional"])
-                    remaining = orig_notional - filled_notional
-                    if remaining > 10:
-                        req["notional"] = remaining
-                        req["orig_notional"] = orig_notional
-                        send_alert(
-                            f"/enter {symbol}: basis {basis:.0f}bps ≥ target — "
-                            f"OK — {msg} | ${remaining:.0f} remaining, gate stays active"
-                        )
-                    else:
-                        pending_entries.pop(symbol, None)
-                        send_alert(f"/enter {symbol}: basis {basis:.0f}bps ≥ target — "
-                                   f"OK — {msg} | fully filled")
-                else:
-                    send_alert(f"/enter {symbol}: basis {basis:.0f}bps ≥ target — "
-                               f"FAILED — {msg}")
+                pending_entries.pop(symbol, None)
+                send_alert(f"/enter {symbol}: basis {basis:.0f}bps ≥ target — "
+                           f"{'OK' if ok else 'FAILED'} — {msg}")
 
         # Exits: close when the executable exit basis clears the target. No expiry —
         # the position's own safety stops close it if the basis stays unfavourable.
@@ -617,13 +603,22 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             await process_manual_commands()
             await evaluate_gated_orders()
 
-            # ── 1. Poll Aster maker orders (entering/exiting) ──
+            # ── 1. Poll resting maker orders (entering/exiting) ──
             if now - last_aster_poll >= ASTER_FILL_POLL_SECONDS * 1000:
                 last_aster_poll = now
-                pending = [s for s, p in pm.positions.items()
-                           if p.status in ("entering", "exiting")]
-                if pending and not paper_mode:
-                    await asyncio.gather(*[executor.poll_aster_maker(s) for s in pending])
+                if not paper_mode:
+                    # Maker-first carry entries: HL post-only resting, hedge on fill.
+                    hl_makers = [s for s, p in pm.positions.items()
+                                 if p.status == "entering" and p.entry_maker_venue == "hl"]
+                    # Legacy Aster-GTX flow: convergence entries + ALL exits
+                    # (carry exits still use try_exit in this increment).
+                    aster_makers = [s for s, p in pm.positions.items()
+                                    if p.status == "exiting"
+                                    or (p.status == "entering" and p.entry_maker_venue != "hl")]
+                    tasks = ([executor.poll_hl_maker(s) for s in hl_makers]
+                             + [executor.poll_aster_maker(s) for s in aster_makers])
+                    if tasks:
+                        await asyncio.gather(*tasks)
 
             # ── 2. Slow scan: rank all symbols every 5 min ──
             if now - last_slow_scan >= SLOW_SCAN_INTERVAL_SECONDS * 1000:
