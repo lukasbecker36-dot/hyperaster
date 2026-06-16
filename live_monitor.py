@@ -109,6 +109,28 @@ _AUTO_ENTRY_FILE = os.path.join(DATA_DIR, "auto_entry")
 # {"action":"close","symbol":..}). The monitor is the single order-placing
 # process, so all manual entries/exits are funnelled through it (no races).
 _MANUAL_CMD_DIR = os.path.join(DATA_DIR, "manual_cmds")
+# Snapshot of basis-gated orders still waiting for their target, for /positions.
+_PENDING_GATES_FILE = os.path.join(DATA_DIR, "pending_gates.json")
+
+
+def _write_pending_gates(pending_entries: dict, pending_exits: dict):
+    """Persist waiting basis-gated orders so the control bot can show them."""
+    tmp = _PENDING_GATES_FILE + ".tmp"
+    try:
+        data = {
+            "entries": {
+                s: {"direction": r["direction"], "notional": r["notional"],
+                    "target_bps": r["target_bps"]}
+                for s, r in pending_entries.items()
+            },
+            "exits": {s: {"target_bps": r["target_bps"]} for s, r in pending_exits.items()},
+            "_ts": time.time(),
+        }
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, _PENDING_GATES_FILE)
+    except Exception:
+        pass
 
 
 def _auto_entry_enabled() -> bool:
@@ -610,6 +632,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 if s not in pm.positions:
                     latest_est_net.pop(s, None)
             _write_latest_spreads(latest_spreads, latest_est_net)
+            _write_pending_gates(pending_entries, pending_exits)
 
             # ── 4. Periodic tick log ──
             if tick_count % 20 == 0:

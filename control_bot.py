@@ -236,6 +236,34 @@ def _load_live_spreads() -> dict:
         return {}
 
 
+def _load_pending_gates() -> dict:
+    """Load pending_gates.json (basis-gated orders waiting for their target)."""
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "pending_gates.json")
+        with open(p) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _pending_gate_lines() -> list[str]:
+    """Render the 'waiting for basis target' section for /positions."""
+    g = _load_pending_gates()
+    entries = g.get("entries", {}) or {}
+    exits = g.get("exits", {}) or {}
+    if not entries and not exits:
+        return []
+    out = ["⏳ Pending basis gates:"]
+    for sym, r in entries.items():
+        short = "L-HL/S-AST" if r.get("direction") == "long_hl_short_aster" else "L-AST/S-HL"
+        out.append(f"  • {sym} ENTER {short} ${r.get('notional', 0):.0f} "
+                   f"— waiting entry basis ≥ {r.get('target_bps', 0):+.0f}bps")
+    for sym, r in exits.items():
+        out.append(f"  • {sym} CLOSE — waiting exit basis ≥ {r.get('target_bps', 0):+.0f}bps")
+    out.append("  (/cancel SYM to clear a gate)")
+    return out
+
+
 def cmd_positions(chat_id: str, _arg: str):
     try:
         from config import ROUND_TRIP_FEE, EXIT_TARGET_NET_USD, EXIT_TARGET_NET_USD_BY_SYMBOL
@@ -248,14 +276,18 @@ def cmd_positions(chat_id: str, _arg: str):
             "SELECT symbol, status, direction, entry_spread_bps, qty, entry_time, "
             "paper, notional_usd, hl_entry_price, aster_entry_price, "
             "hl_funding_rate, aster_funding_rate, "
-            "COALESCE(entry_baseline_bps, 0) "
+            "COALESCE(entry_baseline_bps, 0), COALESCE(hold_for_funding, 0) "
             "FROM positions WHERE status NOT IN ('closed','error') ORDER BY entry_time"
         )
     except Exception as e:
         send(chat_id, f"DB error: {e}")
         return
+    gate_lines = _pending_gate_lines()
     if not rows:
-        send(chat_id, "No open positions.")
+        msg = "No open positions."
+        if gate_lines:
+            msg += "\n\n" + "\n".join(gate_lines)
+        send(chat_id, msg)
         return
     now = time.time() * 1000
     live = _load_live_spreads()
@@ -264,9 +296,11 @@ def cmd_positions(chat_id: str, _arg: str):
         stale = " ⚠️stale"
     lines = ["📊 Open positions:"]
     for (sym, status, direction, spread, qty, etime, paper, notional,
-         hl_px, ast_px, hl_fr, ast_fr, entry_base) in rows:
+         hl_px, ast_px, hl_fr, ast_fr, entry_base, hold_for_funding) in rows:
         held_h = (now - (etime or now)) / 3_600_000
         tag = " [paper]" if paper else ""
+        if hold_for_funding:
+            tag += " 💰carry"
         notional = notional or 1000
         fees = notional * ROUND_TRIP_FEE
         funding = estimate_funding_pnl(
@@ -299,6 +333,9 @@ def cmd_positions(chat_id: str, _arg: str):
             f"    funding=${funding:+.2f}  fees=${fees:.2f}  held={held_h:.1f}h{est_net_str}\n"
             f"    target=${sym_target:.2f} net | need gross≥${sym_target - funding + fees:.2f}"
         )
+    if gate_lines:
+        lines.append("")
+        lines.extend(gate_lines)
     send(chat_id, "\n".join(lines))
 
 
