@@ -29,8 +29,8 @@ def load_api_keys() -> dict:
         "aster_api_key": "ASTER_API_KEY",           # agent wallet address (0x...)
         "aster_api_secret": "ASTER_API_SECRET",      # agent private key (0x...)
         "aster_wallet_address": "ASTER_WALLET_ADDRESS",  # main wallet / user (0x...)
-        "hl_private_key": "HL_PRIVATE_KEY",          # Hyperliquid wallet private key (0x...)
-        "hl_wallet_address": "HL_WALLET_ADDRESS",    # Hyperliquid wallet address (0x...)
+        "hl_private_key": "HL_PRIVATE_KEY",          # Hyperliquid API wallet private key (0x...)
+        "hl_wallet_address": "HL_WALLET_ADDRESS",    # Hyperliquid API wallet address (0x...)
     }
 
     keys = {}
@@ -46,6 +46,14 @@ def load_api_keys() -> dict:
             f"Missing required environment variables: {', '.join(missing)}. "
             f"Set them before running the live monitor."
         )
+
+    # HL_ACCOUNT_ADDRESS = the funded master wallet. API wallet signs orders
+    # that execute on the master, but position/state queries must target the
+    # master. Falls back to HL_WALLET_ADDRESS for backward compatibility
+    # (single-key setups where the signer IS the funded account).
+    keys["hl_account_address"] = (
+        os.environ.get("HL_ACCOUNT_ADDRESS") or keys["hl_wallet_address"]
+    )
 
     # Derive the signer address from the Aster private key
     acct = Account.from_key(keys["aster_api_secret"])

@@ -72,8 +72,9 @@ def main():
     keys = load_api_keys()
     priv = keys["hl_private_key"]
     derived = Account.from_key(priv).address
-    print(f"HL_PRIVATE_KEY derives: {derived}")
-    print(f"HL_WALLET_ADDRESS env:  {keys['hl_wallet_address']}")
+    print(f"HL_PRIVATE_KEY derives:  {derived}")
+    print(f"HL_WALLET_ADDRESS (agent): {keys['hl_wallet_address']}")
+    print(f"HL_ACCOUNT_ADDRESS (master): {keys['hl_account_address']}")
 
     order = {"a": 110061, "b": False, "p": "245.50", "s": "0.40",
              "r": False, "t": {"limit": {"tif": "Alo"}}}

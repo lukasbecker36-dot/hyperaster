@@ -121,7 +121,7 @@ async def reconcile_symbols(api_keys: dict) -> list[str]:
                 HYPERLIQUID_API,
                 json={
                     "type": "clearinghouseState",
-                    "user": api_keys["hl_wallet_address"],
+                    "user": api_keys["hl_account_address"],
                     "dex": "xyz",
                 },
                 timeout=aiohttp.ClientTimeout(total=10),

@@ -1006,7 +1006,7 @@ class ExchangeClient:
                 HYPERLIQUID_API,
                 json={
                     "type": "orderStatus",
-                    "user": self.api_keys["hl_wallet_address"],
+                    "user": self.api_keys["hl_account_address"],
                     "oid": int(order_id),
                 },
                 timeout=self.timeout,
@@ -1072,7 +1072,7 @@ class ExchangeClient:
                 HYPERLIQUID_API,
                 json={
                     "type": "clearinghouseState",
-                    "user": self.api_keys["hl_wallet_address"],
+                    "user": self.api_keys["hl_account_address"],
                     "dex": "xyz",
                 },
                 timeout=self.timeout,

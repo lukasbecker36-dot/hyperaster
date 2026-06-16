@@ -224,6 +224,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 "aster_api_key": "", "aster_api_secret": "",
                 "aster_wallet_address": "", "aster_signer_address": "",
                 "hl_private_key": "", "hl_wallet_address": "",
+                "hl_account_address": "",
             }
         else:
             log.error(f"Cannot start live: {e}")
