@@ -369,6 +369,79 @@ class PositionManager:
             f"HL @ {pos.hl_entry_price:.2f} | Aster @ {aster_fill_price:.2f}"
         )
 
+    def start_exiting_hl_maker(
+        self, symbol: str, hl_maker_order_id: str, exit_baseline_szi: float,
+        hl_ref_price: float, exit_spread_bps: float,
+    ):
+        """Begin a maker-first carry exit: HL post-only close order resting,
+        nothing closed yet. poll_hl_maker_exit advances it as the HL leg fills
+        and the Aster taker closes each increment. Reuses hl_baseline_szi to
+        snapshot the szi at exit-start and aster_hedged_qty to track how much of
+        the Aster leg has been closed back."""
+        pos = self.positions.get(symbol)
+        if not pos:
+            return
+        pos.status = "exiting"
+        pos.exit_time = now_ms()
+        pos.hl_exit_order_id = hl_maker_order_id
+        pos.aster_exit_order_id = ""
+        pos.hl_exit_price = hl_ref_price
+        pos.exit_spread_bps = exit_spread_bps
+        pos.hl_baseline_szi = exit_baseline_szi
+        pos.aster_hedged_qty = 0.0
+        conn = get_connection()
+        conn.execute(
+            "UPDATE positions SET status='exiting', exit_time=?, "
+            "hl_exit_order_id=?, aster_exit_order_id='', hl_exit_price=?, "
+            "exit_spread_bps=?, hl_baseline_szi=?, aster_hedged_qty=0 WHERE id=?",
+            (pos.exit_time, hl_maker_order_id, hl_ref_price, exit_spread_bps,
+             exit_baseline_szi, pos.id),
+        )
+        conn.commit()
+        conn.close()
+        log.info(
+            f"Position #{pos.id} EXITING (HL maker): {symbol} | "
+            f"HL maker resting {hl_maker_order_id} @ {hl_ref_price:.2f} | "
+            f"spread={exit_spread_bps:.1f}bps"
+        )
+
+    def record_hl_maker_exit_progress(
+        self, symbol: str, aster_closed: float, aster_avg_price: float,
+        hl_avg_price: float | None = None,
+    ):
+        """Persist running close/hedge state for an in-flight maker-first exit."""
+        pos = self.positions.get(symbol)
+        if not pos:
+            return
+        pos.aster_hedged_qty = aster_closed
+        if aster_avg_price > 0:
+            pos.aster_exit_price = aster_avg_price
+        if hl_avg_price and hl_avg_price > 0:
+            pos.hl_exit_price = hl_avg_price
+        conn = get_connection()
+        conn.execute(
+            "UPDATE positions SET aster_hedged_qty=?, aster_exit_price=?, "
+            "hl_exit_price=? WHERE id=?",
+            (aster_closed, pos.aster_exit_price, pos.hl_exit_price, pos.id),
+        )
+        conn.commit()
+        conn.close()
+
+    def confirm_hl_maker_exit(
+        self, symbol: str, final_qty: float, hl_exit_price: float,
+        aster_exit_price: float, exit_reason: str,
+    ):
+        """Finalize a maker-first carry exit: set the close prices/qty, compute
+        P&L, and close the position. Mirrors confirm_aster_exit's accounting."""
+        pos = self.positions.get(symbol)
+        if not pos:
+            return
+        if final_qty > 0:
+            pos.qty = final_qty
+        if hl_exit_price > 0:
+            pos.hl_exit_price = hl_exit_price
+        self.confirm_aster_exit(symbol, aster_exit_price, exit_reason)
+
     def start_exiting(
         self, symbol: str, hl_exit_order_id: str, aster_exit_order_id: str,
         hl_exit_price: float, exit_spread_bps: float,

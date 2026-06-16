@@ -117,6 +117,10 @@ FUNDING_ADVERSE_STOP_USD = 25.0       # bail a funding hold if executable loss e
 # portion is kept, already hedged on Aster).
 MAKER_ENTRY_TIMEOUT_SEC = 300         # 5 min to fill the resting HL maker, else give up the rest
 MAKER_REPRICE_TICK_FRAC = 0.5         # reprice the HL maker if it drifts > this×tick from the touch
+# Carry exits also run maker-first (HL post-only sell/buy, Aster IOC taker hedge).
+# If the resting HL exit maker hasn't fully filled within this long, cross the
+# unfilled remainder as a taker to complete the exit (we asked to get out).
+MAKER_EXIT_TIMEOUT_SEC = 300          # 5 min to fill the resting HL exit maker, else taker-complete
 
 # A manual /enter or /close can carry a basis target (bps) — the trade only
 # executes once the executable basis (from bid/ask, in the position's favour) is

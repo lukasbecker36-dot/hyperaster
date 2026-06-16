@@ -31,7 +31,7 @@ from config import (
     MAX_PRICE_RATIO_DIVERGENCE, BLOCKED_SYMBOLS, MIN_EXECUTABLE_PREMIUM_BPS,
     ENTRY_CONFIRM_TICKS, ENTRY_COST_MARGIN_BPS, ROUND_TRIP_FEE,
     EXIT_TARGET_NET_USD, EXIT_TARGET_NET_USD_BY_SYMBOL,
-    MAKER_ENTRY_TIMEOUT_SEC, MAKER_REPRICE_TICK_FRAC,
+    MAKER_ENTRY_TIMEOUT_SEC, MAKER_EXIT_TIMEOUT_SEC, MAKER_REPRICE_TICK_FRAC,
     aster_symbol_for,
 )
 from auth import now_ms
@@ -903,6 +903,268 @@ class Executor:
             log.info(f"{symbol}: repriced HL maker -> {alo.order_id} @ {touch:.2f} (rem {remainder})")
         else:
             log.warning(f"{symbol}: HL maker reprice failed ({alo.error})")
+
+    # ── Maker-first carry exit (HL post-only maker, Aster IOC taker hedge) ──
+
+    # User-initiated carry exits run maker-first for a good basis. The automated
+    # safety bail (funding_stop) is a loss-cut and must cross immediately — never
+    # rest a patient maker while a position bleeds.
+    PATIENT_EXIT_REASONS = {"manual", "manual_target"}
+
+    async def exit_position(
+        self, symbol: str, aster_book: OrderBook, hl_book: OrderBook, reason: str,
+    ) -> bool:
+        """Dispatch an exit. A user-initiated carry close (hold_for_funding, manual
+        reason) goes maker-first on HL with an Aster taker hedge — same patient
+        convention as its entry, so the executable exit basis matches what
+        /positions and /close display. Safety stops and everything else use the
+        legacy taker-first try_exit for an immediate fill."""
+        pos = self.pm.get(symbol)
+        if pos and pos.hold_for_funding and reason in self.PATIENT_EXIT_REASONS:
+            ok = await self.force_exit_maker(symbol, reason)
+            if ok:
+                return True
+            # Maker exit couldn't even be placed — fall back to taker so we're
+            # never stuck unable to close a carry hold.
+            log.warning(f"{symbol}: maker exit unavailable — falling back to taker exit")
+        return await self.try_exit(symbol, aster_book, hl_book, reason)
+
+    async def force_exit_maker(self, symbol: str, reason: str) -> bool:
+        """Close a carry hold maker-first: rest a post-only HL order on the close
+        side (sell@ask for a long-HL leg, buy@bid for a short-HL leg) and let
+        poll_hl_maker_exit cross Aster (IOC taker) to close each HL fill. Returns
+        False if the HL maker can't be placed (caller falls back to taker)."""
+        pos = self.pm.get(symbol)
+        if not pos or pos.status != "open":
+            return False
+        try:
+            aster_book, hl_book = await self.client.get_both_books(symbol)
+        except Exception as e:
+            log.error(f"{symbol}: maker-exit book fetch failed ({e})")
+            return False
+        if aster_book.bid <= 0 or hl_book.bid <= 0:
+            log.warning(f"{symbol}: empty book on maker exit")
+            return False
+        mid = (aster_book.mid + hl_book.mid) / 2
+        exit_spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000 if mid > 0 else 0.0
+
+        closing_long = pos.direction == "long_hl_short_aster"  # long HL leg
+        if closing_long:
+            hl_side, hl_ref = "sell", hl_book.ask    # sell the long HL leg, maker @ ask
+            aster_fill = aster_book.ask              # buy back the short Aster leg @ ask
+        else:
+            hl_side, hl_ref = "buy", hl_book.bid     # buy back the short HL leg, maker @ bid
+            aster_fill = aster_book.bid              # sell the long Aster leg @ bid
+
+        log.warning(
+            f"MAKER EXIT {symbol} ({reason}): {pos.direction} | qty={pos.qty} | "
+            f"HL {hl_side} maker @ {hl_ref:.2f}"
+        )
+
+        if self.paper_mode:
+            self.pm.start_exiting_hl_maker(symbol, "PAPER", 0.0, hl_ref, exit_spread_bps)
+            self.pm.confirm_hl_maker_exit(symbol, pos.qty, hl_ref, aster_fill, reason)
+            log.info(f"[PAPER] MAKER EXIT {symbol} ({reason}) spread={exit_spread_bps:.1f}bps")
+            return True
+
+        try:
+            pre = await self.client.get_hl_position(symbol)
+            baseline_szi = float(pre.get("szi", 0) or 0)
+        except Exception as e:
+            log.error(f"{symbol}: HL exit pre-snapshot failed ({e})")
+            return False
+
+        alo = await self.client.place_hl_alo(symbol, hl_side, pos.qty, hl_ref)
+        if not alo.success:
+            log.error(f"{symbol}: HL exit maker not placed ({alo.error})")
+            return False
+
+        pos.exit_reason = reason
+        self.pm.start_exiting_hl_maker(symbol, alo.order_id, baseline_szi, hl_ref, exit_spread_bps)
+        return True
+
+    async def poll_hl_maker_exit(self, symbol: str):
+        """Per-tick driver for a maker-first carry exit. Detects HL closes via the
+        position szi delta, closes each new increment on Aster with an IOC taker,
+        reprices the resting HL maker if the touch moves (before any fill), and
+        finalises on full close or by taker-completing the remainder at timeout.
+        Only ever closes as much Aster as HL has closed — no naked exposure."""
+        pos = self.pm.get(symbol)
+        if (not pos or pos.status != "exiting" or not pos.hold_for_funding
+                or pos.aster_exit_order_id):
+            return
+
+        closing_long = pos.direction == "long_hl_short_aster"
+        hl_side = "sell" if closing_long else "buy"
+        aster_hedge_side = "buy" if closing_long else "sell"  # close the Aster leg
+
+        try:
+            hlp = await self.client.get_hl_position(symbol)
+            current_szi = float(hlp.get("szi", 0) or 0)
+        except Exception as e:
+            log.warning(f"{symbol}: maker exit poll szi fetch failed ({e})")
+            return
+        # Closing a long HL leg SELLS (szi falls from baseline); closing a short
+        # HL leg BUYS (szi rises toward baseline). Both give a positive closed qty.
+        signed = (pos.hl_baseline_szi - current_szi) if closing_long else (current_szi - pos.hl_baseline_szi)
+        hl_closed = max(0.0, signed)
+
+        # Close any newly-filled HL qty on Aster with an IOC taker.
+        new_fill = hl_closed - pos.aster_hedged_qty
+        lot = self.client.snap_aster_qty(symbol, new_fill) if new_fill > 0 else 0.0
+        if lot > 0:
+            try:
+                aster_book = await self.client._get_aster_book(symbol)
+            except Exception:
+                aster_book = None
+            if aster_book and aster_book.bid > 0:
+                touch = aster_book.ask if aster_hedge_side == "buy" else aster_book.bid
+                hedge_intent = record_intent(
+                    symbol=symbol, venue="aster", action="maker_exit_hedge_ioc",
+                    direction=pos.direction, side=aster_hedge_side, qty=lot,
+                    ref_price=touch, position_id=pos.id, paper=False,
+                )
+                res = await self.client.place_aster_ioc(symbol, aster_hedge_side, lot, touch)
+                if res.success and res.filled_qty > 0:
+                    complete_intent(hedge_intent, "filled",
+                                    notes=f"qty={res.filled_qty} px={res.fill_price}",
+                                    position_id=pos.id)
+                    new_closed = pos.aster_hedged_qty + res.filled_qty
+                    old = pos.aster_hedged_qty
+                    a_avg = ((pos.aster_exit_price * old + res.fill_price * res.filled_qty)
+                             / new_closed) if new_closed > 0 else res.fill_price
+                    self.pm.record_hl_maker_exit_progress(symbol, new_closed, a_avg)
+                    self.pm.log_trade(pos.id, "aster", aster_hedge_side, "ioc_close",
+                                      res.order_id, res.filled_qty, res.fill_price,
+                                      notes="maker-exit close")
+                    log.warning(f"{symbol}: closed {res.filled_qty} on Aster @ {res.fill_price:.2f} "
+                                f"({new_closed}/{pos.qty})")
+                else:
+                    complete_intent(hedge_intent, "rejected",
+                                    notes=(res.error or "no_fill")[:120], position_id=pos.id)
+                    log.error(f"{symbol}: Aster exit IOC failed ({res.error}) — will retry next tick")
+                    return
+
+        # Fully closed and hedged → finalise.
+        if hl_closed >= pos.qty * 0.999 and pos.aster_hedged_qty >= hl_closed * 0.999:
+            if pos.hl_exit_order_id and pos.hl_exit_order_id != "PAPER":
+                await self.client.cancel_hl_order(symbol, pos.hl_exit_order_id)
+            self.pm.confirm_hl_maker_exit(
+                symbol, hl_closed, pos.hl_exit_price, pos.aster_exit_price,
+                pos.exit_reason or "manual")
+            return
+
+        elapsed = (now_ms() - pos.exit_time) / 1000
+        if elapsed >= MAKER_EXIT_TIMEOUT_SEC:
+            await self._complete_maker_exit_taker(pos, closing_long, hl_side, aster_hedge_side)
+            return
+
+        # Reprice the resting exit maker if the touch drifted — only before any
+        # fill, so the recorded exit price stays clean.
+        if hl_closed <= 0:
+            await self._reprice_hl_maker_exit(pos, hl_side)
+
+    async def _complete_maker_exit_taker(self, pos, closing_long, hl_side, aster_hedge_side):
+        """Exit maker timed out: cancel it, cross the unclosed HL remainder as a
+        taker, close the matching Aster, and finalise. We asked to get out, so we
+        complete the exit rather than re-opening the carry hold."""
+        symbol = pos.symbol
+        if pos.hl_exit_order_id and pos.hl_exit_order_id != "PAPER":
+            await self.client.cancel_hl_order(symbol, pos.hl_exit_order_id)
+        await asyncio.sleep(0.5)
+        try:
+            hlp = await self.client.get_hl_position(symbol)
+            current_szi = float(hlp.get("szi", 0) or 0)
+            signed = (pos.hl_baseline_szi - current_szi) if closing_long else (current_szi - pos.hl_baseline_szi)
+            hl_closed = max(0.0, signed)
+        except Exception:
+            hl_closed = pos.aster_hedged_qty
+
+        hl_exit_px = pos.hl_exit_price
+        remaining_hl = self.client.snap_aster_qty(symbol, pos.qty - hl_closed)
+        if remaining_hl > 0:
+            try:
+                hl_book = await self.client._get_hl_book(symbol)
+                ref = hl_book.bid if hl_side == "sell" else hl_book.ask
+                res = await self.client.place_hl_ioc(symbol, hl_side, remaining_hl, ref)
+                if res.success and res.filled_qty > 0:
+                    tot = hl_closed + res.filled_qty
+                    hl_exit_px = ((pos.hl_exit_price * hl_closed + res.fill_price * res.filled_qty)
+                                  / tot) if tot > 0 else pos.hl_exit_price
+                    hl_closed = tot
+                    self.pm.log_trade(pos.id, "hl", hl_side, "ioc_close",
+                                      res.order_id, res.filled_qty, res.fill_price,
+                                      notes="maker-exit taker complete")
+                else:
+                    log.critical(f"{symbol}: maker-exit taker-complete HL FAILED ({res.error}) — CHECK MANUALLY")
+            except Exception as e:
+                log.critical(f"{symbol}: maker-exit taker-complete errored ({e}) — CHECK MANUALLY")
+
+        # Close any Aster residual to match what HL has now closed.
+        residual = self.client.snap_aster_qty(symbol, hl_closed - pos.aster_hedged_qty)
+        if residual > 0:
+            try:
+                aster_book = await self.client._get_aster_book(symbol)
+                touch = aster_book.ask if aster_hedge_side == "buy" else aster_book.bid
+                res = await self.client.place_aster_ioc(symbol, aster_hedge_side, residual, touch)
+                if res.success and res.filled_qty > 0:
+                    new_closed = pos.aster_hedged_qty + res.filled_qty
+                    old = pos.aster_hedged_qty
+                    a_avg = ((pos.aster_exit_price * old + res.fill_price * res.filled_qty)
+                             / new_closed) if new_closed > 0 else res.fill_price
+                    self.pm.record_hl_maker_exit_progress(symbol, new_closed, a_avg)
+                    self.pm.log_trade(pos.id, "aster", aster_hedge_side, "ioc_close",
+                                      res.order_id, res.filled_qty, res.fill_price,
+                                      notes="maker-exit residual close")
+            except Exception as e:
+                log.critical(f"{symbol}: maker-exit residual Aster close failed ({e}) — CHECK MANUALLY")
+
+        final_qty = min(hl_closed, pos.aster_hedged_qty)
+        naked = abs(hl_closed - pos.aster_hedged_qty)
+        if naked > final_qty * 0.001 + 1e-9:
+            log.critical(
+                f"{symbol}: maker exit left {naked:.4f} unhedged "
+                f"(HL closed {hl_closed}, Aster closed {pos.aster_hedged_qty}) — CHECK MANUALLY"
+            )
+        if final_qty <= 0:
+            log.critical(f"{symbol}: maker exit timed out with nothing closed — marking error")
+            self.pm.mark_error(symbol, "maker_exit_nothing_closed")
+            return
+        log.warning(f"{symbol}: maker exit taker-completed {final_qty}/{pos.qty}")
+        self.pm.confirm_hl_maker_exit(
+            symbol, final_qty, hl_exit_px, pos.aster_exit_price,
+            (pos.exit_reason or "manual") + "_taker")
+
+    async def _reprice_hl_maker_exit(self, pos, hl_side: str):
+        """Cancel + repost the resting HL exit maker at the new touch if it has
+        drifted more than a fraction of a tick (only called before any fill)."""
+        symbol = pos.symbol
+        try:
+            _, hl_book = await self.client.get_both_books(symbol)
+        except Exception:
+            return
+        touch = hl_book.ask if hl_side == "sell" else hl_book.bid
+        if touch <= 0:
+            return
+        spec = self.client.hl_specs.get(symbol)
+        tick = 10 ** (-spec.price_precision) if spec else 0.01
+        if abs(touch - pos.hl_exit_price) < tick * MAKER_REPRICE_TICK_FRAC:
+            return
+        if pos.hl_exit_order_id:
+            await self.client.cancel_hl_order(symbol, pos.hl_exit_order_id)
+        alo = await self.client.place_hl_alo(symbol, hl_side, pos.qty, touch)
+        if alo.success:
+            pos.hl_exit_order_id = alo.order_id
+            pos.hl_exit_price = touch
+            from database import get_connection
+            conn = get_connection()
+            conn.execute("UPDATE positions SET hl_exit_order_id=?, hl_exit_price=? WHERE id=?",
+                         (alo.order_id, touch, pos.id))
+            conn.commit()
+            conn.close()
+            log.info(f"{symbol}: repriced HL exit maker -> {alo.order_id} @ {touch:.2f}")
+        else:
+            log.warning(f"{symbol}: HL exit maker reprice failed ({alo.error})")
 
     # ── Poll Aster maker fill (entering / exiting states) ──
 

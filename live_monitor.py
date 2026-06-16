@@ -450,7 +450,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                                 f"<0 — holding | held={elapsed_hours:.1f}h"
                             )
                 if should_exit:
-                    await executor.try_exit(symbol, aster_book, hl_book, reason)
+                    await executor.exit_position(symbol, aster_book, hl_book, reason)
             elif not pos:
                 if runtime_flags["auto_entry"] and pm.active_count < MAX_CONCURRENT_POSITIONS:
                     await executor.try_entry(symbol, aster_book, hl_book)
@@ -524,7 +524,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     else:
                         pending_exits.pop(symbol, None)
                         aster_book, hl_book = await client.get_both_books(symbol)
-                        await executor.try_exit(symbol, aster_book, hl_book, "manual")
+                        await executor.exit_position(symbol, aster_book, hl_book, "manual")
                         send_alert(f"/close {symbol}: exit submitted")
                 elif action == "cancel":
                     had = pending_entries.pop(symbol, None) or pending_exits.pop(symbol, None)
@@ -585,7 +585,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 continue
             if basis >= pending_exits[symbol]["target_bps"]:
                 pending_exits.pop(symbol, None)
-                await executor.try_exit(symbol, aster_book, hl_book, "manual_target")
+                await executor.exit_position(symbol, aster_book, hl_book, "manual_target")
                 send_alert(f"/close {symbol}: exit basis {basis:.0f}bps ≥ target — submitted")
 
     try:
@@ -610,12 +610,19 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     # Maker-first carry entries: HL post-only resting, hedge on fill.
                     hl_makers = [s for s, p in pm.positions.items()
                                  if p.status == "entering" and p.entry_maker_venue == "hl"]
-                    # Legacy Aster-GTX flow: convergence entries + ALL exits
-                    # (carry exits still use try_exit in this increment).
+                    # Maker-first carry exits: HL post-only close resting, Aster
+                    # taker closes each HL fill. Distinguished from a taker-fallback
+                    # exit (which rests an Aster GTX) by the empty aster_exit_order_id.
+                    hl_exit_makers = [s for s, p in pm.positions.items()
+                                      if p.status == "exiting" and p.hold_for_funding
+                                      and not p.aster_exit_order_id]
+                    # Legacy Aster-GTX flow: convergence entries + any exit with a
+                    # resting Aster GTX (convergence exits + carry taker fallbacks).
                     aster_makers = [s for s, p in pm.positions.items()
-                                    if p.status == "exiting"
+                                    if (p.status == "exiting" and p.aster_exit_order_id)
                                     or (p.status == "entering" and p.entry_maker_venue != "hl")]
                     tasks = ([executor.poll_hl_maker(s) for s in hl_makers]
+                             + [executor.poll_hl_maker_exit(s) for s in hl_exit_makers]
                              + [executor.poll_aster_maker(s) for s in aster_makers])
                     if tasks:
                         await asyncio.gather(*tasks)
