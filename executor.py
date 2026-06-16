@@ -519,6 +519,10 @@ class Executor:
             )
 
         # ── Live placement (same leg-risk flow as try_entry) ──
+        # Set 5x isolated leverage/margin on both venues before the first order
+        # for this symbol (idempotent — no-op once done).
+        await self.client.ensure_perp_margin(symbol)
+
         try:
             pre_pos = await self.client.get_hl_position(symbol)
             baseline_szi = float(pre_pos.get("szi", 0) or 0)

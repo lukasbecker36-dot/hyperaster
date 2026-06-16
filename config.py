@@ -15,6 +15,14 @@ ASTER_ORDER_URL = f"{ASTER_BASE}/fapi/v3/order"
 ASTER_OPEN_ORDERS_URL = f"{ASTER_BASE}/fapi/v3/openOrders"
 ASTER_POSITION_URL = f"{ASTER_BASE}/fapi/v3/positionRisk"
 ASTER_EXCHANGE_INFO_URL = f"{ASTER_BASE}/fapi/v3/exchangeInfo"
+ASTER_LEVERAGE_URL = f"{ASTER_BASE}/fapi/v1/leverage"
+ASTER_MARGIN_TYPE_URL = f"{ASTER_BASE}/fapi/v1/marginType"
+
+# ── Leverage & margin ──
+# Applied per symbol on the first live entry (HL via updateLeverage isolated,
+# Aster via /leverage + /marginType). HL HIP-3 markets are isolated-only.
+LEVERAGE = 5
+ASTER_MARGIN_TYPE = "ISOLATED"        # ISOLATED | CROSSED
 
 # ── Fee schedule ──
 # Hyperliquid XYZ: base taker 4.5bps / maker 1.5bps
@@ -102,6 +110,13 @@ MAX_FUNDING_DRAG_USD = 2.0
 # apply — a longer max-hold timeout and a hard mark-to-market stop.
 FUNDING_MAX_HOLD_HOURS = 168          # 1 week safety timeout for a funding hold
 FUNDING_ADVERSE_STOP_USD = 25.0       # bail a funding hold if executable loss exceeds this
+
+# A manual /enter or /close can carry a basis target (bps) — the trade only
+# executes once the executable basis (from bid/ask, in the position's favour) is
+# at or better than the target, so you don't cross at a bad level. A gated entry
+# that never reaches its target expires after this long; gated exits never expire
+# (a safety stop closes the position if the basis stays bad).
+MANUAL_ENTRY_GATE_TIMEOUT_MIN = 120
 
 # ── Position sizing ──
 NOTIONAL_PER_LEG = 1000          # USD per leg

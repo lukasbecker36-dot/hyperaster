@@ -39,7 +39,8 @@ from config import (
     BLOCKED_SYMBOLS, NON_EQUITY_SYMBOLS, ENTRY_CONFIRM_TICKS, ADVERSE_STOP_BPS,
     ROUND_TRIP_FEE, NOTIONAL_PER_LEG, EXIT_TARGET_NET_USD,
     EXIT_TARGET_NET_USD_BY_SYMBOL, MAX_FUNDING_DRAG_USD,
-    FUNDING_MAX_HOLD_HOURS, FUNDING_ADVERSE_STOP_USD, aster_symbol_for,
+    FUNDING_MAX_HOLD_HOURS, FUNDING_ADVERSE_STOP_USD,
+    MANUAL_ENTRY_GATE_TIMEOUT_MIN, aster_symbol_for,
 )
 
 SLOW_SCAN_INTERVAL_SECONDS = 300   # re-rank all symbols every 5 min
@@ -118,6 +119,26 @@ def _auto_entry_enabled() -> bool:
         return True
     except Exception:
         return True
+
+
+def _executable_basis_bps(direction: str, action: str, aster_book, hl_book):
+    """Executable basis (bps) in the position's FAVOUR for the given action.
+
+    Computed from the prices you'd actually cross — the touch bid/ask, not mids —
+    so a basis target genuinely caps your fill level. Higher = better:
+
+      enter long_hl_short_aster / exit long_aster_short_hl  → buy HL@ask, sell Aster@bid
+          = (aster_bid - hl_ask) / mid
+      enter long_aster_short_hl / exit long_hl_short_aster  → buy Aster@ask, sell HL@bid
+          = (hl_bid - aster_ask) / mid
+    """
+    mid = (aster_book.mid + hl_book.mid) / 2
+    if mid <= 0:
+        return None
+    buy_hl_leg = (direction == "long_hl_short_aster") == (action == "enter")
+    if buy_hl_leg:
+        return (aster_book.bid - hl_book.ask) / mid * 10000
+    return (hl_book.bid - aster_book.ask) / mid * 10000
 
 def _write_latest_spreads(spreads: dict[str, tuple[float, str, float]],
                           est_net: dict[str, float] | None = None):
@@ -252,6 +273,11 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     latest_est_net: dict[str, float] = {}
     # Runtime flags refreshed once per tick from their control files.
     runtime_flags = {"auto_entry": True}
+    # Basis-gated manual orders waiting for a good fill level.
+    #   pending_entries: symbol -> {direction, notional, target_bps, expires_ms}
+    #   pending_exits:   symbol -> {target_bps}
+    pending_entries: dict[str, dict] = {}
+    pending_exits: dict[str, dict] = {}
     # top N candidates polled every fast tick
     candidates: list[str] = []
 
@@ -427,27 +453,101 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 continue
             action = cmd.get("action")
             symbol = cmd.get("symbol", "")
+            target = cmd.get("target_bps")  # None = execute immediately (market)
             try:
                 if action == "enter":
                     direction = cmd.get("direction", "")
                     notional = float(cmd.get("notional", 0) or 0)
-                    ok, msg = await executor.force_entry(
-                        symbol, direction, notional, hold_for_funding=True
-                    )
-                    send_alert(f"/enter {symbol}: {'OK' if ok else 'FAILED'} — {msg}")
+                    if target is not None:
+                        # Basis-gated: hold until the executable entry basis clears
+                        # the target instead of crossing now.
+                        pending_entries[symbol] = {
+                            "direction": direction, "notional": notional,
+                            "target_bps": float(target),
+                            "expires_ms": now_ms() + MANUAL_ENTRY_GATE_TIMEOUT_MIN * 60_000,
+                        }
+                        send_alert(
+                            f"/enter {symbol}: waiting for entry basis ≥ {float(target):.0f}bps "
+                            f"(expires {MANUAL_ENTRY_GATE_TIMEOUT_MIN}min)"
+                        )
+                    else:
+                        ok, msg = await executor.force_entry(
+                            symbol, direction, notional, hold_for_funding=True
+                        )
+                        send_alert(f"/enter {symbol}: {'OK' if ok else 'FAILED'} — {msg}")
                 elif action == "close":
                     pos = pm.get(symbol)
                     if not pos:
+                        pending_exits.pop(symbol, None)
                         send_alert(f"/close {symbol}: no open position")
                         continue
-                    aster_book, hl_book = await client.get_both_books(symbol)
-                    await executor.try_exit(symbol, aster_book, hl_book, "manual")
-                    send_alert(f"/close {symbol}: exit submitted")
+                    if target is not None:
+                        pending_exits[symbol] = {"target_bps": float(target)}
+                        send_alert(
+                            f"/close {symbol}: waiting for exit basis ≥ {float(target):.0f}bps "
+                            f"(safety stops still apply)"
+                        )
+                    else:
+                        pending_exits.pop(symbol, None)
+                        aster_book, hl_book = await client.get_both_books(symbol)
+                        await executor.try_exit(symbol, aster_book, hl_book, "manual")
+                        send_alert(f"/close {symbol}: exit submitted")
+                elif action == "cancel":
+                    had = pending_entries.pop(symbol, None) or pending_exits.pop(symbol, None)
+                    send_alert(f"/cancel {symbol}: {'gate cleared' if had else 'nothing pending'}")
                 else:
                     log.warning(f"manual cmd: unknown action {action!r}")
             except Exception as e:
                 log.error(f"manual cmd {action} {symbol} failed: {e}")
                 send_alert(f"/{action} {symbol}: ERROR {e}")
+
+    async def evaluate_gated_orders():
+        """Fire basis-gated manual entries/exits once their target level is met."""
+        # Entries: execute when the executable entry basis clears the target.
+        for symbol in list(pending_entries):
+            req = pending_entries[symbol]
+            if pm.has_position(symbol):
+                pending_entries.pop(symbol, None)
+                continue
+            if now_ms() >= req["expires_ms"]:
+                pending_entries.pop(symbol, None)
+                send_alert(f"/enter {symbol}: gate expired (basis never reached "
+                           f"{req['target_bps']:.0f}bps) — not entered")
+                continue
+            try:
+                aster_book, hl_book = await client.get_both_books(symbol)
+            except Exception:
+                continue
+            basis = _executable_basis_bps(req["direction"], "enter", aster_book, hl_book)
+            if basis is None:
+                continue
+            if basis >= req["target_bps"]:
+                pending_entries.pop(symbol, None)
+                ok, msg = await executor.force_entry(
+                    symbol, req["direction"], req["notional"], hold_for_funding=True
+                )
+                send_alert(f"/enter {symbol}: basis {basis:.0f}bps ≥ target — "
+                           f"{'OK' if ok else 'FAILED'} — {msg}")
+
+        # Exits: close when the executable exit basis clears the target. No expiry —
+        # the position's own safety stops close it if the basis stays unfavourable.
+        for symbol in list(pending_exits):
+            pos = pm.get(symbol)
+            if not pos or pos.status != "open":
+                if not pos:
+                    pending_exits.pop(symbol, None)
+                continue
+            try:
+                aster_book, hl_book = await client.get_both_books(symbol)
+            except Exception:
+                continue
+            basis = _executable_basis_bps(pos.direction, "exit", aster_book, hl_book)
+            if basis is None:
+                continue
+            if basis >= pending_exits[symbol]["target_bps"]:
+                pending_exits.pop(symbol, None)
+                await executor.try_exit(symbol, aster_book, hl_book, "manual_target")
+                send_alert(f"/close {symbol}: exit basis {basis:.0f}bps ≥ target — submitted")
 
     try:
         while True:
@@ -462,6 +562,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 state = "ENABLED" if runtime_flags["auto_entry"] else "DISABLED"
                 log.warning(f"Auto-entry {state} (runtime flag changed)")
             await process_manual_commands()
+            await evaluate_gated_orders()
 
             # ── 1. Poll Aster maker orders (entering/exiting) ──
             if now - last_aster_poll >= ASTER_FILL_POLL_SECONDS * 1000:

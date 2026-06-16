@@ -75,6 +75,8 @@ _PENDING: dict[str, tuple[str, float]] = {}
 # action-name confirm flow can't round-trip.
 _PENDING_ENTER: dict[str, tuple[dict, float]] = {}
 _CONFIRM_TTL = 60  # seconds
+# Monotonic counter so rapid manual-command enqueues get unique filenames.
+_ENQUEUE_SEQ = 0
 
 
 # ── Telegram I/O ──
@@ -508,9 +510,15 @@ _DIR_ALIASES = {
 
 
 def _enqueue_manual(cmd: dict):
-    """Atomically drop a manual command file for the monitor to consume."""
+    """Atomically drop a manual command file for the monitor to consume.
+
+    Uses a nanosecond timestamp + pid so rapid enqueues can't collide on the
+    same filename (which would silently drop a command).
+    """
     MANUAL_CMD_DIR.mkdir(parents=True, exist_ok=True)
-    cid = str(int(time.time() * 1000))
+    global _ENQUEUE_SEQ
+    _ENQUEUE_SEQ += 1
+    cid = f"{time.time_ns()}_{os.getpid()}_{_ENQUEUE_SEQ}"
     dest = MANUAL_CMD_DIR / f"{cid}.json"
     tmp = MANUAL_CMD_DIR / f"{cid}.json.tmp"
     tmp.write_text(json.dumps(cmd))
@@ -540,20 +548,24 @@ def cmd_autoentry(chat_id: str, arg: str):
 def cmd_enter(chat_id: str, arg: str):
     """Manually open ONE delta-neutral funding-carry hold via the monitor.
 
-    Usage: /enter SYMBOL DIRECTION NOTIONAL
+    Usage: /enter SYMBOL DIRECTION NOTIONAL [BASIS_TARGET_BPS]
       DIRECTION: long_hl_short_aster | long_aster_short_hl
                  (aliases: buy_hl / buy_aster / L-HL/S-AST / L-AST/S-HL)
       NOTIONAL : USD per leg
+      BASIS_TARGET_BPS (optional): only fill once the executable entry basis is
+                 at or better than this (bps, in your favour). Omit = enter now.
 
     Held for funding carry — the bot won't close it on basis convergence, only
     on safety stops (mark-to-market loss / 1-week timeout) or manual /close.
+    Leverage 5x + isolated margin are applied automatically on entry.
     In live mode this places REAL orders and requires a typed YES.
     """
     toks = arg.split()
-    if len(toks) != 3:
+    if len(toks) not in (3, 4):
         send(chat_id,
-             "Usage: /enter SYMBOL DIRECTION NOTIONAL\n"
+             "Usage: /enter SYMBOL DIRECTION NOTIONAL [BASIS_TARGET_BPS]\n"
              "e.g. /enter SMSN long_hl_short_aster 1000\n"
+             "     /enter SMSN buy_hl 1000 -10   (wait until entry basis ≥ -10bps)\n"
              "DIRECTION aliases: buy_hl / buy_aster / L-HL/S-AST / L-AST/S-HL")
         return
     symbol = toks[0].upper()
@@ -569,8 +581,17 @@ def cmd_enter(chat_id: str, arg: str):
     except ValueError:
         send(chat_id, f"Bad notional {toks[2]!r} — must be a positive number of USD.")
         return
+    target_bps = None
+    if len(toks) == 4:
+        try:
+            target_bps = float(toks[3])
+        except ValueError:
+            send(chat_id, f"Bad basis target {toks[3]!r} — must be a number (bps).")
+            return
 
     req = {"action": "enter", "symbol": symbol, "direction": direction, "notional": notional}
+    if target_bps is not None:
+        req["target_bps"] = target_bps
     rc, active = run(["systemctl", "is-active", SERVICE], timeout=10)
     if active.strip() != "active":
         send(chat_id, f"⚠️ trader service is {active.strip()} — start it first (/start), "
@@ -578,25 +599,54 @@ def cmd_enter(chat_id: str, arg: str):
         return
 
     short = "L-HL/S-AST" if direction == "long_hl_short_aster" else "L-AST/S-HL"
+    gate = f" once basis ≥ {target_bps:.0f}bps" if target_bps is not None else ""
     if read_mode() == "live":
         _PENDING_ENTER[chat_id] = (req, time.time() + _CONFIRM_TTL)
         send(chat_id,
-             f"⚠️ LIVE order: enter {symbol} {short} ${notional:.0f}/leg as a funding hold.\n"
-             "This places REAL orders. Reply YES within 60s to confirm.")
+             f"⚠️ LIVE order: enter {symbol} {short} ${notional:.0f}/leg as a funding hold{gate}.\n"
+             "5x isolated. This places REAL orders. Reply YES within 60s to confirm.")
         return
     _enqueue_manual(req)
-    send(chat_id, f"📩 queued [PAPER] entry: {symbol} {short} ${notional:.0f}. "
+    send(chat_id, f"📩 queued [PAPER] entry: {symbol} {short} ${notional:.0f}{gate}. "
                   "You'll get an alert when it's placed.")
 
 
 def cmd_close(chat_id: str, arg: str):
-    """Manually close one open position (any symbol) via the monitor."""
+    """Manually close one open position via the monitor.
+
+    Usage: /close SYMBOL [BASIS_TARGET_BPS]
+      Omit target = close now (cross the book).
+      With target = wait until the executable exit basis is at or better than the
+      target (bps, in your favour). Safety stops still close it if it stays bad.
+    """
+    toks = arg.split()
+    if not toks:
+        send(chat_id, "Usage: /close SYMBOL [BASIS_TARGET_BPS]\n"
+                      "e.g. /close SMSN        (close now)\n"
+                      "     /close SMSN 5       (wait until exit basis ≥ 5bps)")
+        return
+    symbol = toks[0].upper()
+    req = {"action": "close", "symbol": symbol}
+    gate = ""
+    if len(toks) >= 2:
+        try:
+            req["target_bps"] = float(toks[1])
+            gate = f" once exit basis ≥ {req['target_bps']:.0f}bps"
+        except ValueError:
+            send(chat_id, f"Bad basis target {toks[1]!r} — must be a number (bps).")
+            return
+    _enqueue_manual(req)
+    send(chat_id, f"📩 queued close for {symbol}{gate}. You'll get an alert when the exit is submitted.")
+
+
+def cmd_cancel(chat_id: str, arg: str):
+    """Cancel a pending basis-gated /enter or /close that hasn't fired yet."""
     symbol = arg.strip().upper()
     if not symbol:
-        send(chat_id, "Usage: /close SYMBOL")
+        send(chat_id, "Usage: /cancel SYMBOL")
         return
-    _enqueue_manual({"action": "close", "symbol": symbol})
-    send(chat_id, f"📩 queued close for {symbol}. You'll get an alert when the exit is submitted.")
+    _enqueue_manual({"action": "cancel", "symbol": symbol})
+    send(chat_id, f"📩 cancel requested for any pending gate on {symbol}.")
 
 
 def cmd_funding(chat_id: str, arg: str):
@@ -619,8 +669,9 @@ def cmd_help(chat_id: str, _arg: str):
          "/status — service state + spreads + positions\n"
          "/spreads — current spread vs threshold detail\n"
          "/funding [n] — top funding-carry opportunities\n"
-         "/enter SYM DIR NOTIONAL — manually open a funding hold (live needs YES)\n"
-         "/close SYM — manually close one position\n"
+         "/enter SYM DIR NOTIONAL [basis_bps] — open a funding hold; basis_bps waits for a fill level\n"
+         "/close SYM [basis_bps] — close a position; basis_bps waits for a fill level\n"
+         "/cancel SYM — cancel a pending basis-gated /enter or /close\n"
          "/autoentry on|off — toggle auto basis-arb entry (exits unaffected)\n"
          "/positions — open positions detail\n"
          "/trades [n] — last n closed trades with P&L detail\n"
@@ -639,7 +690,8 @@ HANDLERS = {
     "/status": cmd_status, "/positions": cmd_positions, "/pos": cmd_positions,
     "/pnl": cmd_pnl, "/trades": cmd_trades,
     "/funding": cmd_funding, "/carry": cmd_funding,
-    "/enter": cmd_enter, "/close": cmd_close, "/autoentry": cmd_autoentry,
+    "/enter": cmd_enter, "/close": cmd_close, "/cancel": cmd_cancel,
+    "/autoentry": cmd_autoentry,
     "/log": cmd_log, "/logs": cmd_log,
     "/spreads": cmd_spreads, "/spread": cmd_spreads,
     "/mode": cmd_mode, "/paper": cmd_paper, "/live": cmd_live,

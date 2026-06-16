@@ -33,6 +33,7 @@ from config import (
     ORDER_TIMEOUT_SECONDS, HL_IOC_BUFFER_BPS, ASTER_IOC_BUFFER_BPS,
     aster_symbol_for, ASTER_BASE_ALIAS, ASTER_BASE_TO_CANON,
     BASELINE_WINDOW_MINUTES, BASELINE_MIN_SAMPLES, BASELINE_SAMPLE_INTERVAL_SECONDS,
+    ASTER_LEVERAGE_URL, ASTER_MARGIN_TYPE_URL, LEVERAGE, ASTER_MARGIN_TYPE,
 )
 from src import history
 
@@ -93,6 +94,9 @@ class ExchangeClient:
 
         # xyz:COIN -> asset_index in XYZ universe
         self._hl_xyz_indices: dict[str, int] = {}
+
+        # Symbols whose leverage + margin type have been set this run (idempotent).
+        self._margin_ready: set[str] = set()
 
         # Mark/index price cache: symbol -> (mark_price, index_price, fetched_at_ms)
         self._mark_cache: dict[str, tuple[float, float, int]] = {}
@@ -941,11 +945,16 @@ class ExchangeClient:
             return {}
 
     async def set_hl_leverage(self, symbol: str, leverage: int, cross: bool = True) -> bool:
-        """Set leverage for a symbol on HL XYZ."""
+        """Set leverage for a symbol on HL XYZ. updateLeverage wants the integer
+        asset index (same id used for order placement), not the coin name."""
         hl_coin = f"xyz:{symbol}"
+        asset_idx = self._hl_xyz_indices.get(hl_coin)
+        if asset_idx is None:
+            log.error(f"HL set leverage: asset index not found for {hl_coin}")
+            return False
         action = {
             "type": "updateLeverage",
-            "asset": hl_coin,
+            "asset": asset_idx,
             "isCross": cross,
             "leverage": leverage,
         }
@@ -958,11 +967,70 @@ class ExchangeClient:
                 if r.content_type != "application/json":
                     text = await r.text()
                     log.error(f"HL non-JSON response ({r.status}): {text}")
-                    return OrderResult(success=False, error=f"HTTP {r.status}: {text}")
+                    return False
                 data = await r.json()
             ok = data.get("status") == "ok"
-            log.info(f"HL leverage set {hl_coin} {leverage}x cross={cross}: {ok}")
+            log.info(f"HL leverage set {hl_coin} {leverage}x cross={cross}: {ok} ({data})")
             return ok
         except Exception as e:
             log.error(f"HL set leverage error: {e}")
             return False
+
+    async def set_aster_leverage(self, symbol: str, leverage: int) -> bool:
+        """Set leverage on Aster for a symbol (POST /fapi/v1/leverage)."""
+        params = {"symbol": aster_symbol_for(symbol), "leverage": int(leverage)}
+        signed = self._sign_aster(params)
+        try:
+            async with self.session.post(
+                ASTER_LEVERAGE_URL, data=signed, timeout=self.timeout
+            ) as r:
+                data = await r.json()
+            ok = "leverage" in data
+            log.info(f"Aster leverage set {params['symbol']} {leverage}x: {ok} ({data})")
+            return ok
+        except Exception as e:
+            log.error(f"Aster set leverage error: {e}")
+            return False
+
+    async def set_aster_margin_type(self, symbol: str, margin_type: str) -> bool:
+        """Set margin type on Aster (POST /fapi/v1/marginType). Treats the
+        'no need to change' response as success (already set)."""
+        params = {"symbol": aster_symbol_for(symbol), "marginType": margin_type.upper()}
+        signed = self._sign_aster(params)
+        try:
+            async with self.session.post(
+                ASTER_MARGIN_TYPE_URL, data=signed, timeout=self.timeout
+            ) as r:
+                data = await r.json()
+            code = data.get("code")
+            msg = str(data.get("msg", "")).lower()
+            ok = code in (200, None) or "no need to change" in msg
+            log.info(f"Aster margin type {params['symbol']} {margin_type}: {ok} ({data})")
+            return ok
+        except Exception as e:
+            log.error(f"Aster set margin type error: {e}")
+            return False
+
+    async def ensure_perp_margin(self, symbol: str) -> bool:
+        """Set leverage + isolated margin on both venues, once per symbol per run.
+
+        Best-effort and idempotent: marks the symbol ready only if both venues
+        accepted, so a transient failure retries on the next entry attempt. HL
+        HIP-3 markets are isolated-only, so cross is forced False there.
+        """
+        if symbol in self._margin_ready:
+            return True
+        cross = ASTER_MARGIN_TYPE.upper() != "ISOLATED"
+        hl_ok = await self.set_hl_leverage(symbol, LEVERAGE, cross=cross)
+        # Set margin type before leverage (Binance rejects margin-type change with
+        # an open position; on a fresh symbol this is fine).
+        ast_mt_ok = await self.set_aster_margin_type(symbol, ASTER_MARGIN_TYPE)
+        ast_lev_ok = await self.set_aster_leverage(symbol, LEVERAGE)
+        if hl_ok and ast_mt_ok and ast_lev_ok:
+            self._margin_ready.add(symbol)
+            return True
+        log.warning(
+            f"{symbol}: ensure_perp_margin incomplete "
+            f"(hl={hl_ok} aster_mt={ast_mt_ok} aster_lev={ast_lev_ok})"
+        )
+        return False
