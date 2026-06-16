@@ -378,10 +378,11 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 if pos.hold_for_funding:
                     # Manual funding-carry hold: held for carry, never the basis
                     # target/convergence exits (those would close it the moment the
-                    # basis reverts). Only safety exits apply.
-                    if symbol in BLOCKED_SYMBOLS:
-                        should_exit, reason = True, "blocked"
-                    elif est_net <= -FUNDING_ADVERSE_STOP_USD:
+                    # basis reverts). The blocklist is a convergence-strategy concern,
+                    # so it does NOT apply here — a deliberately-entered funding hold
+                    # on a "blocked" name (e.g. NOW, WDC) must persist. Only the hard
+                    # safety exits apply.
+                    if est_net <= -FUNDING_ADVERSE_STOP_USD:
                         log.warning(
                             f"FUNDING-STOP {symbol}: est_net=${est_net:.2f} <= "
                             f"-${FUNDING_ADVERSE_STOP_USD} — bailing | held={elapsed_hours:.1f}h"
