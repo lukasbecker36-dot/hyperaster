@@ -147,23 +147,26 @@ def _auto_entry_enabled() -> bool:
 def _carry_basis_bps(direction: str, action: str, aster_book, hl_book):
     """Executable basis (bps) in the position's FAVOUR for the given action.
 
-    Uses touch bid/ask prices — what you'd actually cross — so the gate
-    matches the basis column shown by /funding. Higher = better:
+    Uses the HL-maker / Aster-taker convention (HL is more liquid so we
+    rest there, cross on Aster). Matches /funding display. Higher = better.
+
+      Maker buy  HL @ hl_bid  |  Maker sell HL @ hl_ask
+      Taker buy Ast @ ast_ask |  Taker sell Ast @ ast_bid
 
       buy-HL leg  (enter L-HL/S-AST or exit L-AST/S-HL):
-          buy HL @ ask, sell Aster @ bid  →  (aster_bid - hl_ask) / mid
+          buy HL @ bid (maker), sell Aster @ bid (taker)
+          = (aster_bid - hl_bid) / mid
       buy-AST leg (enter L-AST/S-HL or exit L-HL/S-AST):
-          buy Aster @ ask, sell HL @ bid  →  (hl_bid - aster_ask) / mid
+          sell HL @ ask (maker), buy Aster @ ask (taker)
+          = (hl_ask - aster_ask) / mid
     """
     mid = (aster_book.mid + hl_book.mid) / 2
     if mid <= 0:
         return None
     buy_hl_leg = (direction == "long_hl_short_aster") == (action == "enter")
     if buy_hl_leg:
-        # buy HL @ ask (taker), sell Aster @ ask (maker)
-        return (aster_book.ask - hl_book.ask) / mid * 10000
-    # sell HL @ bid (taker), buy Aster @ bid (maker)
-    return (hl_book.bid - aster_book.bid) / mid * 10000
+        return (aster_book.bid - hl_book.bid) / mid * 10000
+    return (hl_book.ask - aster_book.ask) / mid * 10000
 
 def _write_latest_spreads(spreads: dict[str, tuple[float, str, float]],
                           est_net: dict[str, float] | None = None):
@@ -358,12 +361,16 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 # reversed position wasn't exited until the *opposite* direction
                 # also calmed down — letting losses run (CBRS ran to -24.7bps).
                 mid = (aster_book.mid + hl_book.mid) / 2
-                # Estimate net P&L at current book prices (gross - fees + funding)
+                # Estimate net P&L at current book prices (gross - fees + funding).
+                # Carry trades use HL-maker/Aster-taker prices; convergence uses
+                # taker-taker (conservative, both legs cross).
                 if mid > 0 and pos.direction == "long_hl_short_aster":
-                    est_gross = ((hl_book.bid - pos.hl_entry_price)
+                    hl_exit = hl_book.ask if pos.hold_for_funding else hl_book.bid
+                    est_gross = ((hl_exit - pos.hl_entry_price)
                                  + (pos.aster_entry_price - aster_book.ask)) * pos.qty
                 elif mid > 0:
-                    est_gross = ((pos.hl_entry_price - hl_book.ask)
+                    hl_exit = hl_book.bid if pos.hold_for_funding else hl_book.ask
+                    est_gross = ((pos.hl_entry_price - hl_exit)
                                  + (aster_book.bid - pos.aster_entry_price)) * pos.qty
                 else:
                     est_gross = 0.0

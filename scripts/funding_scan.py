@@ -174,17 +174,18 @@ async def scan(top: int, lookback_h: int) -> str:
         else:
             continue  # no carry edge
 
-        # Executable basis (USDC->USDT normalised). HL is taker (IOC), Aster is
-        # maker (GTX). Maker gets the favourable side: sell@ask, buy@bid.
-        hl_ask_usdt = hl_book.ask * usdc_rate
+        # Executable basis (USDC->USDT normalised). HL-maker / Aster-taker:
+        # HL is more liquid so we rest there. Both legs end up on the same
+        # side of the book (bid-bid for buy-HL, ask-ask for buy-AST).
         hl_bid_usdt = hl_book.bid * usdc_rate
+        hl_ask_usdt = hl_book.ask * usdc_rate
         ref = (hl_book.mid * usdc_rate + aster_book.mid) / 2
         if direction == "BUY_HL":
-            # buy HL @ ask (taker), sell Aster @ ask (maker)
-            basis_credit = (aster_book.ask - hl_ask_usdt) / ref * BPS
+            # buy HL @ bid (maker), sell Aster @ bid (taker)
+            basis_credit = (aster_book.bid - hl_bid_usdt) / ref * BPS
         else:
-            # sell HL @ bid (taker), buy Aster @ bid (maker)
-            basis_credit = (hl_bid_usdt - aster_book.bid) / ref * BPS
+            # sell HL @ ask (maker), buy Aster @ ask (taker)
+            basis_credit = (hl_ask_usdt - aster_book.ask) / ref * BPS
 
         # Funding stability: how many recent Aster settlements share the avg's sign.
         if ast_rates:

@@ -125,14 +125,16 @@ async def run(symbol: str, levels: int) -> str:
     lines.append("bids ↓")
     lines.append("─" * 51)
 
-    # Executable cross basis (aggressive touch, matching the bot's execution:
-    # HL taker, Aster leg crosses since it's 0% maker AND taker).
-    #   buy-HL  leg: sell Aster @ bid, buy HL @ ask  -> (ast_bid - hl_ask_usdt)
-    #   buy-AST leg: buy Aster @ ask, sell HL @ bid  -> (hl_bid_usdt - ast_ask)
+    # Two basis views: HL-maker/Aster-taker (passive, what you'd rest at) and
+    # taker-taker (aggressive, both legs cross immediately).
     hl_ask_usdt = hl_ask * usdc
     hl_bid_usdt = hl_bid * usdc
-    basis_buy_hl = (ast_bid - hl_ask_usdt) / ref * 10000
-    basis_buy_ast = (hl_bid_usdt - ast_ask) / ref * 10000
+    # HL-maker / Aster-taker (bid-bid for buy-HL, ask-ask for buy-AST)
+    mk_buy_hl = (ast_bid - hl_bid_usdt) / ref * 10000
+    mk_buy_ast = (hl_ask_usdt - ast_ask) / ref * 10000
+    # Taker-taker (both cross)
+    tk_buy_hl = (ast_bid - hl_ask_usdt) / ref * 10000
+    tk_buy_ast = (hl_bid_usdt - ast_ask) / ref * 10000
 
     lines += [
         f"mid: HL {float(hl_mid):.3f} (≈{float(hl_mid_usdt):.3f} USDT)  "
@@ -140,8 +142,8 @@ async def run(symbol: str, levels: int) -> str:
         f"spread: HL {float(_spread_bps(hl_bid, hl_ask)):.0f}bp  "
         f"Ast {float(_spread_bps(ast_bid, ast_ask)):.0f}bp  "
         f"USDC/USDT {float(usdc):.4f}",
-        f"exec basis: buy-HL/sell-AST {float(basis_buy_hl):+.0f}bp  |  "
-        f"buy-AST/sell-HL {float(basis_buy_ast):+.0f}bp",
+        f"maker-taker: L-HL {float(mk_buy_hl):+.0f}bp | L-AST {float(mk_buy_ast):+.0f}bp",
+        f"taker-taker: L-HL {float(tk_buy_hl):+.0f}bp | L-AST {float(tk_buy_ast):+.0f}bp",
     ]
     return "\n".join(lines)
 
