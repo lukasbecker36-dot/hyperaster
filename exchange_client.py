@@ -21,6 +21,7 @@ import statistics
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from decimal import Decimal
 
 import aiohttp
 from eth_account import Account
@@ -585,13 +586,26 @@ class ExchangeClient:
         spec = self.aster_specs.get(symbol, ContractSpec())
         return f"{qty:.{spec.qty_precision}f}"
 
+    @staticmethod
+    def _to_wire(rounded: str) -> str:
+        """Canonical Hyperliquid wire form: strip trailing zeros (245.50 -> 245.5,
+        0.40 -> 0.4, 100 -> 100). HL normalises the order to this form before
+        verifying the action signature, so a non-canonical string (e.g. a
+        trailing zero) makes HL recover a phantom signer and reject the order
+        as "User or API Wallet 0x... does not exist". Matches the official
+        SDK's float_to_wire."""
+        norm = Decimal(rounded).normalize()
+        if norm == 0:
+            return "0"
+        return f"{norm:f}"
+
     def format_hl_price(self, symbol: str, price: float) -> str:
         spec = self.hl_specs.get(symbol, ContractSpec())
-        return f"{price:.{spec.price_precision}f}"
+        return self._to_wire(f"{price:.{spec.price_precision}f}")
 
     def format_hl_qty(self, symbol: str, qty: float) -> str:
         spec = self.hl_specs.get(symbol, ContractSpec())
-        return f"{qty:.{spec.qty_precision}f}"
+        return self._to_wire(f"{qty:.{spec.qty_precision}f}")
 
     # ── AsterDEX orders ──
 
@@ -804,13 +818,39 @@ class ExchangeClient:
         }
         signable = encode_typed_data(full_message=typed_data)
         signed = Account.sign_message(signable, private_key=self.api_keys["hl_private_key"])
+
+        # Normalise v to 27/28 (some eth_account versions return 0/1 parity).
+        v = signed.v
+        if v in (0, 1):
+            v += 27
+
+        # Self-verify: recover the signer from the signature we're about to send.
+        # If it doesn't match our wallet, Hyperliquid would recover a phantom
+        # address and reject the action as "User or API Wallet 0x... does not
+        # exist". Catch it here instead of leaking a bad order onto the venue.
+        expected = self.api_keys["hl_wallet_address"]
+        try:
+            recovered = Account.recover_message(signable, vrs=(v, signed.r, signed.s))
+            if expected and recovered.lower() != expected.lower():
+                log.error(
+                    f"HL signature self-check FAILED: recovers {recovered} but "
+                    f"wallet is {expected} — refusing to send (would phantom-reject)"
+                )
+                raise ValueError(
+                    f"HL signature recovers {recovered}, expected {expected}"
+                )
+        except ValueError:
+            raise
+        except Exception as e:
+            log.warning(f"HL signature self-check skipped ({e})")
+
         return {
             "action": action,
             "nonce": nonce,
             "signature": {
                 "r": "0x" + format(signed.r, "064x"),
                 "s": "0x" + format(signed.s, "064x"),
-                "v": signed.v,
+                "v": v,
             },
             "vaultAddress": vault_address,
             "expiresAfter": None,
