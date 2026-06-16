@@ -285,7 +285,8 @@ def cmd_positions(chat_id: str, _arg: str):
             "SELECT symbol, status, direction, entry_spread_bps, qty, entry_time, "
             "paper, notional_usd, hl_entry_price, aster_entry_price, "
             "hl_funding_rate, aster_funding_rate, "
-            "COALESCE(entry_baseline_bps, 0), COALESCE(hold_for_funding, 0) "
+            "COALESCE(entry_baseline_bps, 0), COALESCE(hold_for_funding, 0), "
+            "COALESCE(entry_maker_venue, '') "
             "FROM positions WHERE status NOT IN ('closed','error') ORDER BY entry_time"
         )
     except Exception as e:
@@ -305,14 +306,18 @@ def cmd_positions(chat_id: str, _arg: str):
         stale = " ⚠️stale"
     lines = ["📊 Open positions:"]
     for (sym, status, direction, spread, qty, etime, paper, notional,
-         hl_px, ast_px, hl_fr, ast_fr, entry_base, hold_for_funding) in rows:
+         hl_px, ast_px, hl_fr, ast_fr, entry_base, hold_for_funding,
+         entry_maker_venue) in rows:
         held_h = (now - (etime or now)) / 3_600_000
         tag = " [paper]" if paper else ""
         if hold_for_funding:
             tag += " 💰carry"
+        elif entry_maker_venue == "hl":
+            tag += " 🅼maker"
         notional = notional or 1000
-        # Carry holds pay HL-maker/Aster-taker; convergence pays HL-taker/Aster-maker.
-        fees = notional * (CARRY_ROUND_TRIP_FEE if hold_for_funding else ROUND_TRIP_FEE)
+        # Maker-first (carry + convergence) pay HL-maker/Aster-taker; legacy
+        # taker convergence pays HL-taker/Aster-maker.
+        fees = notional * (CARRY_ROUND_TRIP_FEE if entry_maker_venue == "hl" else ROUND_TRIP_FEE)
         funding = estimate_funding_pnl(
             direction or "long_hl_short_aster", held_h, notional,
             hl_fr or 0, ast_fr or 0,

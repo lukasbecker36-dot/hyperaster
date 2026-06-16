@@ -208,10 +208,13 @@ class PositionManager:
         hl_maker_order_id: str, hl_baseline_szi: float, qty: float,
         notional_usd: float, entry_spread_bps: float, hl_ref_price: float,
         hl_funding_rate: float = 0.0, aster_funding_rate: float = 0.0,
+        hold_for_funding: bool = True, entry_baseline_bps: float = 0.0,
     ) -> Position:
-        """Record a maker-first carry entry: HL post-only order resting, nothing
-        filled yet. poll_hl_maker advances it as the HL leg fills and the Aster
-        taker hedges each increment."""
+        """Record a maker-first entry: HL post-only order resting, nothing filled
+        yet. poll_hl_maker advances it as the HL leg fills and the Aster taker
+        hedges each increment. Used for both carry holds (hold_for_funding=True)
+        and convergence arbs (hold_for_funding=False, with entry_baseline_bps set
+        for the convergence exit)."""
         entry_time = now_ms()
         conn = get_connection()
         cur = conn.execute(
@@ -219,14 +222,14 @@ class PositionManager:
             "(symbol, hl_coin, aster_symbol, direction, status, entry_time, "
             "entry_spread_bps, hl_entry_price, hl_entry_order_id, "
             "aster_entry_order_id, qty, notional_usd, paper, "
-            "hl_funding_rate, aster_funding_rate, hold_for_funding, "
+            "hl_funding_rate, aster_funding_rate, hold_for_funding, entry_baseline_bps, "
             "entry_maker_venue, hl_baseline_szi, aster_hedged_qty) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (symbol, f"xyz:{symbol}", aster_symbol, direction, "entering", entry_time,
              entry_spread_bps, hl_ref_price, hl_maker_order_id,
              "", qty, notional_usd, 1 if self.paper_mode else 0,
-             hl_funding_rate, aster_funding_rate, 1,
-             "hl", hl_baseline_szi, 0.0),
+             hl_funding_rate, aster_funding_rate, 1 if hold_for_funding else 0,
+             entry_baseline_bps, "hl", hl_baseline_szi, 0.0),
         )
         conn.commit()
         pid = cur.lastrowid
@@ -234,10 +237,11 @@ class PositionManager:
         pos = Position(
             id=pid, symbol=symbol, hl_coin=f"xyz:{symbol}", aster_symbol=aster_symbol,
             direction=direction, status="entering", entry_time=entry_time,
-            entry_spread_bps=entry_spread_bps, hl_entry_price=hl_ref_price,
+            entry_spread_bps=entry_spread_bps, entry_baseline_bps=entry_baseline_bps,
+            hl_entry_price=hl_ref_price,
             hl_entry_order_id=hl_maker_order_id, qty=qty, notional_usd=notional_usd,
             hl_funding_rate=hl_funding_rate, aster_funding_rate=aster_funding_rate,
-            hold_for_funding=True, entry_maker_venue="hl",
+            hold_for_funding=hold_for_funding, entry_maker_venue="hl",
             hl_baseline_szi=hl_baseline_szi, aster_hedged_qty=0.0,
         )
         self.positions[symbol] = pos
@@ -487,9 +491,10 @@ class PositionManager:
             aster_pnl = (aster_exit_price - pos.aster_entry_price) * pos.qty
         gross = hl_pnl + aster_pnl
 
-        # Carry trades use HL-maker/Aster-taker; convergence uses HL-taker/Aster-maker.
+        # Maker-first trades (carry + convergence) pay HL-maker/Aster-taker;
+        # legacy taker convergence pays HL-taker/Aster-maker.
         notional = pos.notional_usd
-        if pos.hold_for_funding:
+        if pos.entry_maker_venue == "hl":
             fees = notional * 2 * HL_MAKER_FEE + notional * 2 * ASTER_TAKER_FEE
         else:
             fees = notional * 2 * HL_TAKER_FEE + notional * 2 * ASTER_MAKER_FEE

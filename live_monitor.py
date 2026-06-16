@@ -362,19 +362,21 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 # also calmed down — letting losses run (CBRS ran to -24.7bps).
                 mid = (aster_book.mid + hl_book.mid) / 2
                 # Estimate net P&L at current book prices (gross - fees + funding).
-                # Carry trades use HL-maker/Aster-taker prices; convergence uses
-                # taker-taker (conservative, both legs cross).
+                # Maker-first positions (carry + convergence) mark on HL-maker/
+                # Aster-taker exit prices; legacy taker positions use taker-taker
+                # (conservative, both legs cross).
+                maker_first = pos.entry_maker_venue == "hl"
                 if mid > 0 and pos.direction == "long_hl_short_aster":
-                    hl_exit = hl_book.ask if pos.hold_for_funding else hl_book.bid
+                    hl_exit = hl_book.ask if maker_first else hl_book.bid
                     est_gross = ((hl_exit - pos.hl_entry_price)
                                  + (pos.aster_entry_price - aster_book.ask)) * pos.qty
                 elif mid > 0:
-                    hl_exit = hl_book.bid if pos.hold_for_funding else hl_book.ask
+                    hl_exit = hl_book.bid if maker_first else hl_book.ask
                     est_gross = ((pos.hl_entry_price - hl_exit)
                                  + (aster_book.bid - pos.aster_entry_price)) * pos.qty
                 else:
                     est_gross = 0.0
-                rt_fee = CARRY_ROUND_TRIP_FEE if pos.hold_for_funding else ROUND_TRIP_FEE
+                rt_fee = CARRY_ROUND_TRIP_FEE if maker_first else ROUND_TRIP_FEE
                 est_fees = (pos.notional_usd or NOTIONAL_PER_LEG) * rt_fee
                 est_funding = estimate_funding_pnl(
                     pos.direction, elapsed_hours,
@@ -611,11 +613,12 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     # Maker-first carry entries: HL post-only resting, hedge on fill.
                     hl_makers = [s for s, p in pm.positions.items()
                                  if p.status == "entering" and p.entry_maker_venue == "hl"]
-                    # Maker-first carry exits: HL post-only close resting, Aster
-                    # taker closes each HL fill. Distinguished from a taker-fallback
-                    # exit (which rests an Aster GTX) by the empty aster_exit_order_id.
+                    # Maker-first exits (carry + convergence): HL post-only close
+                    # resting, Aster taker closes each HL fill. Distinguished from a
+                    # taker-fallback exit (which rests an Aster GTX) by the empty
+                    # aster_exit_order_id.
                     hl_exit_makers = [s for s, p in pm.positions.items()
-                                      if p.status == "exiting" and p.hold_for_funding
+                                      if p.status == "exiting" and p.entry_maker_venue == "hl"
                                       and not p.aster_exit_order_id]
                     # Legacy Aster-GTX flow: convergence entries + any exit with a
                     # resting Aster GTX (convergence exits + carry taker fallbacks).
