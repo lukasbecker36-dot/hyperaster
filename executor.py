@@ -562,6 +562,15 @@ class Executor:
         except Exception as e:
             return False, f"{symbol}: HL pre-position snapshot failed ({e})"
 
+        # Snapshot the Aster position BEFORE we place anything, so poll_hl_maker
+        # can measure how much has actually hedged from the live position delta
+        # (not just the order-ack accumulator, which can miss async taker fills).
+        try:
+            pre_ap = await self.client.get_aster_position(symbol)
+            aster_baseline_amt = float(pre_ap.get("positionAmt", 0) or 0)
+        except Exception as e:
+            return False, f"{symbol}: Aster pre-position snapshot failed ({e})"
+
         alo = await self.client.place_hl_alo(symbol, hl_side, qty, hl_ref_price)
         if not alo.success:
             return False, f"{symbol}: HL maker not placed ({alo.error})"
@@ -572,6 +581,7 @@ class Executor:
             hl_baseline_szi=baseline_szi, qty=qty, notional_usd=qty * mid,
             entry_spread_bps=spread_bps, hl_ref_price=hl_ref_price,
             hl_funding_rate=hl_fr, aster_funding_rate=aster_fr,
+            aster_baseline_amt=aster_baseline_amt,
         )
         return True, (
             f"resting HL maker for {symbol} {direction} ${qty*mid:.0f} @ {hl_ref_price:.2f} "
@@ -624,6 +634,32 @@ class Executor:
             )
             await self._finalize_partial_entry(pos, long_hl, aster_hedge_side, "overexposure_cap")
             return
+
+        # Reconcile hedged qty against the LIVE Aster position before deciding
+        # what's left to hedge. The order-ack accumulator (pos.aster_hedged_qty)
+        # can UNDER-count when Aster matches asynchronously — the POST response
+        # comes back with executedQty=0 but the order then fills as a taker.
+        # If we trusted only the accumulator, new_fill would stay positive and
+        # we'd re-hedge the same fill every tick → runaway. The live position is
+        # the source of truth and makes hedging idempotent.
+        try:
+            ap = await self.client.get_aster_position(symbol)
+            aster_amt = float(ap.get("positionAmt", 0) or 0)
+            # Hedge SELLS Aster when long_hl (amt falls below baseline), BUYS
+            # when short_hl (amt rises above baseline). Either way → positive.
+            hedged_live = ((pos.aster_baseline_amt - aster_amt) if long_hl
+                           else (aster_amt - pos.aster_baseline_amt))
+            hedged_live = max(0.0, hedged_live)
+            if hedged_live > pos.aster_hedged_qty + 1e-12:
+                log.warning(
+                    f"{symbol}: Aster hedge reconciled "
+                    f"{pos.aster_hedged_qty:.4f} -> {hedged_live:.4f} from live position"
+                )
+                self.pm.record_hl_maker_progress(
+                    symbol, hl_filled, hedged_live,
+                    pos.hl_entry_price, pos.aster_entry_price or 0.0)
+        except Exception as e:
+            log.warning(f"{symbol}: Aster position reconcile failed ({e}) — using accumulator")
 
         # Hedge any newly-filled HL qty with an Aster IOC taker.
         new_fill = hl_filled - pos.aster_hedged_qty

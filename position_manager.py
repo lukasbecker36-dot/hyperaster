@@ -95,6 +95,7 @@ class Position:
     entry_maker_venue: str = ""
     hl_baseline_szi: float = 0.0   # HL signed size before the resting maker order
     aster_hedged_qty: float = 0.0  # Aster qty already hedged against HL fills
+    aster_baseline_amt: float = 0.0  # Aster positionAmt before entry (hedge reconcile)
     aster_hedge_attempts: int = 0  # circuit breaker: total Aster hedge IOCs placed
 
 
@@ -117,7 +118,7 @@ class PositionManager:
             "hl_funding_rate, aster_funding_rate, "
             "COALESCE(entry_baseline_bps, 0), COALESCE(hold_for_funding, 0), "
             "COALESCE(entry_maker_venue, ''), COALESCE(hl_baseline_szi, 0), "
-            "COALESCE(aster_hedged_qty, 0) "
+            "COALESCE(aster_hedged_qty, 0), COALESCE(aster_baseline_amt, 0) "
             "FROM positions WHERE status NOT IN ('closed', 'error') AND paper=?",
             (paper_val,)
         ).fetchall()
@@ -138,6 +139,7 @@ class PositionManager:
                 entry_maker_venue=r[21] or "",
                 hl_baseline_szi=r[22] or 0.0,
                 aster_hedged_qty=r[23] or 0.0,
+                aster_baseline_amt=r[24] or 0.0,
             )
             self.positions[p.symbol] = p
             log.warning(
@@ -210,6 +212,7 @@ class PositionManager:
         notional_usd: float, entry_spread_bps: float, hl_ref_price: float,
         hl_funding_rate: float = 0.0, aster_funding_rate: float = 0.0,
         hold_for_funding: bool = True, entry_baseline_bps: float = 0.0,
+        aster_baseline_amt: float = 0.0,
     ) -> Position:
         """Record a maker-first entry: HL post-only order resting, nothing filled
         yet. poll_hl_maker advances it as the HL leg fills and the Aster taker
@@ -224,13 +227,13 @@ class PositionManager:
             "entry_spread_bps, hl_entry_price, hl_entry_order_id, "
             "aster_entry_order_id, qty, notional_usd, paper, "
             "hl_funding_rate, aster_funding_rate, hold_for_funding, entry_baseline_bps, "
-            "entry_maker_venue, hl_baseline_szi, aster_hedged_qty) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "entry_maker_venue, hl_baseline_szi, aster_hedged_qty, aster_baseline_amt) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (symbol, f"xyz:{symbol}", aster_symbol, direction, "entering", entry_time,
              entry_spread_bps, hl_ref_price, hl_maker_order_id,
              "", qty, notional_usd, 1 if self.paper_mode else 0,
              hl_funding_rate, aster_funding_rate, 1 if hold_for_funding else 0,
-             entry_baseline_bps, "hl", hl_baseline_szi, 0.0),
+             entry_baseline_bps, "hl", hl_baseline_szi, 0.0, aster_baseline_amt),
         )
         conn.commit()
         pid = cur.lastrowid
@@ -244,6 +247,7 @@ class PositionManager:
             hl_funding_rate=hl_funding_rate, aster_funding_rate=aster_funding_rate,
             hold_for_funding=hold_for_funding, entry_maker_venue="hl",
             hl_baseline_szi=hl_baseline_szi, aster_hedged_qty=0.0,
+            aster_baseline_amt=aster_baseline_amt,
         )
         self.positions[symbol] = pos
         log.info(

@@ -76,6 +76,7 @@ def init_db():
         ("entry_maker_venue", "TEXT DEFAULT ''"),
         ("hl_baseline_szi", "REAL DEFAULT 0"),
         ("aster_hedged_qty", "REAL DEFAULT 0"),
+        ("aster_baseline_amt", "REAL DEFAULT 0"),
     ):
         try:
             conn.execute(f"ALTER TABLE positions ADD COLUMN {_col} {_type}")
