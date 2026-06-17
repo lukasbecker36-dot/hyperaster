@@ -22,7 +22,7 @@ Aster GTX repricing:
 import asyncio
 import logging
 
-from exchange_client import ExchangeClient, OrderBook, OrderResult
+from exchange_client import ExchangeClient, OrderBook, OrderResult, ContractSpec
 from position_manager import PositionManager
 from intents import record_intent, complete_intent
 from config import (
@@ -522,11 +522,15 @@ class Executor:
             )
 
         # HL leg is the maker. Long HL -> buy resting at the bid; short HL ->
-        # sell resting at the ask. (Aster taker hedges later, in poll_hl_maker.)
+        # sell resting at the ask. Offset by one tick AWAY from the spread so the
+        # post-only (Alo) never crosses even if the book moved between our fetch
+        # and the order reaching HL. Repricing corrects on the next tick if the
+        # touch drifted.
+        hl_tick = self.client.hl_specs.get(symbol, ContractSpec()).tick_size
         if direction == "long_hl_short_aster":
-            hl_side, hl_ref_price = "buy", hl_book.bid
+            hl_side, hl_ref_price = "buy", hl_book.bid - hl_tick
         else:
-            hl_side, hl_ref_price = "sell", hl_book.ask
+            hl_side, hl_ref_price = "sell", hl_book.ask + hl_tick
 
         qty = self.client.snap_aster_qty(symbol, notional / mid)
         if qty <= 0:
@@ -883,11 +887,12 @@ class Executor:
             _, hl_book = await self.client.get_both_books(symbol)
         except Exception:
             return
-        touch = hl_book.bid if hl_side == "buy" else hl_book.ask
+        spec = self.client.hl_specs.get(symbol, ContractSpec())
+        tick = spec.tick_size
+        # Offset one tick away from spread so the Alo never crosses.
+        touch = (hl_book.bid - tick) if hl_side == "buy" else (hl_book.ask + tick)
         if touch <= 0:
             return
-        spec = self.client.hl_specs.get(symbol)
-        tick = 10 ** (-spec.price_precision) if spec else 0.01
         if abs(touch - pos.hl_entry_price) < tick * MAKER_REPRICE_TICK_FRAC:
             return
         remainder = self.client.snap_aster_qty(symbol, pos.qty - hl_filled)
@@ -978,12 +983,13 @@ class Executor:
         exit_spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000 if mid > 0 else 0.0
 
         closing_long = pos.direction == "long_hl_short_aster"  # long HL leg
+        hl_tick = self.client.hl_specs.get(symbol, ContractSpec()).tick_size
         if closing_long:
-            hl_side, hl_ref = "sell", hl_book.ask    # sell the long HL leg, maker @ ask
-            aster_fill = aster_book.ask              # buy back the short Aster leg @ ask
+            hl_side, hl_ref = "sell", hl_book.ask + hl_tick
+            aster_fill = aster_book.ask
         else:
-            hl_side, hl_ref = "buy", hl_book.bid     # buy back the short HL leg, maker @ bid
-            aster_fill = aster_book.bid              # sell the long Aster leg @ bid
+            hl_side, hl_ref = "buy", hl_book.bid - hl_tick
+            aster_fill = aster_book.bid
 
         log.warning(
             f"MAKER EXIT {symbol} ({reason}): {pos.direction} | qty={pos.qty} | "
@@ -1222,11 +1228,11 @@ class Executor:
             _, hl_book = await self.client.get_both_books(symbol)
         except Exception:
             return
-        touch = hl_book.ask if hl_side == "sell" else hl_book.bid
+        spec = self.client.hl_specs.get(symbol, ContractSpec())
+        tick = spec.tick_size
+        touch = (hl_book.ask + tick) if hl_side == "sell" else (hl_book.bid - tick)
         if touch <= 0:
             return
-        spec = self.client.hl_specs.get(symbol)
-        tick = 10 ** (-spec.price_precision) if spec else 0.01
         if abs(touch - pos.hl_exit_price) < tick * MAKER_REPRICE_TICK_FRAC:
             return
         if pos.hl_exit_order_id:
