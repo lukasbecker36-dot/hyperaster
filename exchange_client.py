@@ -249,13 +249,26 @@ class ExchangeClient:
                 step = round(10 ** -sz_dec, sz_dec)
                 asset_idx = xyz_offset + i  # correct index for order actions
                 self._hl_xyz_indices[coin_name] = asset_idx
+
+                # Price precision: HL allows at most (6 - szDecimals) significant
+                # figures, but never fewer than 1. The tick size may also come from
+                # the asset metadata (tickSize field) if the deployer set one.
+                px_dec = max(6 - sz_dec, 1)
+                tick = float(asset.get("tickSize", 0) or 0)
+                if tick <= 0:
+                    tick = round(10 ** -px_dec, px_dec)
+
                 self.hl_specs[base] = ContractSpec(
-                    tick_size=0.01,
+                    tick_size=tick,
                     step_size=step,
                     min_qty=step,
                     min_notional=10.0,
-                    price_precision=2,
+                    price_precision=px_dec,
                     qty_precision=sz_dec,
+                )
+                log.info(
+                    f"HL spec {base}: szDec={sz_dec} pxDec={px_dec} "
+                    f"tick={tick} step={step} raw_keys={list(asset.keys())}"
                 )
                 # Populate oracle cache while we have the data
                 if i < len(ctxs):
@@ -601,7 +614,10 @@ class ExchangeClient:
 
     def format_hl_price(self, symbol: str, price: float) -> str:
         spec = self.hl_specs.get(symbol, ContractSpec())
-        return self._to_wire(f"{price:.{spec.price_precision}f}")
+        # Snap to tick boundary first, then format for the wire.
+        tick = spec.tick_size
+        snapped = round(round(price / tick) * tick, spec.price_precision)
+        return self._to_wire(f"{snapped:.{spec.price_precision}f}")
 
     def format_hl_qty(self, symbol: str, qty: float) -> str:
         spec = self.hl_specs.get(symbol, ContractSpec())
@@ -881,7 +897,6 @@ class ExchangeClient:
         is_buy = side.lower() == "buy"
         buffer = price * HL_IOC_BUFFER_BPS / 10000
         limit_px = price + buffer if is_buy else price - buffer
-        limit_px = round(limit_px, self.hl_specs.get(symbol, ContractSpec()).price_precision)
 
         order = {
             "a": asset_idx,
@@ -959,11 +974,10 @@ class ExchangeClient:
             return OrderResult(success=False, error=f"HL asset index not found for {hl_coin}")
 
         is_buy = side.lower() == "buy"
-        limit_px = round(price, self.hl_specs.get(symbol, ContractSpec()).price_precision)
         order = {
             "a": asset_idx,
             "b": is_buy,
-            "p": self.format_hl_price(symbol, limit_px),
+            "p": self.format_hl_price(symbol, price),
             "s": self.format_hl_qty(symbol, qty),
             "r": False,
             "t": {"limit": {"tif": "Alo"}},
