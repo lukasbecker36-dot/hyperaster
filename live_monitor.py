@@ -532,7 +532,16 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                         send_alert(f"/close {symbol}: exit submitted")
                 elif action == "cancel":
                     had = pending_entries.pop(symbol, None) or pending_exits.pop(symbol, None)
-                    send_alert(f"/cancel {symbol}: {'gate cleared' if had else 'nothing pending'}")
+                    # Also abort any running maker entry (status="entering")
+                    pos = pm.get(symbol)
+                    if pos and pos.status == "entering":
+                        executor._abort_entering.add(symbol)
+                        send_alert(
+                            f"/cancel {symbol}: {'gate cleared + ' if had else ''}"
+                            f"aborting maker entry (will finalize on next tick)"
+                        )
+                    else:
+                        send_alert(f"/cancel {symbol}: {'gate cleared' if had else 'nothing pending'}")
                 else:
                     log.warning(f"manual cmd: unknown action {action!r}")
             except Exception as e:

@@ -56,6 +56,8 @@ class Executor:
         # An entry only commits once the same-direction signal has held for
         # ENTRY_CONFIRM_TICKS consecutive scans, filtering out stale-feed phantoms.
         self._entry_streak: dict[str, tuple[str, int]] = {}
+        # Symbols whose maker entry should be aborted on the next poll tick.
+        self._abort_entering: set[str] = set()
 
     # ── Entry ──
 
@@ -588,6 +590,15 @@ class Executor:
         if not pos or pos.status != "entering" or pos.entry_maker_venue != "hl":
             return
 
+        # Abort check: /cancel sets this flag to stop a running maker entry.
+        if symbol in self._abort_entering:
+            self._abort_entering.discard(symbol)
+            long_hl = pos.direction == "long_hl_short_aster"
+            aster_hedge_side = "sell" if long_hl else "buy"
+            log.warning(f"{symbol}: maker entry ABORTED by /cancel")
+            await self._finalize_partial_entry(pos, long_hl, aster_hedge_side, "manual_cancel")
+            return
+
         long_hl = pos.direction == "long_hl_short_aster"
         hl_side = "buy" if long_hl else "sell"
         aster_hedge_side = "sell" if long_hl else "buy"
@@ -602,6 +613,17 @@ class Executor:
         signed_delta = current_szi - pos.hl_baseline_szi
         hl_filled = signed_delta if long_hl else -signed_delta
         hl_filled = max(0.0, hl_filled)
+
+        # Safety cap: if HL exposure exceeds target by >10%, something went wrong
+        # (e.g. stale position API caused repricing to place duplicate Alo orders).
+        # Emergency-finalize to stop the bleed.
+        if hl_filled > pos.qty * 1.10:
+            log.error(
+                f"{symbol}: HL exposure {hl_filled:.4f} exceeds target {pos.qty:.4f} by "
+                f"{(hl_filled/pos.qty - 1)*100:.0f}% — EMERGENCY FINALIZE"
+            )
+            await self._finalize_partial_entry(pos, long_hl, aster_hedge_side, "overexposure_cap")
+            return
 
         # Hedge any newly-filled HL qty with an Aster IOC taker.
         new_fill = hl_filled - pos.aster_hedged_qty
@@ -805,7 +827,12 @@ class Executor:
 
     async def _reprice_hl_maker(self, pos, hl_side: str, hl_filled: float):
         """Cancel + repost the resting HL maker at the new touch for the unfilled
-        remainder, if it has drifted more than a fraction of a tick."""
+        remainder, if it has drifted more than a fraction of a tick.
+
+        Before repricing, verifies the current order is still resting — if it
+        already filled (position API was stale), we skip the reprice so we don't
+        accumulate duplicate Alo orders that overshoot the target qty.
+        """
         symbol = pos.symbol
         try:
             _, hl_book = await self.client.get_both_books(symbol)
@@ -821,8 +848,31 @@ class Executor:
         remainder = self.client.snap_aster_qty(symbol, pos.qty - hl_filled)
         if remainder <= 0:
             return
+
+        # Verify the current order is still resting before cancel+replace.
+        # If it already filled (stale position API made hl_filled look like 0),
+        # placing a new Alo would overshoot the target qty.
         if pos.hl_entry_order_id:
+            try:
+                resp = await self.client.query_hl_order(pos.hl_entry_order_id)
+                # HL returns {"status": "order", "order": {"status": "open"|"filled"|...}}
+                # or {"status": "unknownOid"}
+                if resp.get("status") == "unknownOid":
+                    log.warning(f"{symbol}: HL order {pos.hl_entry_order_id} unknown — skipping reprice")
+                    return
+                order_info = resp.get("order", {})
+                order_status = order_info.get("status", "")
+                if order_status != "open":
+                    log.warning(
+                        f"{symbol}: HL order {pos.hl_entry_order_id} already "
+                        f"{order_status} — skipping reprice (position API may be stale)"
+                    )
+                    return
+            except Exception as e:
+                log.warning(f"{symbol}: HL order status check failed ({e}) — skipping reprice for safety")
+                return
             await self.client.cancel_hl_order(symbol, pos.hl_entry_order_id)
+
         alo = await self.client.place_hl_alo(symbol, hl_side, remainder, touch)
         if alo.success:
             pos.hl_entry_order_id = alo.order_id

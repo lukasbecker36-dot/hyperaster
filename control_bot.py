@@ -463,13 +463,14 @@ def cmd_flatten(chat_id: str, arg: str):
     if arg.strip().upper() != "YES":
         _PENDING[chat_id] = ("flatten", time.time() + _CONFIRM_TTL)
         send(chat_id,
-             "🚨 EMERGENCY FLATTEN — this market-closes EVERY open position on "
-             "BOTH venues (taker fees, immediate).\n\n"
+             "🚨 FLATTEN — this market-closes all BOT-MANAGED positions "
+             "(tracked in DB) on BOTH venues (taker fees, immediate).\n"
+             "Unrelated positions (spot-perp, manual trades) are NOT touched.\n\n"
              f"Send /flatten YES within {_CONFIRM_TTL}s to confirm.")
         return
-    send(chat_id, "🚨 flattening — querying both venues and closing everything…")
+    send(chat_id, "🚨 flattening bot-managed positions…")
     rc, out = run(
-        [PYTHON, str(BASE_DIR / "flatten.py"), "--reconcile", "--yes"],
+        [PYTHON, str(BASE_DIR / "flatten.py"), "--yes"],
         timeout=180,
     )
     send(chat_id, f"flatten {'completed' if rc == 0 else 'FINISHED WITH ERRORS'}:\n\n{out[-3500:]}")
