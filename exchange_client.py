@@ -689,10 +689,20 @@ class ExchangeClient:
                 oid = str(data["orderId"])
                 filled_qty = float(data.get("executedQty", 0) or 0)
                 fill_price = float(data.get("avgPrice", 0) or 0)
+                order_status = data.get("status", "")
                 log.info(
                     f"Aster IOC: {side.upper()} {qty} {aster_sym} @ {limit_px} -> "
-                    f"filled {filled_qty} @ {fill_price} (oid {oid})"
+                    f"filled {filled_qty} @ {fill_price} (oid {oid}, status={order_status})"
                 )
+                # Safety: if Aster returned a non-terminal status (e.g. "NEW"),
+                # the order may be resting instead of IOC. Cancel it immediately
+                # to prevent phantom resting orders that fill later.
+                if order_status not in ("FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED"):
+                    log.warning(
+                        f"Aster IOC order {oid} has status {order_status!r} — "
+                        f"cancelling to prevent resting order"
+                    )
+                    await self.cancel_aster_order(symbol, oid)
                 return OrderResult(
                     success=filled_qty > 0, order_id=oid,
                     filled_qty=filled_qty, fill_price=fill_price or limit_px,

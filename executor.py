@@ -629,6 +629,17 @@ class Executor:
         new_fill = hl_filled - pos.aster_hedged_qty
         min_lot = self.client.snap_aster_qty(symbol, new_fill) if new_fill > 0 else 0.0
         if min_lot > 0:
+            # Circuit breaker: cap total Aster hedge attempts to prevent runaway
+            # order placement if IOC orders aren't working as expected.
+            MAX_HEDGE_ATTEMPTS = 10
+            if pos.aster_hedge_attempts >= MAX_HEDGE_ATTEMPTS:
+                log.error(
+                    f"{symbol}: Aster hedge circuit breaker tripped "
+                    f"({pos.aster_hedge_attempts} attempts) — EMERGENCY FINALIZE"
+                )
+                await self._finalize_partial_entry(pos, long_hl, aster_hedge_side, "hedge_circuit_breaker")
+                return
+
             try:
                 aster_book = await self.client._get_aster_book(symbol)
             except Exception:
@@ -640,6 +651,7 @@ class Executor:
                     direction=pos.direction, side=aster_hedge_side, qty=min_lot,
                     ref_price=touch, position_id=pos.id, paper=False,
                 )
+                pos.aster_hedge_attempts += 1
                 res = await self.client.place_aster_ioc(symbol, aster_hedge_side, min_lot, touch)
                 if res.success and res.filled_qty > 0:
                     complete_intent(hedge_intent, "filled",
@@ -999,6 +1011,14 @@ class Executor:
         new_fill = hl_closed - pos.aster_hedged_qty
         lot = self.client.snap_aster_qty(symbol, new_fill) if new_fill > 0 else 0.0
         if lot > 0:
+            MAX_HEDGE_ATTEMPTS = 10
+            if pos.aster_hedge_attempts >= MAX_HEDGE_ATTEMPTS:
+                log.error(
+                    f"{symbol}: Aster exit hedge circuit breaker tripped "
+                    f"({pos.aster_hedge_attempts} attempts) — CHECK MANUALLY"
+                )
+                return
+
             try:
                 aster_book = await self.client._get_aster_book(symbol)
             except Exception:
@@ -1010,6 +1030,7 @@ class Executor:
                     direction=pos.direction, side=aster_hedge_side, qty=lot,
                     ref_price=touch, position_id=pos.id, paper=False,
                 )
+                pos.aster_hedge_attempts += 1
                 res = await self.client.place_aster_ioc(symbol, aster_hedge_side, lot, touch)
                 if res.success and res.filled_qty > 0:
                     complete_intent(hedge_intent, "filled",

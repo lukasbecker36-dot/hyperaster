@@ -95,6 +95,7 @@ class Position:
     entry_maker_venue: str = ""
     hl_baseline_szi: float = 0.0   # HL signed size before the resting maker order
     aster_hedged_qty: float = 0.0  # Aster qty already hedged against HL fills
+    aster_hedge_attempts: int = 0  # circuit breaker: total Aster hedge IOCs placed
 
 
 class PositionManager:
