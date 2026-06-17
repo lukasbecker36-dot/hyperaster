@@ -1004,9 +1004,9 @@ class ExchangeClient:
             s = statuses[0] if statuses else {}
             if "resting" in s:
                 oid = str(s["resting"].get("oid", ""))
-                log.info(f"HL ALO resting: {side.upper()} {qty} {hl_coin} @ {limit_px} -> {oid}")
+                log.info(f"HL ALO resting: {side.upper()} {qty} {hl_coin} @ {price} -> {oid}")
                 return OrderResult(success=True, order_id=oid, filled_qty=0.0,
-                                   fill_price=limit_px, raw=data)
+                                   fill_price=price, raw=data)
             if "filled" in s:
                 f = s["filled"]
                 log.info(f"HL ALO filled immediately: {side.upper()} {hl_coin} -> {f.get('oid')}")
