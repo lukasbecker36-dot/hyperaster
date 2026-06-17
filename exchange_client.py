@@ -281,6 +281,57 @@ class ExchangeClient:
         except Exception as e:
             log.error(f"Failed to load HL XYZ specs: {e}")
 
+        # Infer actual tick sizes from the live orderbook — the metadata doesn't
+        # include tick size for builder dex perps, and the formula-derived default
+        # (10^-pxDec) is often wrong. The minimum price increment between
+        # orderbook levels IS the tick.
+        await self._infer_hl_tick_sizes(symbols)
+
+    async def _infer_hl_tick_sizes(self, symbols: list[str]):
+        """Probe each symbol's HL orderbook to discover the real tick size."""
+        for symbol in symbols:
+            hl_coin = f"xyz:{symbol}"
+            try:
+                async with self.session.post(
+                    HYPERLIQUID_API,
+                    json={"type": "l2Book", "coin": hl_coin},
+                    timeout=self.timeout,
+                ) as r:
+                    data = await r.json()
+                levels = data.get("levels", [[], []])
+                # Gather all prices from both sides
+                prices = []
+                for side_levels in levels:
+                    for lvl in side_levels[:10]:
+                        prices.append(float(lvl["px"]))
+                prices.sort()
+                # Find the minimum non-zero difference between adjacent prices
+                min_diff = None
+                for j in range(len(prices) - 1):
+                    diff = round(prices[j + 1] - prices[j], 10)
+                    if diff > 1e-12:
+                        if min_diff is None or diff < min_diff:
+                            min_diff = diff
+                if min_diff and symbol in self.hl_specs:
+                    spec = self.hl_specs[symbol]
+                    # Determine price_precision from the tick
+                    tick_str = f"{min_diff:.10f}".rstrip("0")
+                    if "." in tick_str:
+                        px_prec = len(tick_str.split(".")[1])
+                    else:
+                        px_prec = 0
+                    old_tick = spec.tick_size
+                    spec.tick_size = min_diff
+                    spec.price_precision = px_prec
+                    if abs(old_tick - min_diff) > 1e-12:
+                        log.info(
+                            f"HL tick {symbol}: inferred {min_diff} "
+                            f"(pxPrec={px_prec}) from orderbook "
+                            f"(was {old_tick})"
+                        )
+            except Exception as e:
+                log.warning(f"HL tick inference failed for {symbol}: {e}")
+
     # ── Orderbook ──
 
     async def get_orderbook(self, exchange: str, symbol: str) -> OrderBook:
