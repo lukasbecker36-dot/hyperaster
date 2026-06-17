@@ -720,13 +720,10 @@ class Executor:
             return
 
         if pos.hold_for_funding:
-            # Carry hold: give up the unfilled remainder at the fixed timeout and
-            # open whatever filled (carry holds are entered at an absolute basis
-            # gate, no signal to chase).
-            elapsed = (now_ms() - pos.entry_time) / 1000
-            if elapsed >= MAKER_ENTRY_TIMEOUT_SEC:
-                await self._finalize_partial_entry(pos, long_hl, aster_hedge_side, "maker_entry_timeout")
-                return
+            # Carry hold: the operator deliberately chose this entry via /enter
+            # with a basis gate. The maker rests indefinitely until filled — no
+            # timeout. Use /cancel to abort manually if needed.
+            pass
         else:
             # Convergence arb: re-measure the signal each tick. If the taker-taker
             # excess clears its (wider) gate, escalate — cross both as taker to lock
