@@ -1162,6 +1162,46 @@ class ExchangeClient:
             log.error(f"HL position query error: {e}")
             return {}
 
+    async def get_all_hl_positions(self) -> list[dict]:
+        """Return all open HL XYZ positions (non-zero szi)."""
+        try:
+            async with self.session.post(
+                HYPERLIQUID_API,
+                json={
+                    "type": "clearinghouseState",
+                    "user": self.api_keys["hl_account_address"],
+                    "dex": "xyz",
+                },
+                timeout=self.timeout,
+            ) as r:
+                data = await r.json()
+            results = []
+            for pos in data.get("assetPositions", []):
+                p = pos.get("position", {})
+                szi = float(p.get("szi", 0) or 0)
+                if abs(szi) > 1e-12:
+                    results.append(p)
+            return results
+        except Exception as e:
+            log.error(f"HL all positions query error: {e}")
+            return []
+
+    async def get_all_aster_positions(self) -> list[dict]:
+        """Return all open Aster positions (non-zero positionAmt)."""
+        params = {}
+        signed = self._sign_aster(params)
+        try:
+            async with self.session.get(
+                ASTER_POSITION_URL, params=signed, timeout=self.timeout
+            ) as r:
+                data = await r.json()
+            if not isinstance(data, list):
+                return []
+            return [p for p in data if abs(float(p.get("positionAmt", 0) or 0)) > 1e-12]
+        except Exception as e:
+            log.error(f"Aster all positions query error: {e}")
+            return []
+
     async def set_hl_leverage(self, symbol: str, leverage: int, cross: bool = True) -> bool:
         """Set leverage for a symbol on HL XYZ. updateLeverage wants the integer
         asset index (same id used for order placement), not the coin name."""

@@ -40,7 +40,7 @@ from config import (
     ROUND_TRIP_FEE, CARRY_ROUND_TRIP_FEE, NOTIONAL_PER_LEG, EXIT_TARGET_NET_USD,
     EXIT_TARGET_NET_USD_BY_SYMBOL, MAX_FUNDING_DRAG_USD,
     FUNDING_ADVERSE_STOP_USD,
-    MANUAL_ENTRY_GATE_TIMEOUT_MIN, aster_symbol_for,
+    MANUAL_ENTRY_GATE_TIMEOUT_MIN, aster_symbol_for, ASTER_BASE_TO_CANON,
 )
 
 SLOW_SCAN_INTERVAL_SECONDS = 300   # re-rank all symbols every 5 min
@@ -542,11 +542,116 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                         )
                     else:
                         send_alert(f"/cancel {symbol}: {'gate cleared' if had else 'nothing pending'}")
+                elif action == "import":
+                    await _handle_import(symbol or None)
                 else:
                     log.warning(f"manual cmd: unknown action {action!r}")
             except Exception as e:
                 log.error(f"manual cmd {action} {symbol} failed: {e}")
                 send_alert(f"/{action} {symbol}: ERROR {e}")
+
+    async def _handle_import(filter_symbol: str | None = None):
+        """Scan both venues for offsetting positions and import them into the DB."""
+        hl_positions, aster_positions = await asyncio.gather(
+            client.get_all_hl_positions(),
+            client.get_all_aster_positions(),
+        )
+        # Build lookup: canonical_base -> (signed_qty, entry_price) per venue
+        hl_map: dict[str, tuple[float, float]] = {}
+        for p in hl_positions:
+            coin = p.get("coin", "")
+            if not coin.startswith("xyz:"):
+                continue
+            base = coin.split(":", 1)[1]
+            szi = float(p.get("szi", 0) or 0)
+            entry_px = float(p.get("entryPx", 0) or 0)
+            if abs(szi) > 1e-12:
+                hl_map[base] = (szi, entry_px)
+
+        aster_map: dict[str, tuple[float, float]] = {}
+        for p in aster_positions:
+            raw_sym = p.get("symbol", "")
+            base = None
+            for suffix in ("USDT", "USDC", "USD"):
+                if raw_sym.endswith(suffix):
+                    base = raw_sym[:-len(suffix)]
+                    break
+            if not base:
+                continue
+            if base in ASTER_BASE_TO_CANON:
+                base = ASTER_BASE_TO_CANON[base]
+            amt = float(p.get("positionAmt", 0) or 0)
+            entry_px = float(p.get("entryPrice", 0) or 0)
+            if abs(amt) > 1e-12:
+                aster_map[base] = (amt, entry_px)
+
+        # Find offsetting pairs (opposite signs on each venue)
+        common = set(hl_map) & set(aster_map)
+        if filter_symbol:
+            common = {filter_symbol} & common
+
+        pairs = []
+        for base in sorted(common):
+            hl_szi, hl_px = hl_map[base]
+            ast_amt, ast_px = aster_map[base]
+            if hl_szi * ast_amt >= 0:
+                continue  # same direction, not an arb pair
+            if pm.has_position(base):
+                continue  # already tracked
+            qty = min(abs(hl_szi), abs(ast_amt))
+            if hl_szi > 0:
+                direction = "long_hl_short_aster"
+            else:
+                direction = "long_aster_short_hl"
+            pairs.append((base, direction, qty, hl_px, ast_px, hl_szi, ast_amt))
+
+        if not pairs:
+            if filter_symbol:
+                # Give detail on why nothing matched
+                reasons = []
+                if filter_symbol not in hl_map:
+                    reasons.append("no HL position")
+                if filter_symbol not in aster_map:
+                    reasons.append("no Aster position")
+                if filter_symbol in hl_map and filter_symbol in aster_map:
+                    hl_s, _ = hl_map[filter_symbol]
+                    ast_s, _ = aster_map[filter_symbol]
+                    if hl_s * ast_s >= 0:
+                        reasons.append("same direction on both venues (not offsetting)")
+                    if pm.has_position(filter_symbol):
+                        reasons.append("already tracked in DB")
+                send_alert(f"/import {filter_symbol}: nothing to import ({', '.join(reasons) or '?'})")
+            else:
+                send_alert(
+                    f"/import: no importable pairs found.\n"
+                    f"HL positions: {list(hl_map.keys())}\n"
+                    f"Aster positions: {list(aster_map.keys())}\n"
+                    f"Already tracked: {list(pm.positions.keys())}"
+                )
+            return
+
+        imported = []
+        for base, direction, qty, hl_px, ast_px, hl_szi, ast_amt in pairs:
+            hl_fr = client.get_hl_funding_rate(base)
+            ast_fr = client.get_aster_funding_rate(base)
+            pos = pm.import_position(
+                symbol=base,
+                hl_coin=f"xyz:{base}",
+                aster_symbol=aster_symbol_for(base),
+                direction=direction,
+                qty=qty,
+                hl_price=hl_px,
+                aster_price=ast_px,
+                hl_funding_rate=hl_fr,
+                aster_funding_rate=ast_fr,
+            )
+            short_dir = "HL↑ Ast↓" if "long_hl" in direction else "HL↓ Ast↑"
+            imported.append(
+                f"  • {base} #{pos.id} {short_dir} qty={qty} "
+                f"HL@{hl_px:.2f} Ast@{ast_px:.2f} ${pos.notional_usd:.0f}"
+            )
+            log.warning(f"Imported {base}: {direction} qty={qty} HL@{hl_px:.2f} Ast@{ast_px:.2f}")
+        send_alert("✅ Imported positions:\n" + "\n".join(imported))
 
     async def evaluate_gated_orders():
         """Fire basis-gated manual entries/exits once their target level is met."""

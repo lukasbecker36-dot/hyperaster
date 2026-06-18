@@ -702,6 +702,50 @@ class PositionManager:
         log.info(f"Position #{pos.id} dropped ({reason}): {symbol}")
         del self.positions[symbol]
 
+    def import_position(
+        self, *, symbol: str, hl_coin: str, aster_symbol: str,
+        direction: str, qty: float, hl_price: float, aster_price: float,
+        hl_funding_rate: float = 0.0, aster_funding_rate: float = 0.0,
+    ) -> Position:
+        """Import an existing venue position pair into the DB as 'open'.
+
+        Used when the user has offsetting perp positions on HL and Aster that
+        were created outside the bot (manual trades, prior runaway, etc.) and
+        wants to manage them via /positions and /close."""
+        entry_time = now_ms()
+        notional = qty * ((hl_price + aster_price) / 2)
+        conn = get_connection()
+        cur = conn.execute(
+            "INSERT INTO positions "
+            "(symbol, hl_coin, aster_symbol, direction, status, entry_time, "
+            "entry_spread_bps, hl_entry_price, aster_entry_price, "
+            "qty, notional_usd, paper, "
+            "hl_funding_rate, aster_funding_rate, hold_for_funding, "
+            "entry_maker_venue) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (symbol, hl_coin, aster_symbol, direction, "open", entry_time,
+             0.0, hl_price, aster_price,
+             qty, notional, 1 if self.paper_mode else 0,
+             hl_funding_rate, aster_funding_rate, 1, "hl"),
+        )
+        conn.commit()
+        pid = cur.lastrowid
+        conn.close()
+        pos = Position(
+            id=pid, symbol=symbol, hl_coin=hl_coin, aster_symbol=aster_symbol,
+            direction=direction, status="open", entry_time=entry_time,
+            hl_entry_price=hl_price, aster_entry_price=aster_price,
+            qty=qty, notional_usd=notional,
+            hl_funding_rate=hl_funding_rate, aster_funding_rate=aster_funding_rate,
+            hold_for_funding=True, entry_maker_venue="hl",
+        )
+        self.positions[symbol] = pos
+        log.warning(
+            f"Position #{pid} IMPORTED: {symbol} {direction} | "
+            f"qty={qty} ${notional:.0f} | HL @ {hl_price:.2f} | Aster @ {aster_price:.2f}"
+        )
+        return pos
+
     def log_trade(self, position_id: int, exchange: str, side: str,
                   order_type: str, order_id: str = "", qty: float = 0,
                   fill_price: float = 0, fee: float = 0, status: str = "",

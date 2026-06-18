@@ -713,6 +713,28 @@ def cmd_cancel(chat_id: str, arg: str):
     send(chat_id, f"📩 cancel requested for any pending gate on {symbol}.")
 
 
+def cmd_import(chat_id: str, arg: str):
+    """Import existing venue positions into the bot's DB for management.
+
+    Usage: /import          — scan both venues, show offsetting pairs
+           /import SYMBOL   — import a specific symbol's offsetting pair
+    """
+    symbol = arg.strip().upper() if arg.strip() else ""
+    req = {"action": "import"}
+    if symbol:
+        req["symbol"] = symbol
+    rc, active = run(["systemctl", "is-active", SERVICE], timeout=10)
+    if active.strip() != "active":
+        send(chat_id, f"⚠️ trader service is {active.strip()} — start it first (/start), "
+                      "the monitor queries the venues.")
+        return
+    _enqueue_manual(req)
+    if symbol:
+        send(chat_id, f"📩 import requested for {symbol}. Scanning venues…")
+    else:
+        send(chat_id, "📩 scanning both venues for importable offsetting positions…")
+
+
 def cmd_funding(chat_id: str, arg: str):
     """Rank funding-carry opportunities across the equity universe.
 
@@ -754,6 +776,7 @@ def cmd_help(chat_id: str, _arg: str):
          "/enter SYM DIR NOTIONAL [basis_bps] — open a funding hold; basis_bps waits for a fill level\n"
          "/close SYM [basis_bps] — close a position; basis_bps waits for a fill level\n"
          "/cancel SYM — cancel a pending basis-gated /enter or /close\n"
+         "/import [SYM] — adopt existing venue positions into the bot for management\n"
          "/autoentry on|off — toggle auto basis-arb entry (exits unaffected)\n"
          "/positions — open positions detail\n"
          "/trades [n] — last n closed trades with P&L detail\n"
@@ -773,7 +796,7 @@ HANDLERS = {
     "/pnl": cmd_pnl, "/trades": cmd_trades,
     "/book": cmd_book,
     "/funding": cmd_funding, "/carry": cmd_funding,
-    "/enter": cmd_enter, "/close": cmd_close, "/cancel": cmd_cancel,
+    "/enter": cmd_enter, "/close": cmd_close, "/cancel": cmd_cancel, "/import": cmd_import,
     "/autoentry": cmd_autoentry,
     "/log": cmd_log, "/logs": cmd_log,
     "/spreads": cmd_spreads, "/spread": cmd_spreads,
@@ -847,6 +870,7 @@ def main():
             {"command": "enter", "description": "Open a funding hold: SYM DIR NOTIONAL [basis_bps]"},
             {"command": "close", "description": "Close a position: SYM [basis_bps]"},
             {"command": "cancel", "description": "Cancel a pending basis-gated order: SYM"},
+            {"command": "import", "description": "Adopt existing venue positions: [SYM]"},
             {"command": "autoentry", "description": "Toggle auto basis-arb entry: on|off"},
             {"command": "trades", "description": "Last N closed trades with P&L"},
             {"command": "pnl", "description": "Realised P&L today + all-time"},
