@@ -77,6 +77,10 @@ def init_db():
         ("hl_baseline_szi", "REAL DEFAULT 0"),
         ("aster_hedged_qty", "REAL DEFAULT 0"),
         ("aster_baseline_amt", "REAL DEFAULT 0"),
+        ("scale_pre_qty", "REAL DEFAULT 0"),
+        ("scale_pre_hl_px", "REAL DEFAULT 0"),
+        ("scale_pre_aster_px", "REAL DEFAULT 0"),
+        ("scale_pre_notional", "REAL DEFAULT 0"),
     ):
         try:
             conn.execute(f"ALTER TABLE positions ADD COLUMN {_col} {_type}")

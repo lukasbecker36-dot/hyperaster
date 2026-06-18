@@ -498,12 +498,25 @@ class Executor:
         """
         if direction not in ("long_hl_short_aster", "long_aster_short_hl"):
             return False, f"bad direction {direction!r}"
-        if self.pm.has_position(symbol):
-            # Maker-first rests the full notional (no top-of-book cap), so there's
-            # no scale-in need — one position per symbol. Close it to resize.
-            return False, f"{symbol}: position already exists — close it first to resize"
         if notional <= 0:
             return False, f"{symbol}: notional must be > 0"
+
+        # Scale-in: if an OPEN position already exists in the same direction, add
+        # to it. A mid-flight (entering/exiting) position can't be scaled, and an
+        # opposite-direction request is a reduction (use /close), not a scale.
+        existing = self.pm.get(symbol)
+        is_scale = False
+        if existing is not None:
+            if existing.status != "open":
+                return False, (f"{symbol}: position is '{existing.status}', not open — "
+                               f"wait for it to settle before scaling")
+            if existing.direction != direction:
+                return False, (f"{symbol}: existing position is {existing.direction}, "
+                               f"opposite to {direction} — use /close to reduce, not /enter")
+            if existing.entry_maker_venue != "hl":
+                return False, (f"{symbol}: existing position isn't a maker-first carry "
+                               f"trade — can't scale it this way")
+            is_scale = True
 
         try:
             aster_book, hl_book = await self.client.get_both_books(symbol)
@@ -548,6 +561,15 @@ class Executor:
             # Paper: assume the maker fills at its resting price and the Aster
             # taker hedges instantly at the touch.
             aster_fill = aster_book.bid if direction == "long_hl_short_aster" else aster_book.ask
+            if is_scale:
+                self.pm.start_scale_in(
+                    symbol=symbol, hl_maker_order_id="PAPER", increment_qty=qty,
+                    hl_ref_price=hl_ref_price, hl_baseline_szi=0.0,
+                    aster_baseline_amt=0.0, hl_funding_rate=hl_fr,
+                    aster_funding_rate=aster_fr,
+                )
+                self.pm.confirm_hl_maker_open(symbol, qty, hl_ref_price, aster_fill)
+                return True, f"[PAPER] scaled {symbol} {direction} +${qty*mid:.0f} (maker-first)"
             self.pm.open_hl_maker_entering(
                 symbol=symbol, aster_symbol=aster_symbol_for(symbol),
                 direction=direction, hl_maker_order_id="PAPER",
@@ -578,6 +600,21 @@ class Executor:
         alo = await self.client.place_hl_alo(symbol, hl_side, qty, hl_ref_price)
         if not alo.success:
             return False, f"{symbol}: HL maker not placed ({alo.error})"
+
+        if is_scale:
+            ok = self.pm.start_scale_in(
+                symbol=symbol, hl_maker_order_id=alo.order_id, increment_qty=qty,
+                hl_ref_price=hl_ref_price, hl_baseline_szi=baseline_szi,
+                aster_baseline_amt=aster_baseline_amt,
+                hl_funding_rate=hl_fr, aster_funding_rate=aster_fr,
+            )
+            if not ok:
+                await self.client.cancel_hl_order(symbol, alo.order_id)
+                return False, f"{symbol}: scale-in could not start (position state changed)"
+            return True, (
+                f"scaling {symbol} {direction} +${qty*mid:.0f} @ {hl_ref_price:.2f} "
+                f"(existing {existing.scale_pre_qty or existing.qty} qty) — hedging on fill"
+            )
 
         self.pm.open_hl_maker_entering(
             symbol=symbol, aster_symbol=aster_symbol_for(symbol),
@@ -757,8 +794,12 @@ class Executor:
         except Exception:
             hl_filled = pos.aster_hedged_qty
         if hl_filled <= 0:
-            log.warning(f"{symbol}: maker entry ended unfilled ({reason}) — cancelling record")
-            self.pm.drop_entering(symbol, reason)
+            if pos.scale_pre_qty > 0:
+                log.warning(f"{symbol}: scale-in increment unfilled ({reason}) — reverting")
+                self.pm.revert_scale_in(symbol)
+            else:
+                log.warning(f"{symbol}: maker entry ended unfilled ({reason}) — cancelling record")
+                self.pm.drop_entering(symbol, reason)
             return
         residual = self.client.snap_aster_qty(symbol, hl_filled - pos.aster_hedged_qty)
         if residual > 0:
@@ -780,7 +821,10 @@ class Executor:
                 f"(filled {hl_filled}, hedged {pos.aster_hedged_qty}) — CHECK MANUALLY"
             )
         if final_qty <= 0:
-            self.pm.drop_entering(symbol, "maker_entry_unhedged")
+            if pos.scale_pre_qty > 0:
+                self.pm.revert_scale_in(symbol)
+            else:
+                self.pm.drop_entering(symbol, "maker_entry_unhedged")
             return
         log.warning(f"{symbol}: maker entry partial {final_qty}/{pos.qty} ({reason}) — opening")
         self.pm.confirm_hl_maker_open(symbol, final_qty, pos.hl_entry_price, pos.aster_entry_price)

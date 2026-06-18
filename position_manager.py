@@ -97,6 +97,13 @@ class Position:
     aster_hedged_qty: float = 0.0  # Aster qty already hedged against HL fills
     aster_baseline_amt: float = 0.0  # Aster positionAmt before entry (hedge reconcile)
     aster_hedge_attempts: int = 0  # circuit breaker: total Aster hedge IOCs placed
+    # Scale-in tracking: when >0, this 'entering' record is adding to an existing
+    # open position. On completion the increment is blended into the pre-scale
+    # qty/prices; if it fails to fill, the position reverts to its pre-scale state.
+    scale_pre_qty: float = 0.0
+    scale_pre_hl_px: float = 0.0
+    scale_pre_aster_px: float = 0.0
+    scale_pre_notional: float = 0.0
 
 
 class PositionManager:
@@ -118,7 +125,9 @@ class PositionManager:
             "hl_funding_rate, aster_funding_rate, "
             "COALESCE(entry_baseline_bps, 0), COALESCE(hold_for_funding, 0), "
             "COALESCE(entry_maker_venue, ''), COALESCE(hl_baseline_szi, 0), "
-            "COALESCE(aster_hedged_qty, 0), COALESCE(aster_baseline_amt, 0) "
+            "COALESCE(aster_hedged_qty, 0), COALESCE(aster_baseline_amt, 0), "
+            "COALESCE(scale_pre_qty, 0), COALESCE(scale_pre_hl_px, 0), "
+            "COALESCE(scale_pre_aster_px, 0), COALESCE(scale_pre_notional, 0) "
             "FROM positions WHERE status NOT IN ('closed', 'error') AND paper=?",
             (paper_val,)
         ).fetchall()
@@ -140,6 +149,10 @@ class PositionManager:
                 hl_baseline_szi=r[22] or 0.0,
                 aster_hedged_qty=r[23] or 0.0,
                 aster_baseline_amt=r[24] or 0.0,
+                scale_pre_qty=r[25] or 0.0,
+                scale_pre_hl_px=r[26] or 0.0,
+                scale_pre_aster_px=r[27] or 0.0,
+                scale_pre_notional=r[28] or 0.0,
             )
             self.positions[p.symbol] = p
             log.warning(
@@ -281,10 +294,54 @@ class PositionManager:
     def confirm_hl_maker_open(
         self, symbol: str, final_qty: float, hl_avg_price: float, aster_avg_price: float,
     ):
-        """Finalize a maker-first entry once the HL leg is filled and hedged."""
+        """Finalize a maker-first entry once the HL leg is filled and hedged.
+
+        For a scale-in (scale_pre_qty>0), `final_qty` is the INCREMENT that
+        filled — blend it into the pre-scale position rather than replacing it."""
         pos = self.positions.get(symbol)
         if not pos:
             return
+
+        if pos.scale_pre_qty > 0:
+            # Blend the increment into the existing position by notional weight.
+            inc_qty = final_qty
+            inc_hl = hl_avg_price if hl_avg_price > 0 else pos.hl_entry_price
+            inc_aster = aster_avg_price if aster_avg_price > 0 else pos.aster_entry_price
+            inc_notional = inc_qty * ((inc_hl + inc_aster) / 2)
+            old_n = pos.scale_pre_notional or (pos.scale_pre_qty *
+                    ((pos.scale_pre_hl_px + pos.scale_pre_aster_px) / 2))
+            tot_n = old_n + inc_notional
+            w_old = old_n / tot_n if tot_n > 0 else 0.0
+            w_new = inc_notional / tot_n if tot_n > 0 else 1.0
+            total_qty = pos.scale_pre_qty + inc_qty
+            blended_hl = pos.scale_pre_hl_px * w_old + inc_hl * w_new
+            blended_aster = pos.scale_pre_aster_px * w_old + inc_aster * w_new
+            pos.qty = total_qty
+            pos.aster_hedged_qty = total_qty
+            pos.hl_entry_price = blended_hl
+            pos.aster_entry_price = blended_aster
+            pos.notional_usd = tot_n
+            pos.status = "open"
+            # Clear scale-in markers.
+            pos.scale_pre_qty = pos.scale_pre_hl_px = 0.0
+            pos.scale_pre_aster_px = pos.scale_pre_notional = 0.0
+            conn = get_connection()
+            conn.execute(
+                "UPDATE positions SET status='open', qty=?, aster_hedged_qty=?, "
+                "hl_entry_price=?, aster_entry_price=?, notional_usd=?, "
+                "scale_pre_qty=0, scale_pre_hl_px=0, scale_pre_aster_px=0, "
+                "scale_pre_notional=0 WHERE id=?",
+                (total_qty, total_qty, blended_hl, blended_aster, tot_n, pos.id),
+            )
+            conn.commit()
+            conn.close()
+            log.warning(
+                f"Position #{pos.id} SCALE-IN complete: {symbol} +{inc_qty} → "
+                f"total qty={total_qty} ${tot_n:.0f} | HL @ {blended_hl:.2f} | "
+                f"Aster @ {blended_aster:.2f}"
+            )
+            return
+
         pos.qty = final_qty
         pos.aster_hedged_qty = final_qty
         if hl_avg_price > 0:
@@ -305,6 +362,87 @@ class PositionManager:
         log.info(
             f"Position #{pos.id} OPEN (HL maker): {symbol} | qty={final_qty} | "
             f"HL @ {pos.hl_entry_price:.2f} | Aster @ {pos.aster_entry_price:.2f}"
+        )
+
+    def start_scale_in(
+        self, *, symbol: str, hl_maker_order_id: str, increment_qty: float,
+        hl_ref_price: float, hl_baseline_szi: float, aster_baseline_amt: float,
+        hl_funding_rate: float = 0.0, aster_funding_rate: float = 0.0,
+    ) -> bool:
+        """Put an OPEN position into scale-in 'entering' mode for an increment.
+
+        Stashes the pre-scale qty/prices so the increment can be blended in on
+        completion (or reverted if it fails). poll_hl_maker then drives the
+        increment exactly like a fresh maker entry, measuring fills from the
+        supplied baselines (which already include the existing position)."""
+        pos = self.positions.get(symbol)
+        if not pos or pos.status != "open":
+            return False
+        pos.scale_pre_qty = pos.qty
+        pos.scale_pre_hl_px = pos.hl_entry_price
+        pos.scale_pre_aster_px = pos.aster_entry_price
+        pos.scale_pre_notional = pos.notional_usd or (
+            pos.qty * ((pos.hl_entry_price + pos.aster_entry_price) / 2))
+        pos.qty = increment_qty           # poll completion target = the increment
+        pos.aster_hedged_qty = 0.0        # track only the new hedge
+        pos.aster_hedge_attempts = 0
+        pos.hl_baseline_szi = hl_baseline_szi
+        pos.aster_baseline_amt = aster_baseline_amt
+        pos.hl_entry_price = hl_ref_price  # increment's resting price (blends in poll)
+        pos.hl_entry_order_id = hl_maker_order_id
+        pos.entry_time = now_ms()
+        if hl_funding_rate:
+            pos.hl_funding_rate = hl_funding_rate
+        if aster_funding_rate:
+            pos.aster_funding_rate = aster_funding_rate
+        pos.status = "entering"
+        conn = get_connection()
+        conn.execute(
+            "UPDATE positions SET status='entering', qty=?, aster_hedged_qty=0, "
+            "hl_baseline_szi=?, aster_baseline_amt=?, "
+            "hl_entry_price=?, hl_entry_order_id=?, entry_time=?, "
+            "scale_pre_qty=?, scale_pre_hl_px=?, scale_pre_aster_px=?, "
+            "scale_pre_notional=? WHERE id=?",
+            (increment_qty, hl_baseline_szi, aster_baseline_amt, hl_ref_price,
+             hl_maker_order_id, pos.entry_time, pos.scale_pre_qty, pos.scale_pre_hl_px,
+             pos.scale_pre_aster_px, pos.scale_pre_notional, pos.id),
+        )
+        conn.commit()
+        conn.close()
+        log.warning(
+            f"Position #{pos.id} SCALE-IN started: {symbol} +{increment_qty} "
+            f"(existing {pos.scale_pre_qty}) | HL maker @ {hl_ref_price:.2f}"
+        )
+        return True
+
+    def revert_scale_in(self, symbol: str):
+        """Increment filled nothing — restore the position to its pre-scale state."""
+        pos = self.positions.get(symbol)
+        if not pos or pos.scale_pre_qty <= 0:
+            return
+        pos.qty = pos.scale_pre_qty
+        pos.aster_hedged_qty = pos.scale_pre_qty
+        pos.hl_entry_price = pos.scale_pre_hl_px
+        pos.aster_entry_price = pos.scale_pre_aster_px
+        pos.notional_usd = pos.scale_pre_notional
+        pos.status = "open"
+        pos.hl_entry_order_id = ""
+        pos.scale_pre_qty = pos.scale_pre_hl_px = 0.0
+        pos.scale_pre_aster_px = pos.scale_pre_notional = 0.0
+        conn = get_connection()
+        conn.execute(
+            "UPDATE positions SET status='open', qty=?, aster_hedged_qty=?, "
+            "hl_entry_price=?, aster_entry_price=?, notional_usd=?, "
+            "hl_entry_order_id='', scale_pre_qty=0, scale_pre_hl_px=0, "
+            "scale_pre_aster_px=0, scale_pre_notional=0 WHERE id=?",
+            (pos.qty, pos.qty, pos.hl_entry_price, pos.aster_entry_price,
+             pos.notional_usd, pos.id),
+        )
+        conn.commit()
+        conn.close()
+        log.warning(
+            f"Position #{pos.id} SCALE-IN reverted: {symbol} — increment unfilled, "
+            f"restored to qty={pos.qty} ${pos.notional_usd:.0f}"
         )
 
     def scale_in(
