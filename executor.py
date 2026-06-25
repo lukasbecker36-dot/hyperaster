@@ -499,6 +499,7 @@ class Executor:
             return False, f"{symbol}: drip already running — /cancel first"
         if not bite_notional:
             bite_notional = min(target_notional, 200.0)
+        bite_notional = max(bite_notional, 12.0)
         self._drips[symbol] = {
             "direction": direction,
             "target_notional": target_notional,
@@ -506,6 +507,8 @@ class Executor:
             "min_basis_bps": min_basis_bps,
             "bite_notional": bite_notional,
             "fills": 0,
+            "last_attempt_ms": 0,
+            "cooldown_ms": 5_000,
         }
         return True, (
             f"drip started: {symbol} {direction} target=${target_notional:.0f} "
@@ -526,6 +529,11 @@ class Executor:
         drip = self._drips.get(symbol)
         if not drip:
             return
+
+        now = now_ms()
+        if now - drip.get("last_attempt_ms", 0) < drip.get("cooldown_ms", 5_000):
+            return
+        drip["last_attempt_ms"] = now
 
         remaining = drip["target_notional"] - drip["filled_notional"]
         if remaining <= 0:
