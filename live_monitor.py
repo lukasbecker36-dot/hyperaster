@@ -104,6 +104,7 @@ _SPREADS_FILE = os.path.join(DATA_DIR, "latest_spreads.json")
 # (and manages exits + manual entries) but never auto-opens a basis arb. Lets you
 # go live for a manual funding trade without the auto-scanner also trading live.
 _AUTO_ENTRY_FILE = os.path.join(DATA_DIR, "auto_entry")
+_AUTO_EXIT_FILE = os.path.join(DATA_DIR, "auto_exit")
 # Manual command inbox: the control bot drops one JSON file per request here
 # ({"action":"enter","symbol":..,"direction":..,"notional":..} or
 # {"action":"close","symbol":..}). The monitor is the single order-placing
@@ -157,6 +158,16 @@ def _auto_entry_enabled() -> bool:
     """Read the runtime auto-entry flag. Missing/unreadable file = enabled (default)."""
     try:
         return Path(_AUTO_ENTRY_FILE).read_text().strip().lower() != "off"
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return True
+
+
+def _auto_exit_enabled() -> bool:
+    """Read the runtime auto-exit flag. Missing/unreadable file = enabled (default)."""
+    try:
+        return Path(_AUTO_EXIT_FILE).read_text().strip().lower() != "off"
     except FileNotFoundError:
         return True
     except Exception:
@@ -320,7 +331,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     # symbol -> est_net USD (executable bid/ask P&L) for open positions
     latest_est_net: dict[str, float] = {}
     # Runtime flags refreshed once per tick from their control files.
-    runtime_flags = {"auto_entry": True}
+    runtime_flags = {"auto_entry": True, "auto_exit": True}
     # Basis-gated manual orders waiting for a good fill level.
     #   pending_entries: symbol -> {direction, notional, target_bps, expires_ms}
     #   pending_exits:   symbol -> {target_bps}
@@ -409,8 +420,10 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 should_exit, reason = False, ""
                 sym_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(symbol, EXIT_TARGET_NET_USD)
 
-                # Skip auto-exit when a drip or drip_exit is managing this position
-                if symbol in executor._drip_exits or symbol in executor._drips:
+                # Skip auto-exit when disabled, or when a drip/drip_exit is active
+                if (not runtime_flags["auto_exit"]
+                        or symbol in executor._drip_exits
+                        or symbol in executor._drips):
                     pass
                 elif pos.hold_for_funding:
                     # Manual funding-carry hold: held for carry, never the basis
@@ -779,6 +792,11 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             if runtime_flags["auto_entry"] != prev_auto:
                 state = "ENABLED" if runtime_flags["auto_entry"] else "DISABLED"
                 log.warning(f"Auto-entry {state} (runtime flag changed)")
+            prev_auto_exit = runtime_flags["auto_exit"]
+            runtime_flags["auto_exit"] = _auto_exit_enabled()
+            if runtime_flags["auto_exit"] != prev_auto_exit:
+                state = "ENABLED" if runtime_flags["auto_exit"] else "DISABLED"
+                log.warning(f"Auto-exit {state} (runtime flag changed)")
             await process_manual_commands()
             await evaluate_gated_orders()
 

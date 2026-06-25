@@ -55,6 +55,7 @@ MODE_FILE = BASE_DIR / "data" / "mode.env"
 # The monitor is the only process that places orders, so manual entries/exits are
 # enqueued as files here rather than executed by this stdlib-only control bot.
 AUTO_ENTRY_FILE = BASE_DIR / "data" / "auto_entry"
+AUTO_EXIT_FILE = BASE_DIR / "data" / "auto_exit"
 MANUAL_CMD_DIR = BASE_DIR / "data" / "manual_cmds"
 
 TOKEN = os.getenv("ALERT_TELEGRAM_BOT_TOKEN", "")
@@ -629,6 +630,27 @@ def cmd_autoentry(chat_id: str, arg: str):
         send(chat_id, "✅ auto-entry ENABLED — scanner will auto-open basis arbs again.")
 
 
+def cmd_autoexit(chat_id: str, arg: str):
+    """Toggle the auto convergence/target/timeout exit. Manual /close and /drip_exit unaffected."""
+    a = arg.strip().lower()
+    if a not in ("on", "off"):
+        cur = "off" if (AUTO_EXIT_FILE.exists()
+                        and AUTO_EXIT_FILE.read_text().strip().lower() == "off") else "on"
+        send(chat_id,
+             f"auto-exit is currently {cur.upper()}.\n"
+             "/autoexit off — stop auto-closing positions (convergence/target/timeout)\n"
+             "/autoexit on — resume auto exit\n"
+             "/drip_exit still works regardless of this setting.")
+        return
+    AUTO_EXIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    AUTO_EXIT_FILE.write_text(a + "\n")
+    if a == "off":
+        send(chat_id, "🛑 auto-exit DISABLED — positions won't auto-close on convergence/target/timeout. "
+                      "Manual /close and /drip_exit still work. (takes effect within ~1s, no restart)")
+    else:
+        send(chat_id, "✅ auto-exit ENABLED — positions will auto-close on convergence/target/timeout again.")
+
+
 def cmd_enter(chat_id: str, arg: str):
     """Manually open ONE delta-neutral funding-carry hold via the monitor.
 
@@ -920,6 +942,7 @@ def cmd_help(chat_id: str, _arg: str):
          "/drip_exit SYM MAX_BPS BITE_QTY — taker-taker drip exit when spread narrows\n"
          "/import [SYM] — adopt existing venue positions into the bot for management\n"
          "/autoentry on|off — toggle auto basis-arb entry (exits unaffected)\n"
+         "/autoexit on|off — toggle auto convergence/target exit (/drip_exit unaffected)\n"
          "/positions — open positions detail\n"
          "/trades [n] — last n closed trades with P&L detail\n"
          "/pnl — realised P&L (today + all-time)\n"
@@ -940,7 +963,7 @@ HANDLERS = {
     "/funding": cmd_funding, "/carry": cmd_funding,
     "/enter": cmd_enter, "/close": cmd_close, "/cancel": cmd_cancel,
     "/drip": cmd_drip, "/drip_exit": cmd_drip_exit, "/import": cmd_import,
-    "/autoentry": cmd_autoentry,
+    "/autoentry": cmd_autoentry, "/autoexit": cmd_autoexit,
     "/log": cmd_log, "/logs": cmd_log,
     "/spreads": cmd_spreads, "/spread": cmd_spreads,
     "/mode": cmd_mode, "/paper": cmd_paper, "/live": cmd_live,
@@ -1017,6 +1040,7 @@ def main():
             {"command": "drip_exit", "description": "Taker-taker drip exit: SYM MAX_BPS BITE_QTY"},
             {"command": "import", "description": "Adopt existing venue positions: [SYM]"},
             {"command": "autoentry", "description": "Toggle auto basis-arb entry: on|off"},
+            {"command": "autoexit", "description": "Toggle auto convergence/target exit: on|off"},
             {"command": "trades", "description": "Last N closed trades with P&L"},
             {"command": "pnl", "description": "Realised P&L today + all-time"},
             {"command": "log", "description": "Last n journal lines"},
