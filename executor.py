@@ -489,7 +489,7 @@ class Executor:
 
     def start_drip(
         self, symbol: str, direction: str, target_notional: float,
-        min_basis_bps: float, bite_notional: float = 0.0,
+        min_basis_bps: float, bite_qty: float = 0.0,
     ) -> tuple[bool, str]:
         if direction not in ("long_hl_short_aster", "long_aster_short_hl"):
             return False, f"bad direction {direction!r}"
@@ -497,22 +497,21 @@ class Executor:
             return False, f"target notional must be > 0"
         if symbol in self._drips:
             return False, f"{symbol}: drip already running — /cancel first"
-        if not bite_notional:
-            bite_notional = min(target_notional, 200.0)
-        bite_notional = max(bite_notional, 12.0)
+        if bite_qty <= 0:
+            return False, "bite_qty must be > 0 (shares per bite)"
         self._drips[symbol] = {
             "direction": direction,
             "target_notional": target_notional,
             "filled_notional": 0.0,
             "min_basis_bps": min_basis_bps,
-            "bite_notional": bite_notional,
+            "bite_qty": bite_qty,
             "fills": 0,
             "last_attempt_ms": 0,
             "cooldown_ms": 5_000,
         }
         return True, (
             f"drip started: {symbol} {direction} target=${target_notional:.0f} "
-            f"bite=${bite_notional:.0f} min_basis={min_basis_bps:.0f}bps"
+            f"bite={bite_qty}shares min_basis={min_basis_bps:.0f}bps"
         )
 
     def cancel_drip(self, symbol: str) -> tuple[bool, str]:
@@ -576,16 +575,14 @@ class Executor:
             log.debug(f"drip {symbol}: basis {basis_bps:.0f}bps < min {drip['min_basis_bps']:.0f}bps")
             return
 
-        # Size this bite: min of bite_notional, remaining, and available Aster depth.
-        # Capping to Aster depth avoids placing IOCs that can't fill because the
-        # book is too thin (common on equity perps with 0.01-0.02 per level).
-        bite_usd = min(drip["bite_notional"], remaining)
-        raw_qty = bite_usd / mid
+        # Size this bite: min of configured bite_qty, remaining qty, and Aster depth.
+        remaining_qty = remaining / mid if mid > 0 else 0
+        raw_qty = min(drip["bite_qty"], remaining_qty)
         if aster_depth > 0:
             raw_qty = min(raw_qty, aster_depth)
         bite_qty = self.client.snap_aster_qty(symbol, raw_qty)
         bite_notional_actual = bite_qty * mid
-        if bite_qty <= 0 or bite_notional_actual < 12.0:
+        if bite_qty <= 0 or bite_notional_actual < 5.0:
             log.debug(f"drip {symbol}: bite too small (qty={bite_qty} notional=${bite_notional_actual:.1f} "
                       f"mid={mid:.2f} ast_depth={aster_depth})")
             return

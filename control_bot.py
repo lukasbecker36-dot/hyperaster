@@ -272,7 +272,8 @@ def _pending_gate_lines() -> list[str]:
         out.append(
             f"  • {sym} 💧DRIP {short} ${d.get('filled_notional',0):.0f}"
             f"/${d.get('target_notional',0):.0f} "
-            f"({d.get('fills',0)} fills) min≥{d.get('min_basis_bps',0):.0f}bps"
+            f"({d.get('fills',0)} fills) bite={d.get('bite_qty',0)}sh "
+            f"min≥{d.get('min_basis_bps',0):.0f}bps"
         )
     out.append("  (/cancel SYM to clear a gate)")
     return out
@@ -724,22 +725,22 @@ def cmd_cancel(chat_id: str, arg: str):
 def cmd_drip(chat_id: str, arg: str):
     """Taker-taker drip entry: small bites until target notional is reached.
 
-    Usage: /drip SYMBOL DIRECTION NOTIONAL MIN_BASIS_BPS [BITE_USD]
+    Usage: /drip SYMBOL DIRECTION NOTIONAL MIN_BASIS_BPS BITE_QTY
       DIRECTION: long_hl_short_aster | long_aster_short_hl (or aliases)
       NOTIONAL:  total target USD per leg
       MIN_BASIS_BPS: minimum executable basis (bps) to place a bite
-      BITE_USD (optional): notional per bite, default $200
+      BITE_QTY: shares per bite (e.g. 0.6)
 
     Each tick, if the executable spread ≥ MIN_BASIS_BPS, places one small
     taker-taker order (HL IOC + Aster IOC). Accumulates into one position.
     Use /cancel SYMBOL to stop early.
     """
     toks = arg.split()
-    if len(toks) not in (4, 5):
+    if len(toks) != 5:
         send(chat_id,
-             "Usage: /drip SYMBOL DIRECTION NOTIONAL MIN_BASIS_BPS [BITE_USD]\n"
-             "e.g. /drip ZHIPU buy_hl 2000 50\n"
-             "     /drip ZHIPU buy_hl 2000 50 100   (bites of $100)\n"
+             "Usage: /drip SYMBOL DIRECTION NOTIONAL MIN_BASIS_BPS BITE_QTY\n"
+             "e.g. /drip ZHIPU buy_hl 2000 50 0.6\n"
+             "BITE_QTY is in shares (e.g. 0.6 = 0.6 shares per bite)\n"
              "DIRECTION aliases: buy_hl / buy_aster / L-HL/S-AST / L-AST/S-HL")
         return
     symbol = toks[0].upper()
@@ -759,15 +760,13 @@ def cmd_drip(chat_id: str, arg: str):
     except ValueError:
         send(chat_id, f"Bad min basis {toks[3]!r} — must be a number (bps).")
         return
-    bite = 0.0
-    if len(toks) == 5:
-        try:
-            bite = float(toks[4])
-            if bite <= 0:
-                raise ValueError
-        except ValueError:
-            send(chat_id, f"Bad bite size {toks[4]!r} — must be a positive number.")
-            return
+    try:
+        bite_qty = float(toks[4])
+        if bite_qty <= 0:
+            raise ValueError
+    except ValueError:
+        send(chat_id, f"Bad bite qty {toks[4]!r} — must be a positive number (shares).")
+        return
 
     rc, active = run(["systemctl", "is-active", SERVICE], timeout=10)
     if active.strip() != "active":
@@ -775,11 +774,9 @@ def cmd_drip(chat_id: str, arg: str):
         return
 
     req = {"action": "drip", "symbol": symbol, "direction": direction,
-           "notional": notional, "min_basis_bps": min_basis}
-    if bite:
-        req["bite_notional"] = bite
+           "notional": notional, "min_basis_bps": min_basis, "bite_qty": bite_qty}
     short = "L-HL/S-AST" if direction == "long_hl_short_aster" else "L-AST/S-HL"
-    bite_str = f" bite=${bite:.0f}" if bite else ""
+    bite_str = f" bite={bite_qty}shares"
 
     if read_mode() == "live":
         _PENDING_ENTER[chat_id] = (req, time.time() + _CONFIRM_TTL)
@@ -857,7 +854,7 @@ def cmd_help(chat_id: str, _arg: str):
          "/enter SYM DIR NOTIONAL [basis_bps] — open a funding hold; basis_bps waits for a fill level\n"
          "/close SYM [basis_bps] — close a position; basis_bps waits for a fill level\n"
          "/cancel SYM — cancel a pending basis-gated /enter or /close or /drip\n"
-         "/drip SYM DIR NOTIONAL MIN_BPS [BITE] — taker-taker drip entry\n"
+         "/drip SYM DIR NOTIONAL MIN_BPS BITE_QTY — taker-taker drip entry\n"
          "/import [SYM] — adopt existing venue positions into the bot for management\n"
          "/autoentry on|off — toggle auto basis-arb entry (exits unaffected)\n"
          "/positions — open positions detail\n"
@@ -953,7 +950,7 @@ def main():
             {"command": "enter", "description": "Open a funding hold: SYM DIR NOTIONAL [basis_bps]"},
             {"command": "close", "description": "Close a position: SYM [basis_bps]"},
             {"command": "cancel", "description": "Cancel a pending basis-gated order: SYM"},
-            {"command": "drip", "description": "Taker-taker drip entry: SYM DIR NOTIONAL MIN_BPS"},
+            {"command": "drip", "description": "Taker-taker drip: SYM DIR NOTIONAL MIN_BPS BITE_QTY"},
             {"command": "import", "description": "Adopt existing venue positions: [SYM]"},
             {"command": "autoentry", "description": "Toggle auto basis-arb entry: on|off"},
             {"command": "trades", "description": "Last N closed trades with P&L"},

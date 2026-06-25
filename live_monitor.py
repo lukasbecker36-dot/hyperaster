@@ -567,9 +567,9 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     direction = cmd.get("direction", "")
                     notional = float(cmd.get("notional", 0) or 0)
                     min_basis = float(cmd.get("min_basis_bps", 0) or 0)
-                    bite = float(cmd.get("bite_notional", 0) or 0)
+                    bite_qty = float(cmd.get("bite_qty", 0) or 0)
                     ok, msg = executor.start_drip(
-                        symbol, direction, notional, min_basis, bite)
+                        symbol, direction, notional, min_basis, bite_qty)
                     send_alert(f"/drip {symbol}: {'OK' if ok else 'FAILED'} — {msg}")
                 elif action == "import":
                     await _handle_import(symbol or None)
