@@ -580,17 +580,16 @@ class Executor:
                      f"(${drip['filled_notional']:.0f}/${drip['target_notional']:.0f} filled)")
             return
 
-        # Size this bite: min of configured bite_qty, remaining qty, and Aster depth.
+        # Size this bite: min of configured bite_qty and remaining qty.
+        # Don't cap to Aster depth — the IOC will partial-fill for whatever's
+        # available, and we check actual fill notional before hedging on HL.
         remaining_qty = remaining / mid if mid > 0 else 0
         raw_qty = min(drip["bite_qty"], remaining_qty)
-        if aster_depth > 0:
-            raw_qty = min(raw_qty, aster_depth)
         bite_qty = self.client.snap_aster_qty(symbol, raw_qty)
         bite_notional_actual = bite_qty * mid
-        if bite_qty <= 0 or bite_notional_actual < 12.0:
-            log.info(f"drip {symbol}: bite too small for both venues "
-                     f"(qty={bite_qty} notional=${bite_notional_actual:.1f} "
-                     f"mid={mid:.2f} ast_depth={aster_depth}, need $12+)")
+        if bite_qty <= 0:
+            log.info(f"drip {symbol}: bite_qty snapped to 0 "
+                     f"(mid={mid:.2f} ast_depth={aster_depth})")
             return
 
         if direction == "long_hl_short_aster":
