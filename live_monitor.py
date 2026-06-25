@@ -408,7 +408,11 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
 
                 should_exit, reason = False, ""
                 sym_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(symbol, EXIT_TARGET_NET_USD)
-                if pos.hold_for_funding:
+
+                # Skip auto-exit when a drip or drip_exit is managing this position
+                if symbol in executor._drip_exits or symbol in executor._drips:
+                    pass
+                elif pos.hold_for_funding:
                     # Manual funding-carry hold: held for carry, never the basis
                     # target/convergence exits (those would close it the moment the
                     # basis reverts). The blocklist is a convergence-strategy concern,
