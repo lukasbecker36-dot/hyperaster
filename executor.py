@@ -530,8 +530,11 @@ class Executor:
             return
 
         now = now_ms()
-        if now - drip.get("last_attempt_ms", 0) < drip.get("cooldown_ms", 5_000):
+        elapsed = now - drip.get("last_attempt_ms", 0)
+        if elapsed < drip.get("cooldown_ms", 5_000):
             return
+        log.info(f"drip {symbol}: tick (elapsed={elapsed/1000:.1f}s, "
+                 f"${drip['filled_notional']:.0f}/${drip['target_notional']:.0f})")
         drip["last_attempt_ms"] = now
 
         remaining = drip["target_notional"] - drip["filled_notional"]
@@ -554,7 +557,7 @@ class Executor:
             log.warning(f"drip {symbol}: book fetch failed ({e})")
             return
         if aster_book.bid <= 0 or hl_book.bid <= 0:
-            log.debug(f"drip {symbol}: empty book (HL bid={hl_book.bid} Ast bid={aster_book.bid})")
+            log.info(f"drip {symbol}: empty book (HL bid={hl_book.bid} Ast bid={aster_book.bid})")
             return
 
         mid = (aster_book.mid + hl_book.mid) / 2
