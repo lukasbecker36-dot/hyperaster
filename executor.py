@@ -623,47 +623,14 @@ class Executor:
                     f"drip complete: {symbol} ${drip['filled_notional']:.0f} ({drip['fills']} fills)")
             return
 
-        # ── Live: taker-taker ──
+        # ── Live: taker-taker (Aster first, then HL) ──
+        # Aster is the thin/illiquid side — fill it first. If it doesn't fill,
+        # no harm (no position taken). If it fills, HL has plenty of depth to
+        # hedge immediately. This avoids the leg-risk problem of filling HL
+        # first and then failing to fill the Aster hedge.
         await self.client.ensure_perp_margin(symbol)
 
-        try:
-            pre_pos = await self.client.get_hl_position(symbol)
-            baseline_szi = float(pre_pos.get("szi", 0) or 0)
-        except Exception as e:
-            log.warning(f"drip {symbol}: HL pre-position failed ({e})")
-            return
-
-        hl_intent = record_intent(
-            symbol=symbol, venue="hl", action="drip_ioc",
-            direction=direction, side=hl_side, qty=bite_qty,
-            ref_price=hl_ref, baseline_szi=baseline_szi, paper=False,
-        )
-        hl_res = await self.client.place_hl_ioc(symbol, hl_side, bite_qty, hl_ref)
-
-        if hl_res.ambiguous:
-            expected_signed = bite_qty if hl_side == "buy" else -bite_qty
-            filled, actual_signed, _ = await self.client.reconcile_hl_position_delta(
-                symbol, baseline_szi, expected_signed)
-            if filled:
-                hl_res = OrderResult(success=True, order_id="RECONCILED",
-                                     filled_qty=abs(actual_signed), fill_price=hl_ref)
-            else:
-                complete_intent(hl_intent, "no_fill", notes="ambiguous reconciled unfilled")
-                return
-
-        if not hl_res.success or hl_res.filled_qty <= 0:
-            complete_intent(hl_intent, "no_fill", notes=hl_res.error[:200])
-            return
-
-        complete_intent(hl_intent, "filled",
-                        notes=f"qty={hl_res.filled_qty} px={hl_res.fill_price}")
-        actual_qty = hl_res.filled_qty
-
-        # Aster taker leg — snapshot position before, reconcile after.
-        # Aster IOC can return executedQty=0 in the POST response but fill
-        # asynchronously as a taker. If we trust the response and emergency-
-        # close HL, we'd create a naked Aster short. Instead, wait and check
-        # the actual position delta.
+        # Snapshot Aster position before the order for reconciliation.
         try:
             pre_ap = await self.client.get_aster_position(symbol)
             aster_pre_amt = float(pre_ap.get("positionAmt", 0) or 0)
@@ -672,41 +639,76 @@ class Executor:
 
         ast_intent = record_intent(
             symbol=symbol, venue="aster", action="drip_ioc",
-            direction=direction, side=aster_side, qty=actual_qty,
+            direction=direction, side=aster_side, qty=bite_qty,
             ref_price=aster_ref, paper=False,
         )
-        ast_res = await self.client.place_aster_ioc(symbol, aster_side, actual_qty, aster_ref)
+        ast_res = await self.client.place_aster_ioc(symbol, aster_side, bite_qty, aster_ref)
 
+        # Aster IOC can return executedQty=0 but fill async as taker.
+        # Wait and reconcile from the actual position delta.
         if not ast_res.success or ast_res.filled_qty <= 0:
-            # Don't trust the response — Aster IOC may have filled async.
-            # Wait briefly and check the actual position delta.
             if aster_pre_amt is not None:
                 await asyncio.sleep(2.0)
                 try:
                     post_ap = await self.client.get_aster_position(symbol)
                     aster_post_amt = float(post_ap.get("positionAmt", 0) or 0)
                     delta = abs(aster_post_amt - aster_pre_amt)
-                    if delta >= actual_qty * 0.90:
+                    if delta >= bite_qty * 0.50:
                         log.warning(
                             f"drip {symbol}: Aster IOC reported no fill but position "
-                            f"moved {aster_pre_amt} -> {aster_post_amt} — reconciled as filled"
+                            f"moved {aster_pre_amt} -> {aster_post_amt} — reconciled"
                         )
                         ast_res = OrderResult(
                             success=True, order_id=ast_res.order_id or "RECONCILED",
                             filled_qty=delta, fill_price=aster_ref,
                         )
                 except Exception as e:
-                    log.warning(f"drip {symbol}: Aster position reconcile failed ({e})")
+                    log.warning(f"drip {symbol}: Aster reconcile failed ({e})")
 
         if not ast_res.success or ast_res.filled_qty <= 0:
-            complete_intent(ast_intent, "no_fill", notes=(ast_res.error or "no fill")[:200])
-            log.error(f"drip {symbol}: Aster IOC failed after HL fill — emergency closing HL")
-            close_side = "sell" if hl_side == "buy" else "buy"
-            await self.client.place_hl_ioc(symbol, close_side, actual_qty, hl_res.fill_price)
+            complete_intent(ast_intent, "no_fill",
+                            notes=(ast_res.error or "no fill")[:200])
+            log.debug(f"drip {symbol}: Aster IOC no fill — skipping this tick")
             return
 
         complete_intent(ast_intent, "filled",
                         notes=f"qty={ast_res.filled_qty} px={ast_res.fill_price}")
+        actual_qty = ast_res.filled_qty
+
+        # HL hedge leg — HL is liquid, this should always fill.
+        try:
+            pre_pos = await self.client.get_hl_position(symbol)
+            baseline_szi = float(pre_pos.get("szi", 0) or 0)
+        except Exception as e:
+            log.warning(f"drip {symbol}: HL pre-position failed ({e})")
+            # Aster already filled — must try HL anyway
+            baseline_szi = 0.0
+
+        hl_intent = record_intent(
+            symbol=symbol, venue="hl", action="drip_ioc",
+            direction=direction, side=hl_side, qty=actual_qty,
+            ref_price=hl_ref, baseline_szi=baseline_szi, paper=False,
+        )
+        hl_res = await self.client.place_hl_ioc(symbol, hl_side, actual_qty, hl_ref)
+
+        if hl_res.ambiguous:
+            expected_signed = actual_qty if hl_side == "buy" else -actual_qty
+            filled, actual_signed, _ = await self.client.reconcile_hl_position_delta(
+                symbol, baseline_szi, expected_signed)
+            if filled:
+                hl_res = OrderResult(success=True, order_id="RECONCILED",
+                                     filled_qty=abs(actual_signed), fill_price=hl_ref)
+
+        if not hl_res.success or hl_res.filled_qty <= 0:
+            complete_intent(hl_intent, "no_fill", notes=hl_res.error[:200])
+            log.error(f"drip {symbol}: HL IOC failed after Aster fill — "
+                      f"NAKED ASTER {aster_side} {actual_qty} — retry next tick")
+            # Don't emergency-close Aster (illiquid) — the next drip tick will
+            # try HL again, or the user can /cancel and handle manually.
+            return
+
+        complete_intent(hl_intent, "filled",
+                        notes=f"qty={hl_res.filled_qty} px={hl_res.fill_price}")
 
         fill_notional = actual_qty * mid
         hl_fr = self.client.get_hl_funding_rate(symbol)

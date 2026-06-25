@@ -781,15 +781,10 @@ class ExchangeClient:
                     f"Aster IOC: {side.upper()} {qty} {aster_sym} @ {limit_px} -> "
                     f"filled {filled_qty} @ {fill_price} (oid {oid}, status={order_status})"
                 )
-                # Safety: if Aster returned a non-terminal status (e.g. "NEW"),
-                # the order may be resting instead of IOC. Cancel it immediately
-                # to prevent phantom resting orders that fill later.
-                if order_status not in ("FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED"):
-                    log.warning(
-                        f"Aster IOC order {oid} has status {order_status!r} — "
-                        f"cancelling to prevent resting order"
-                    )
-                    await self.cancel_aster_order(symbol, oid)
+                # Aster matches IOC orders asynchronously — the POST response
+                # often returns status=NEW with executedQty=0, then the order
+                # fills as a taker microseconds later. Do NOT cancel here; the
+                # caller reconciles from the actual position delta.
                 return OrderResult(
                     success=filled_qty > 0, order_id=oid,
                     filled_qty=filled_qty, fill_price=fill_price or limit_px,
