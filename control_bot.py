@@ -255,7 +255,8 @@ def _pending_gate_lines() -> list[str]:
     entries = g.get("entries", {}) or {}
     exits = g.get("exits", {}) or {}
     drips = g.get("drips", {}) or {}
-    if not entries and not exits and not drips:
+    drip_exits = g.get("drip_exits", {}) or {}
+    if not entries and not exits and not drips and not drip_exits:
         return []
     out = ["⏳ Pending basis gates:"]
     for sym, r in entries.items():
@@ -276,6 +277,14 @@ def _pending_gate_lines() -> list[str]:
             f"/${d.get('target_notional',0):.0f} "
             f"({d.get('fills',0)} fills) bite={d.get('bite_qty',0)}sh "
             f"min≥{d.get('min_basis_bps',0):.0f}bps{uh_str}"
+        )
+    for sym, d in drip_exits.items():
+        short = "L-HL/S-AST" if d.get("direction") == "long_hl_short_aster" else "L-AST/S-HL"
+        out.append(
+            f"  • {sym} 💧EXIT {short} {d.get('exited_qty',0):.3f}"
+            f"/{d.get('total_qty',0):.3f}sh "
+            f"({d.get('fills',0)} fills) bite={d.get('bite_qty',0)}sh "
+            f"max≤{d.get('max_basis_bps',0):.0f}bps"
         )
     out.append("  (/cancel SYM to clear a gate)")
     return out
@@ -793,6 +802,57 @@ def cmd_drip(chat_id: str, arg: str):
          f"min basis {min_basis:.0f}bps{bite_str}. /cancel {symbol} to stop.")
 
 
+def cmd_drip_exit(chat_id: str, arg: str):
+    """Taker-taker drip exit: unwind position in small bites when spread narrows.
+
+    Usage: /drip_exit SYMBOL MAX_BASIS_BPS BITE_QTY
+      MAX_BASIS_BPS: exit when executable spread ≤ this (e.g. 0 = fully converged)
+      BITE_QTY: shares per bite (e.g. 0.04)
+
+    Reverses the position's entry direction. Use /cancel SYMBOL to stop.
+    """
+    toks = arg.split()
+    if len(toks) != 3:
+        send(chat_id,
+             "Usage: /drip_exit SYMBOL MAX_BASIS_BPS BITE_QTY\n"
+             "e.g. /drip_exit ZHIPU 0 0.04\n"
+             "Exits when spread ≤ MAX_BASIS_BPS, in bites of BITE_QTY shares.")
+        return
+    symbol = toks[0].upper()
+    try:
+        max_basis = float(toks[1])
+    except ValueError:
+        send(chat_id, f"Bad max basis {toks[1]!r} — must be a number (bps).")
+        return
+    try:
+        bite_qty = float(toks[2])
+        if bite_qty <= 0:
+            raise ValueError
+    except ValueError:
+        send(chat_id, f"Bad bite qty {toks[2]!r} — must be a positive number (shares).")
+        return
+
+    rc, active = run(["systemctl", "is-active", SERVICE], timeout=10)
+    if active.strip() != "active":
+        send(chat_id, f"⚠️ trader service is {active.strip()} — start it first (/start).")
+        return
+
+    req = {"action": "drip_exit", "symbol": symbol,
+           "max_basis_bps": max_basis, "bite_qty": bite_qty}
+    bite_str = f" bite={bite_qty}shares"
+
+    if read_mode() == "live":
+        _PENDING_ENTER[chat_id] = (req, time.time() + _CONFIRM_TTL)
+        send(chat_id,
+             f"⚠️ LIVE drip_exit: {symbol} exit when spread ≤{max_basis:.0f}bps{bite_str}.\n"
+             "This places REAL taker-taker exit orders each tick. Reply YES within 60s.")
+        return
+    _enqueue_manual(req)
+    send(chat_id,
+         f"📩 queued [PAPER] drip_exit: {symbol} exit when spread "
+         f"≤{max_basis:.0f}bps{bite_str}. /cancel {symbol} to stop.")
+
+
 def cmd_import(chat_id: str, arg: str):
     """Import existing venue positions into the bot's DB for management.
 
@@ -857,6 +917,7 @@ def cmd_help(chat_id: str, _arg: str):
          "/close SYM [basis_bps] — close a position; basis_bps waits for a fill level\n"
          "/cancel SYM — cancel a pending basis-gated /enter or /close or /drip\n"
          "/drip SYM DIR NOTIONAL MIN_BPS BITE_QTY — taker-taker drip entry\n"
+         "/drip_exit SYM MAX_BPS BITE_QTY — taker-taker drip exit when spread narrows\n"
          "/import [SYM] — adopt existing venue positions into the bot for management\n"
          "/autoentry on|off — toggle auto basis-arb entry (exits unaffected)\n"
          "/positions — open positions detail\n"
@@ -878,7 +939,7 @@ HANDLERS = {
     "/book": cmd_book,
     "/funding": cmd_funding, "/carry": cmd_funding,
     "/enter": cmd_enter, "/close": cmd_close, "/cancel": cmd_cancel,
-    "/drip": cmd_drip, "/import": cmd_import,
+    "/drip": cmd_drip, "/drip_exit": cmd_drip_exit, "/import": cmd_import,
     "/autoentry": cmd_autoentry,
     "/log": cmd_log, "/logs": cmd_log,
     "/spreads": cmd_spreads, "/spread": cmd_spreads,
@@ -953,6 +1014,7 @@ def main():
             {"command": "close", "description": "Close a position: SYM [basis_bps]"},
             {"command": "cancel", "description": "Cancel a pending basis-gated order: SYM"},
             {"command": "drip", "description": "Taker-taker drip: SYM DIR NOTIONAL MIN_BPS BITE_QTY"},
+            {"command": "drip_exit", "description": "Taker-taker drip exit: SYM MAX_BPS BITE_QTY"},
             {"command": "import", "description": "Adopt existing venue positions: [SYM]"},
             {"command": "autoentry", "description": "Toggle auto basis-arb entry: on|off"},
             {"command": "trades", "description": "Last N closed trades with P&L"},

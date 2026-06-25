@@ -61,6 +61,7 @@ class Executor:
         # Active drip orders: symbol -> {direction, target_notional, filled_notional,
         # min_basis_bps, fills}. Each tick places one taker-taker bite if basis is met.
         self._drips: dict[str, dict] = {}
+        self._drip_exits: dict[str, dict] = {}
 
     # ── Entry ──
 
@@ -522,6 +523,260 @@ class Executor:
             f"drip cancelled: {symbol} filled ${drip['filled_notional']:.0f}"
             f"/${drip['target_notional']:.0f} ({drip['fills']} fills)"
         )
+
+    # ── Drip exit (taker-taker unwind when spread narrows) ──
+
+    def start_drip_exit(
+        self, symbol: str, max_basis_bps: float, bite_qty: float,
+    ) -> tuple[bool, str]:
+        pos = self.pm.get(symbol)
+        if not pos or pos.status != "open":
+            return False, f"{symbol}: no open position to exit"
+        if bite_qty <= 0:
+            return False, "bite_qty must be > 0 (shares per bite)"
+        if symbol in self._drip_exits:
+            return False, f"{symbol}: drip_exit already running — /cancel first"
+        self._drip_exits[symbol] = {
+            "direction": pos.direction,
+            "total_qty": pos.qty,
+            "exited_qty": 0.0,
+            "exited_notional": 0.0,
+            "max_basis_bps": max_basis_bps,
+            "bite_qty": bite_qty,
+            "fills": 0,
+            "last_attempt_ms": 0,
+            "cooldown_ms": 5_000,
+            "unhedged_qty": 0.0,
+            "last_hl_exit_price": 0.0,
+            "last_aster_exit_price": 0.0,
+        }
+        return True, (
+            f"drip_exit started: {symbol} {pos.direction} qty={pos.qty:.4f} "
+            f"bite={bite_qty}shares max_basis={max_basis_bps:.0f}bps"
+        )
+
+    def cancel_drip_exit(self, symbol: str) -> tuple[bool, str]:
+        de = self._drip_exits.pop(symbol, None)
+        if not de:
+            return False, f"{symbol}: no active drip_exit"
+        return True, (
+            f"drip_exit cancelled: {symbol} exited {de['exited_qty']:.4f}"
+            f"/{de['total_qty']:.4f} ({de['fills']} fills)"
+        )
+
+    async def drip_exit_tick(self, symbol: str):
+        """One tick of drip exit: close a small bite when spread narrows."""
+        de = self._drip_exits.get(symbol)
+        if not de:
+            return
+
+        now = now_ms()
+        elapsed = now - de.get("last_attempt_ms", 0)
+        if elapsed < de.get("cooldown_ms", 5_000):
+            return
+
+        remaining_qty = de["total_qty"] - de["exited_qty"]
+        if remaining_qty <= 0.0001:
+            msg = (f"drip_exit complete: {symbol} exited {de['exited_qty']:.4f} "
+                   f"({de['fills']} fills)")
+            self._drip_exits.pop(symbol, None)
+            # Close the position in the DB
+            pos = self.pm.get(symbol)
+            if pos and pos.status == "open":
+                self.pm.start_exiting(
+                    symbol, "drip_exit", "drip_exit",
+                    de["last_hl_exit_price"], de["max_basis_bps"])
+                self.pm.confirm_aster_exit(
+                    symbol, de["last_aster_exit_price"], "drip_exit_converge")
+            log.warning(msg)
+            return msg
+
+        log.info(f"drip_exit {symbol}: tick (elapsed={elapsed/1000:.1f}s, "
+                 f"{de['exited_qty']:.3f}/{de['total_qty']:.3f})")
+        de["last_attempt_ms"] = now
+
+        direction = de["direction"]
+
+        if not await self.client.ensure_symbol_loaded(symbol):
+            log.warning(f"drip_exit {symbol}: ensure_symbol_loaded failed")
+            return
+
+        try:
+            aster_book, hl_book = await self.client.get_both_books(symbol)
+        except Exception as e:
+            log.warning(f"drip_exit {symbol}: book fetch failed ({e})")
+            return
+        if aster_book.bid <= 0 or hl_book.bid <= 0:
+            log.info(f"drip_exit {symbol}: empty book")
+            return
+
+        mid = (aster_book.mid + hl_book.mid) / 2
+        if mid <= 0:
+            return
+
+        raw_qty = min(de["bite_qty"], remaining_qty)
+
+        # Exit = reverse of entry. For long_hl_short_aster:
+        #   entry was: buy HL ask, sell Aster bid → basis = (ast_bid - hl_ask)
+        #   exit is:   sell HL bid, buy Aster ask → basis = (ast_ask - hl_bid)
+        # We want to exit when the spread has NARROWED, i.e. basis ≤ max_basis.
+        if direction == "long_hl_short_aster":
+            aster_vwap = aster_book.vwap_buy(raw_qty)    # buying back Aster short
+            hl_vwap = hl_book.vwap_sell(raw_qty)          # selling HL long
+            basis_bps = (aster_vwap - hl_vwap) / mid * 10000
+            hl_side, aster_side = "sell", "buy"
+            hl_ref = hl_book.bid
+            aster_ref = aster_book.ask
+        else:
+            hl_vwap = hl_book.vwap_buy(raw_qty)           # buying back HL short
+            aster_vwap = aster_book.vwap_sell(raw_qty)     # selling Aster long
+            basis_bps = (hl_vwap - aster_vwap) / mid * 10000
+            hl_side, aster_side = "buy", "sell"
+            hl_ref = hl_book.ask
+            aster_ref = aster_book.bid
+
+        if basis_bps > de["max_basis_bps"]:
+            log.info(f"drip_exit {symbol}: basis {basis_bps:.0f}bps > max {de['max_basis_bps']:.0f}bps "
+                     f"({de['exited_qty']:.3f}/{de['total_qty']:.3f} exited)")
+            return
+
+        bite_qty = self.client.snap_aster_qty(symbol, raw_qty)
+        if bite_qty <= 0:
+            log.info(f"drip_exit {symbol}: bite_qty snapped to 0")
+            return
+
+        if self.paper_mode:
+            de["exited_qty"] += bite_qty
+            de["exited_notional"] += bite_qty * mid
+            de["fills"] += 1
+            de["last_hl_exit_price"] = hl_ref
+            de["last_aster_exit_price"] = aster_ref
+            log.warning(f"drip_exit [PAPER] {symbol}: -{bite_qty} @ basis={basis_bps:.0f}bps "
+                        f"({de['exited_qty']:.3f}/{de['total_qty']:.3f})")
+            if de["exited_qty"] >= de["total_qty"] - 0.0001:
+                return self._finish_drip_exit(symbol, de)
+            return
+
+        # Live: Aster first (buy back short / sell long), then HL hedge
+        await self.client.ensure_perp_margin(symbol)
+
+        try:
+            pre_ap = await self.client.get_aster_position(symbol)
+            aster_pre_amt = float(pre_ap.get("positionAmt", 0) or 0)
+        except Exception:
+            aster_pre_amt = None
+
+        ast_intent = record_intent(
+            symbol=symbol, venue="aster", action="drip_exit_ioc",
+            direction=direction, side=aster_side, qty=bite_qty,
+            ref_price=aster_ref, paper=False,
+        )
+        ast_res = await self.client.place_aster_ioc(symbol, aster_side, bite_qty, aster_ref)
+
+        if not ast_res.success or ast_res.filled_qty <= 0:
+            if aster_pre_amt is not None:
+                await asyncio.sleep(2.0)
+                try:
+                    post_ap = await self.client.get_aster_position(symbol)
+                    aster_post_amt = float(post_ap.get("positionAmt", 0) or 0)
+                    delta = abs(aster_post_amt - aster_pre_amt)
+                    if delta >= bite_qty * 0.50:
+                        log.warning(
+                            f"drip_exit {symbol}: Aster IOC reconciled "
+                            f"{aster_pre_amt} -> {aster_post_amt}")
+                        ast_res = OrderResult(
+                            success=True, order_id=ast_res.order_id or "RECONCILED",
+                            filled_qty=delta, fill_price=aster_ref,
+                        )
+                except Exception as e:
+                    log.warning(f"drip_exit {symbol}: Aster reconcile failed ({e})")
+
+        if not ast_res.success or ast_res.filled_qty <= 0:
+            complete_intent(ast_intent, "no_fill",
+                            notes=(ast_res.error or "no fill")[:200])
+            log.debug(f"drip_exit {symbol}: Aster IOC no fill — skipping tick")
+            return
+
+        complete_intent(ast_intent, "filled",
+                        notes=f"qty={ast_res.filled_qty} px={ast_res.fill_price}")
+        actual_qty = round(ast_res.filled_qty, 8)
+
+        de["unhedged_qty"] = de.get("unhedged_qty", 0.0) + actual_qty
+        hedge_qty = round(de["unhedged_qty"], 8)
+        hedge_notional = hedge_qty * mid
+
+        if hedge_notional < 12.0:
+            log.info(f"drip_exit {symbol}: Aster filled {actual_qty}, buffer={hedge_qty} "
+                     f"(${hedge_notional:.1f}) — accumulating for HL hedge")
+            return
+
+        # HL hedge
+        try:
+            pre_pos = await self.client.get_hl_position(symbol)
+            baseline_szi = float(pre_pos.get("szi", 0) or 0)
+        except Exception:
+            baseline_szi = 0.0
+
+        hl_intent = record_intent(
+            symbol=symbol, venue="hl", action="drip_exit_ioc",
+            direction=direction, side=hl_side, qty=hedge_qty,
+            ref_price=hl_ref, baseline_szi=baseline_szi, paper=False,
+        )
+        hl_res = await self.client.place_hl_ioc(symbol, hl_side, hedge_qty, hl_ref)
+
+        if hl_res.ambiguous:
+            expected_signed = hedge_qty if hl_side == "buy" else -hedge_qty
+            filled, actual_signed, _ = await self.client.reconcile_hl_position_delta(
+                symbol, baseline_szi, expected_signed)
+            if filled:
+                hl_res = OrderResult(success=True, order_id="RECONCILED",
+                                     filled_qty=abs(actual_signed), fill_price=hl_ref)
+
+        if not hl_res.success or hl_res.filled_qty <= 0:
+            complete_intent(hl_intent, "no_fill", notes=hl_res.error[:200])
+            log.error(f"drip_exit {symbol}: HL IOC failed for buffer {hedge_qty} — retry next tick")
+            return
+
+        complete_intent(hl_intent, "filled",
+                        notes=f"qty={hl_res.filled_qty} px={hl_res.fill_price}")
+
+        de["unhedged_qty"] = 0.0
+        de["exited_qty"] += hedge_qty
+        de["exited_notional"] += hedge_qty * mid
+        de["fills"] += 1
+        de["last_hl_exit_price"] = hl_res.fill_price
+        de["last_aster_exit_price"] = ast_res.fill_price
+
+        pos = self.pm.get(symbol)
+        if pos:
+            self.pm.log_trade(pos.id, "hl", hl_side, "drip_exit_ioc",
+                              hl_res.order_id, hedge_qty, hl_res.fill_price)
+            self.pm.log_trade(pos.id, "aster", aster_side, "drip_exit_ioc",
+                              ast_res.order_id, hedge_qty, ast_res.fill_price)
+
+        log.warning(
+            f"drip_exit {symbol}: -{hedge_qty} @ basis={basis_bps:.0f}bps "
+            f"HL@{hl_res.fill_price:.2f} Ast@{ast_res.fill_price:.2f} "
+            f"({de['exited_qty']:.3f}/{de['total_qty']:.3f})"
+        )
+
+        if de["exited_qty"] >= de["total_qty"] - 0.0001:
+            return self._finish_drip_exit(symbol, de)
+        return None
+
+    def _finish_drip_exit(self, symbol: str, de: dict) -> str:
+        msg = (f"drip_exit complete: {symbol} exited {de['exited_qty']:.4f} "
+               f"({de['fills']} fills)")
+        self._drip_exits.pop(symbol, None)
+        pos = self.pm.get(symbol)
+        if pos and pos.status == "open":
+            self.pm.start_exiting(
+                symbol, "drip_exit", "drip_exit",
+                de["last_hl_exit_price"], de["max_basis_bps"])
+            self.pm.confirm_aster_exit(
+                symbol, de["last_aster_exit_price"], "drip_exit_converge")
+        log.warning(msg)
+        return msg
 
     async def drip_tick(self, symbol: str):
         """One tick of the drip loop: check basis, place one taker-taker bite."""

@@ -114,7 +114,8 @@ _PENDING_GATES_FILE = os.path.join(DATA_DIR, "pending_gates.json")
 
 
 def _write_pending_gates(pending_entries: dict, pending_exits: dict,
-                         drips: dict | None = None):
+                         drips: dict | None = None,
+                         drip_exits: dict | None = None):
     """Persist waiting basis-gated orders so the control bot can show them."""
     tmp = _PENDING_GATES_FILE + ".tmp"
     try:
@@ -133,6 +134,15 @@ def _write_pending_gates(pending_entries: dict, pending_exits: dict,
                     "min_basis_bps": d["min_basis_bps"],
                     "fills": d["fills"]}
                 for s, d in (drips or {}).items()
+            },
+            "drip_exits": {
+                s: {"direction": d["direction"],
+                    "exited_qty": d["exited_qty"],
+                    "total_qty": d["total_qty"],
+                    "max_basis_bps": d["max_basis_bps"],
+                    "bite_qty": d["bite_qty"],
+                    "fills": d["fills"]}
+                for s, d in (drip_exits or {}).items()
             },
             "_ts": time.time(),
         }
@@ -541,8 +551,9 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                         send_alert(f"/close {symbol}: exit submitted")
                 elif action == "cancel":
                     had = pending_entries.pop(symbol, None) or pending_exits.pop(symbol, None)
-                    # Cancel any active drip
+                    # Cancel any active drip or drip_exit
                     drip_ok, drip_msg = executor.cancel_drip(symbol)
+                    dex_ok, dex_msg = executor.cancel_drip_exit(symbol)
                     # Also abort any running maker entry (status="entering")
                     pos = pm.get(symbol)
                     if pos and pos.status == "entering":
@@ -552,6 +563,8 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                             parts.append("gate cleared")
                         if drip_ok:
                             parts.append(drip_msg)
+                        if dex_ok:
+                            parts.append(dex_msg)
                         parts.append("aborting maker entry (will finalize on next tick)")
                         send_alert(f"/cancel {symbol}: {' + '.join(parts)}")
                     else:
@@ -560,6 +573,8 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                             parts.append("gate cleared")
                         if drip_ok:
                             parts.append(drip_msg)
+                        if dex_ok:
+                            parts.append(dex_msg)
                         if not parts:
                             parts.append("nothing pending")
                         send_alert(f"/cancel {symbol}: {' + '.join(parts)}")
@@ -571,6 +586,12 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     ok, msg = executor.start_drip(
                         symbol, direction, notional, min_basis, bite_qty)
                     send_alert(f"/drip {symbol}: {'OK' if ok else 'FAILED'} — {msg}")
+                elif action == "drip_exit":
+                    max_basis = float(cmd.get("max_basis_bps", 0) or 0)
+                    bite_qty = float(cmd.get("bite_qty", 0) or 0)
+                    ok, msg = executor.start_drip_exit(
+                        symbol, max_basis, bite_qty)
+                    send_alert(f"/drip_exit {symbol}: {'OK' if ok else 'FAILED'} — {msg}")
                 elif action == "import":
                     await _handle_import(symbol or None)
                 else:
@@ -793,6 +814,17 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     log.error(f"drip tick {ds} error: {e}")
                     send_alert(f"💧 drip {ds}: ERROR {e}")
 
+            # ── 1c. Drip exits: one taker-taker exit bite per active drip_exit ──
+            dex_syms = list(executor._drip_exits.keys())
+            for ds in dex_syms:
+                try:
+                    result = await executor.drip_exit_tick(ds)
+                    if result and isinstance(result, str):
+                        send_alert(f"💧 {result}")
+                except Exception as e:
+                    log.error(f"drip_exit tick {ds} error: {e}")
+                    send_alert(f"💧 drip_exit {ds}: ERROR {e}")
+
             # ── 2. Slow scan: rank all symbols every 5 min ──
             if now - last_slow_scan >= SLOW_SCAN_INTERVAL_SECONDS * 1000:
                 last_slow_scan = now
@@ -831,7 +863,8 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 if s not in pm.positions:
                     latest_est_net.pop(s, None)
             _write_latest_spreads(latest_spreads, latest_est_net)
-            _write_pending_gates(pending_entries, pending_exits, executor._drips)
+            _write_pending_gates(pending_entries, pending_exits,
+                                 executor._drips, executor._drip_exits)
 
             # ── 4. Periodic tick log ──
             if tick_count % 20 == 0:
