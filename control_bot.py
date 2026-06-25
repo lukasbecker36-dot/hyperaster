@@ -269,11 +269,13 @@ def _pending_gate_lines() -> list[str]:
         out.append(f"  • {sym} CLOSE — waiting exit basis ≥ {r.get('target_bps', 0):+.0f}bps")
     for sym, d in drips.items():
         short = "L-HL/S-AST" if d.get("direction") == "long_hl_short_aster" else "L-AST/S-HL"
+        unhedged = d.get("unhedged_qty", 0)
+        uh_str = f" unhedged={unhedged:.3f}sh" if unhedged > 0 else ""
         out.append(
             f"  • {sym} 💧DRIP {short} ${d.get('filled_notional',0):.0f}"
             f"/${d.get('target_notional',0):.0f} "
             f"({d.get('fills',0)} fills) bite={d.get('bite_qty',0)}sh "
-            f"min≥{d.get('min_basis_bps',0):.0f}bps"
+            f"min≥{d.get('min_basis_bps',0):.0f}bps{uh_str}"
         )
     out.append("  (/cancel SYM to clear a gate)")
     return out

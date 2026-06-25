@@ -678,9 +678,20 @@ class Executor:
 
         complete_intent(ast_intent, "filled",
                         notes=f"qty={ast_res.filled_qty} px={ast_res.fill_price}")
-        actual_qty = ast_res.filled_qty
+        actual_qty = round(ast_res.filled_qty, 8)
 
-        # HL hedge leg — HL is liquid, this should always fill.
+        # Accumulate into unhedged buffer. Only hedge on HL once buffer ≥ $12
+        # (HL XYZ minimum order). This avoids repeated $6 fills that HL rejects.
+        drip["unhedged_qty"] = drip.get("unhedged_qty", 0.0) + actual_qty
+        hedge_qty = round(drip["unhedged_qty"], 8)
+        hedge_notional = hedge_qty * mid
+
+        if hedge_notional < 12.0:
+            log.info(f"drip {symbol}: Aster filled {actual_qty}, buffer={hedge_qty} "
+                     f"(${hedge_notional:.1f}) — accumulating until $12+ for HL hedge")
+            return
+
+        # HL hedge leg — hedge the full accumulated buffer.
         try:
             pre_pos = await self.client.get_hl_position(symbol)
             baseline_szi = float(pre_pos.get("szi", 0) or 0)
@@ -691,13 +702,13 @@ class Executor:
 
         hl_intent = record_intent(
             symbol=symbol, venue="hl", action="drip_ioc",
-            direction=direction, side=hl_side, qty=actual_qty,
+            direction=direction, side=hl_side, qty=hedge_qty,
             ref_price=hl_ref, baseline_szi=baseline_szi, paper=False,
         )
-        hl_res = await self.client.place_hl_ioc(symbol, hl_side, actual_qty, hl_ref)
+        hl_res = await self.client.place_hl_ioc(symbol, hl_side, hedge_qty, hl_ref)
 
         if hl_res.ambiguous:
-            expected_signed = actual_qty if hl_side == "buy" else -actual_qty
+            expected_signed = hedge_qty if hl_side == "buy" else -hedge_qty
             filled, actual_signed, _ = await self.client.reconcile_hl_position_delta(
                 symbol, baseline_szi, expected_signed)
             if filled:
@@ -706,44 +717,44 @@ class Executor:
 
         if not hl_res.success or hl_res.filled_qty <= 0:
             complete_intent(hl_intent, "no_fill", notes=hl_res.error[:200])
-            log.error(f"drip {symbol}: HL IOC failed after Aster fill — "
-                      f"NAKED ASTER {aster_side} {actual_qty} — retry next tick")
-            # Don't emergency-close Aster (illiquid) — the next drip tick will
-            # try HL again, or the user can /cancel and handle manually.
+            log.error(f"drip {symbol}: HL IOC failed for buffer {hedge_qty} "
+                      f"(${hedge_notional:.1f}) — will retry next tick")
             return
 
         complete_intent(hl_intent, "filled",
                         notes=f"qty={hl_res.filled_qty} px={hl_res.fill_price}")
 
-        fill_notional = actual_qty * mid
+        # Buffer hedged successfully — clear it.
+        drip["unhedged_qty"] = 0.0
+        fill_notional = hedge_qty * mid
         hl_fr = self.client.get_hl_funding_rate(symbol)
         ast_fr = self.client.get_aster_funding_rate(symbol)
         existing = self.pm.get(symbol)
         if existing and existing.status == "open":
-            self.pm.scale_in(symbol, actual_qty, fill_notional,
+            self.pm.scale_in(symbol, hedge_qty, fill_notional,
                              hl_res.fill_price, ast_res.fill_price,
                              hl_funding_rate=hl_fr, aster_funding_rate=ast_fr)
             self.pm.log_trade(existing.id, "hl", hl_side, "drip_ioc",
-                              hl_res.order_id, actual_qty, hl_res.fill_price)
+                              hl_res.order_id, hedge_qty, hl_res.fill_price)
             self.pm.log_trade(existing.id, "aster", aster_side, "drip_ioc",
-                              ast_res.order_id, ast_res.filled_qty, ast_res.fill_price)
+                              ast_res.order_id, hedge_qty, ast_res.fill_price)
         else:
             pos = self.pm.import_position(
                 symbol=symbol, hl_coin=f"xyz:{symbol}",
                 aster_symbol=aster_symbol_for(symbol),
-                direction=direction, qty=actual_qty,
+                direction=direction, qty=hedge_qty,
                 hl_price=hl_res.fill_price, aster_price=ast_res.fill_price,
                 hl_funding_rate=hl_fr, aster_funding_rate=ast_fr,
             )
             self.pm.log_trade(pos.id, "hl", hl_side, "drip_ioc",
-                              hl_res.order_id, actual_qty, hl_res.fill_price)
+                              hl_res.order_id, hedge_qty, hl_res.fill_price)
             self.pm.log_trade(pos.id, "aster", aster_side, "drip_ioc",
-                              ast_res.order_id, ast_res.filled_qty, ast_res.fill_price)
+                              ast_res.order_id, hedge_qty, ast_res.fill_price)
 
         drip["filled_notional"] += fill_notional
         drip["fills"] += 1
         log.warning(
-            f"drip {symbol}: +{actual_qty} @ basis={basis_bps:.0f}bps "
+            f"drip {symbol}: +{hedge_qty} hedged @ basis={basis_bps:.0f}bps "
             f"HL@{hl_res.fill_price:.2f} Ast@{ast_res.fill_price:.2f} "
             f"(${drip['filled_notional']:.0f}/${drip['target_notional']:.0f})"
         )
