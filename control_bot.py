@@ -254,7 +254,8 @@ def _pending_gate_lines() -> list[str]:
     g = _load_pending_gates()
     entries = g.get("entries", {}) or {}
     exits = g.get("exits", {}) or {}
-    if not entries and not exits:
+    drips = g.get("drips", {}) or {}
+    if not entries and not exits and not drips:
         return []
     out = ["⏳ Pending basis gates:"]
     for sym, r in entries.items():
@@ -266,6 +267,13 @@ def _pending_gate_lines() -> list[str]:
                    f"— waiting entry basis ≥ {r.get('target_bps', 0):+.0f}bps")
     for sym, r in exits.items():
         out.append(f"  • {sym} CLOSE — waiting exit basis ≥ {r.get('target_bps', 0):+.0f}bps")
+    for sym, d in drips.items():
+        short = "L-HL/S-AST" if d.get("direction") == "long_hl_short_aster" else "L-AST/S-HL"
+        out.append(
+            f"  • {sym} 💧DRIP {short} ${d.get('filled_notional',0):.0f}"
+            f"/${d.get('target_notional',0):.0f} "
+            f"({d.get('fills',0)} fills) min≥{d.get('min_basis_bps',0):.0f}bps"
+        )
     out.append("  (/cancel SYM to clear a gate)")
     return out
 
@@ -713,6 +721,79 @@ def cmd_cancel(chat_id: str, arg: str):
     send(chat_id, f"📩 cancel requested for any pending gate on {symbol}.")
 
 
+def cmd_drip(chat_id: str, arg: str):
+    """Taker-taker drip entry: small bites until target notional is reached.
+
+    Usage: /drip SYMBOL DIRECTION NOTIONAL MIN_BASIS_BPS [BITE_USD]
+      DIRECTION: long_hl_short_aster | long_aster_short_hl (or aliases)
+      NOTIONAL:  total target USD per leg
+      MIN_BASIS_BPS: minimum executable basis (bps) to place a bite
+      BITE_USD (optional): notional per bite, default $200
+
+    Each tick, if the executable spread ≥ MIN_BASIS_BPS, places one small
+    taker-taker order (HL IOC + Aster IOC). Accumulates into one position.
+    Use /cancel SYMBOL to stop early.
+    """
+    toks = arg.split()
+    if len(toks) not in (4, 5):
+        send(chat_id,
+             "Usage: /drip SYMBOL DIRECTION NOTIONAL MIN_BASIS_BPS [BITE_USD]\n"
+             "e.g. /drip ZHIPU buy_hl 2000 50\n"
+             "     /drip ZHIPU buy_hl 2000 50 100   (bites of $100)\n"
+             "DIRECTION aliases: buy_hl / buy_aster / L-HL/S-AST / L-AST/S-HL")
+        return
+    symbol = toks[0].upper()
+    direction = _DIR_ALIASES.get(toks[1].lower())
+    if not direction:
+        send(chat_id, f"Bad direction {toks[1]!r}. Use long_hl_short_aster or long_aster_short_hl.")
+        return
+    try:
+        notional = float(toks[2])
+        if notional <= 0:
+            raise ValueError
+    except ValueError:
+        send(chat_id, f"Bad notional {toks[2]!r} — must be a positive number.")
+        return
+    try:
+        min_basis = float(toks[3])
+    except ValueError:
+        send(chat_id, f"Bad min basis {toks[3]!r} — must be a number (bps).")
+        return
+    bite = 0.0
+    if len(toks) == 5:
+        try:
+            bite = float(toks[4])
+            if bite <= 0:
+                raise ValueError
+        except ValueError:
+            send(chat_id, f"Bad bite size {toks[4]!r} — must be a positive number.")
+            return
+
+    rc, active = run(["systemctl", "is-active", SERVICE], timeout=10)
+    if active.strip() != "active":
+        send(chat_id, f"⚠️ trader service is {active.strip()} — start it first (/start).")
+        return
+
+    req = {"action": "drip", "symbol": symbol, "direction": direction,
+           "notional": notional, "min_basis_bps": min_basis}
+    if bite:
+        req["bite_notional"] = bite
+    short = "L-HL/S-AST" if direction == "long_hl_short_aster" else "L-AST/S-HL"
+    bite_str = f" bite=${bite:.0f}" if bite else ""
+
+    if read_mode() == "live":
+        _PENDING_ENTER[chat_id] = (req, time.time() + _CONFIRM_TTL)
+        send(chat_id,
+             f"⚠️ LIVE drip: {symbol} {short} ${notional:.0f} target, "
+             f"min basis {min_basis:.0f}bps{bite_str}.\n"
+             "This places REAL taker-taker orders each tick. Reply YES within 60s.")
+        return
+    _enqueue_manual(req)
+    send(chat_id,
+         f"📩 queued [PAPER] drip: {symbol} {short} ${notional:.0f} target, "
+         f"min basis {min_basis:.0f}bps{bite_str}. /cancel {symbol} to stop.")
+
+
 def cmd_import(chat_id: str, arg: str):
     """Import existing venue positions into the bot's DB for management.
 
@@ -775,7 +856,8 @@ def cmd_help(chat_id: str, _arg: str):
          "/funding [n] — top funding-carry opportunities\n"
          "/enter SYM DIR NOTIONAL [basis_bps] — open a funding hold; basis_bps waits for a fill level\n"
          "/close SYM [basis_bps] — close a position; basis_bps waits for a fill level\n"
-         "/cancel SYM — cancel a pending basis-gated /enter or /close\n"
+         "/cancel SYM — cancel a pending basis-gated /enter or /close or /drip\n"
+         "/drip SYM DIR NOTIONAL MIN_BPS [BITE] — taker-taker drip entry\n"
          "/import [SYM] — adopt existing venue positions into the bot for management\n"
          "/autoentry on|off — toggle auto basis-arb entry (exits unaffected)\n"
          "/positions — open positions detail\n"
@@ -796,7 +878,8 @@ HANDLERS = {
     "/pnl": cmd_pnl, "/trades": cmd_trades,
     "/book": cmd_book,
     "/funding": cmd_funding, "/carry": cmd_funding,
-    "/enter": cmd_enter, "/close": cmd_close, "/cancel": cmd_cancel, "/import": cmd_import,
+    "/enter": cmd_enter, "/close": cmd_close, "/cancel": cmd_cancel,
+    "/drip": cmd_drip, "/import": cmd_import,
     "/autoentry": cmd_autoentry,
     "/log": cmd_log, "/logs": cmd_log,
     "/spreads": cmd_spreads, "/spread": cmd_spreads,
@@ -870,6 +953,7 @@ def main():
             {"command": "enter", "description": "Open a funding hold: SYM DIR NOTIONAL [basis_bps]"},
             {"command": "close", "description": "Close a position: SYM [basis_bps]"},
             {"command": "cancel", "description": "Cancel a pending basis-gated order: SYM"},
+            {"command": "drip", "description": "Taker-taker drip entry: SYM DIR NOTIONAL MIN_BPS"},
             {"command": "import", "description": "Adopt existing venue positions: [SYM]"},
             {"command": "autoentry", "description": "Toggle auto basis-arb entry: on|off"},
             {"command": "trades", "description": "Last N closed trades with P&L"},

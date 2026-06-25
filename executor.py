@@ -58,6 +58,9 @@ class Executor:
         self._entry_streak: dict[str, tuple[str, int]] = {}
         # Symbols whose maker entry should be aborted on the next poll tick.
         self._abort_entering: set[str] = set()
+        # Active drip orders: symbol -> {direction, target_notional, filled_notional,
+        # min_basis_bps, fills}. Each tick places one taker-taker bite if basis is met.
+        self._drips: dict[str, dict] = {}
 
     # ── Entry ──
 
@@ -481,6 +484,217 @@ class Executor:
             f"entered {symbol} {direction} ${actual_notional:.0f} qty={actual_qty} "
             f"(Aster maker resting; you'll get a fill confirmation)"
         )
+
+    # ── Drip entry (taker-taker small bites until target notional) ──
+
+    def start_drip(
+        self, symbol: str, direction: str, target_notional: float,
+        min_basis_bps: float, bite_notional: float = 0.0,
+    ) -> tuple[bool, str]:
+        if direction not in ("long_hl_short_aster", "long_aster_short_hl"):
+            return False, f"bad direction {direction!r}"
+        if target_notional <= 0:
+            return False, f"target notional must be > 0"
+        if symbol in self._drips:
+            return False, f"{symbol}: drip already running — /cancel first"
+        if not bite_notional:
+            bite_notional = min(target_notional, 200.0)
+        self._drips[symbol] = {
+            "direction": direction,
+            "target_notional": target_notional,
+            "filled_notional": 0.0,
+            "min_basis_bps": min_basis_bps,
+            "bite_notional": bite_notional,
+            "fills": 0,
+        }
+        return True, (
+            f"drip started: {symbol} {direction} target=${target_notional:.0f} "
+            f"bite=${bite_notional:.0f} min_basis={min_basis_bps:.0f}bps"
+        )
+
+    def cancel_drip(self, symbol: str) -> tuple[bool, str]:
+        drip = self._drips.pop(symbol, None)
+        if not drip:
+            return False, f"{symbol}: no active drip"
+        return True, (
+            f"drip cancelled: {symbol} filled ${drip['filled_notional']:.0f}"
+            f"/${drip['target_notional']:.0f} ({drip['fills']} fills)"
+        )
+
+    async def drip_tick(self, symbol: str):
+        """One tick of the drip loop: check basis, place one taker-taker bite."""
+        drip = self._drips.get(symbol)
+        if not drip:
+            return
+
+        remaining = drip["target_notional"] - drip["filled_notional"]
+        if remaining <= 0:
+            msg = (f"drip complete: {symbol} filled ${drip['filled_notional']:.0f} "
+                   f"({drip['fills']} fills)")
+            self._drips.pop(symbol, None)
+            log.warning(msg)
+            return msg
+
+        direction = drip["direction"]
+
+        if not await self.client.ensure_symbol_loaded(symbol):
+            return
+
+        try:
+            aster_book, hl_book = await self.client.get_both_books(symbol)
+        except Exception as e:
+            log.debug(f"drip {symbol}: book fetch failed ({e})")
+            return
+        if aster_book.bid <= 0 or hl_book.bid <= 0:
+            return
+
+        mid = (aster_book.mid + hl_book.mid) / 2
+        if mid <= 0:
+            return
+
+        # Compute executable basis from the prices we'd actually trade at.
+        # long_hl_short_aster: buy HL ask, sell Aster bid → basis = (ast_bid - hl_ask) / mid
+        # long_aster_short_hl: buy Aster ask, sell HL bid → basis = (hl_bid - ast_ask) / mid
+        if direction == "long_hl_short_aster":
+            basis_bps = (aster_book.bid - hl_book.ask) / mid * 10000
+        else:
+            basis_bps = (hl_book.bid - aster_book.ask) / mid * 10000
+
+        if basis_bps < drip["min_basis_bps"]:
+            return
+
+        # Size this bite: min of bite_notional, remaining, and available depth
+        bite_usd = min(drip["bite_notional"], remaining)
+        bite_qty = self.client.snap_aster_qty(symbol, bite_usd / mid)
+        if bite_qty <= 0:
+            return
+
+        if direction == "long_hl_short_aster":
+            hl_side, aster_side = "buy", "sell"
+            hl_ref = hl_book.ask
+            aster_ref = aster_book.bid
+        else:
+            hl_side, aster_side = "sell", "buy"
+            hl_ref = hl_book.bid
+            aster_ref = aster_book.ask
+
+        if self.paper_mode:
+            fill_notional = bite_qty * mid
+            existing = self.pm.get(symbol)
+            hl_fr = self.client.get_hl_funding_rate(symbol)
+            ast_fr = self.client.get_aster_funding_rate(symbol)
+            if existing and existing.status == "open":
+                self.pm.scale_in(symbol, bite_qty, fill_notional, hl_ref, aster_ref,
+                                 hl_funding_rate=hl_fr, aster_funding_rate=ast_fr)
+            else:
+                self.pm.import_position(
+                    symbol=symbol, hl_coin=f"xyz:{symbol}",
+                    aster_symbol=aster_symbol_for(symbol),
+                    direction=direction, qty=bite_qty,
+                    hl_price=hl_ref, aster_price=aster_ref,
+                    hl_funding_rate=hl_fr, aster_funding_rate=ast_fr,
+                )
+            drip["filled_notional"] += fill_notional
+            drip["fills"] += 1
+            log.warning(f"drip [PAPER] {symbol}: +{bite_qty} @ basis={basis_bps:.0f}bps "
+                        f"(${drip['filled_notional']:.0f}/${drip['target_notional']:.0f})")
+            if drip["filled_notional"] >= drip["target_notional"]:
+                return self._drips.pop(symbol, None) and (
+                    f"drip complete: {symbol} ${drip['filled_notional']:.0f} ({drip['fills']} fills)")
+            return
+
+        # ── Live: taker-taker ──
+        await self.client.ensure_perp_margin(symbol)
+
+        try:
+            pre_pos = await self.client.get_hl_position(symbol)
+            baseline_szi = float(pre_pos.get("szi", 0) or 0)
+        except Exception as e:
+            log.warning(f"drip {symbol}: HL pre-position failed ({e})")
+            return
+
+        hl_intent = record_intent(
+            symbol=symbol, venue="hl", action="drip_ioc",
+            direction=direction, side=hl_side, qty=bite_qty,
+            ref_price=hl_ref, baseline_szi=baseline_szi, paper=False,
+        )
+        hl_res = await self.client.place_hl_ioc(symbol, hl_side, bite_qty, hl_ref)
+
+        if hl_res.ambiguous:
+            expected_signed = bite_qty if hl_side == "buy" else -bite_qty
+            filled, actual_signed, _ = await self.client.reconcile_hl_position_delta(
+                symbol, baseline_szi, expected_signed)
+            if filled:
+                hl_res = OrderResult(success=True, order_id="RECONCILED",
+                                     filled_qty=abs(actual_signed), fill_price=hl_ref)
+            else:
+                complete_intent(hl_intent, "no_fill", notes="ambiguous reconciled unfilled")
+                return
+
+        if not hl_res.success or hl_res.filled_qty <= 0:
+            complete_intent(hl_intent, "no_fill", notes=hl_res.error[:200])
+            return
+
+        complete_intent(hl_intent, "filled",
+                        notes=f"qty={hl_res.filled_qty} px={hl_res.fill_price}")
+        actual_qty = hl_res.filled_qty
+
+        # Aster taker leg
+        ast_intent = record_intent(
+            symbol=symbol, venue="aster", action="drip_ioc",
+            direction=direction, side=aster_side, qty=actual_qty,
+            ref_price=aster_ref, paper=False,
+        )
+        ast_res = await self.client.place_aster_ioc(symbol, aster_side, actual_qty, aster_ref)
+
+        if not ast_res.success or ast_res.filled_qty <= 0:
+            complete_intent(ast_intent, "no_fill", notes=(ast_res.error or "no fill")[:200])
+            log.error(f"drip {symbol}: Aster IOC failed after HL fill — emergency closing HL")
+            close_side = "sell" if hl_side == "buy" else "buy"
+            await self.client.place_hl_ioc(symbol, close_side, actual_qty, hl_res.fill_price)
+            return
+
+        complete_intent(ast_intent, "filled",
+                        notes=f"qty={ast_res.filled_qty} px={ast_res.fill_price}")
+
+        fill_notional = actual_qty * mid
+        hl_fr = self.client.get_hl_funding_rate(symbol)
+        ast_fr = self.client.get_aster_funding_rate(symbol)
+        existing = self.pm.get(symbol)
+        if existing and existing.status == "open":
+            self.pm.scale_in(symbol, actual_qty, fill_notional,
+                             hl_res.fill_price, ast_res.fill_price,
+                             hl_funding_rate=hl_fr, aster_funding_rate=ast_fr)
+            self.pm.log_trade(existing.id, "hl", hl_side, "drip_ioc",
+                              hl_res.order_id, actual_qty, hl_res.fill_price)
+            self.pm.log_trade(existing.id, "aster", aster_side, "drip_ioc",
+                              ast_res.order_id, ast_res.filled_qty, ast_res.fill_price)
+        else:
+            pos = self.pm.import_position(
+                symbol=symbol, hl_coin=f"xyz:{symbol}",
+                aster_symbol=aster_symbol_for(symbol),
+                direction=direction, qty=actual_qty,
+                hl_price=hl_res.fill_price, aster_price=ast_res.fill_price,
+                hl_funding_rate=hl_fr, aster_funding_rate=ast_fr,
+            )
+            self.pm.log_trade(pos.id, "hl", hl_side, "drip_ioc",
+                              hl_res.order_id, actual_qty, hl_res.fill_price)
+            self.pm.log_trade(pos.id, "aster", aster_side, "drip_ioc",
+                              ast_res.order_id, ast_res.filled_qty, ast_res.fill_price)
+
+        drip["filled_notional"] += fill_notional
+        drip["fills"] += 1
+        log.warning(
+            f"drip {symbol}: +{actual_qty} @ basis={basis_bps:.0f}bps "
+            f"HL@{hl_res.fill_price:.2f} Ast@{ast_res.fill_price:.2f} "
+            f"(${drip['filled_notional']:.0f}/${drip['target_notional']:.0f})"
+        )
+        if drip["filled_notional"] >= drip["target_notional"]:
+            msg = (f"drip complete: {symbol} ${drip['filled_notional']:.0f} "
+                   f"({drip['fills']} fills)")
+            self._drips.pop(symbol, None)
+            return msg
+        return None
 
     # ── Maker-first carry entry (HL post-only maker, Aster IOC taker hedge) ──
 
