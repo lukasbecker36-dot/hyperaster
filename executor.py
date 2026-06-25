@@ -562,6 +562,7 @@ class Executor:
 
         mid = (aster_book.mid + hl_book.mid) / 2
         if mid <= 0:
+            log.info(f"drip {symbol}: mid={mid:.4f} — skipping")
             return
 
         # Compute executable basis from the prices we'd actually trade at.
@@ -587,9 +588,9 @@ class Executor:
         bite_qty = self.client.snap_aster_qty(symbol, raw_qty)
         bite_notional_actual = bite_qty * mid
         if bite_qty <= 0 or bite_notional_actual < 12.0:
-            log.debug(f"drip {symbol}: bite too small for both venues "
-                      f"(qty={bite_qty} notional=${bite_notional_actual:.1f} "
-                      f"mid={mid:.2f} ast_depth={aster_depth}, need $12+)")
+            log.info(f"drip {symbol}: bite too small for both venues "
+                     f"(qty={bite_qty} notional=${bite_notional_actual:.1f} "
+                     f"mid={mid:.2f} ast_depth={aster_depth}, need $12+)")
             return
 
         if direction == "long_hl_short_aster":
