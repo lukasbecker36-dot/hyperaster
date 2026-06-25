@@ -1,43 +1,56 @@
 #!/usr/bin/env python3
 """ZHIPU spread & convergence analysis — last 48 hours.
 
-Run on the server:  python3 /opt/hyperaster/scripts/zhipu_backtest.py
+No dependencies beyond stdlib. Run on server:
+    python3 /opt/hyperaster/scripts/zhipu_backtest.py
 """
-import asyncio
-import aiohttp
 import json
+import math
 import statistics
 import time
+import urllib.request
+import urllib.parse
 from datetime import datetime, timezone
 
 HYPERLIQUID_API = "https://api.hyperliquid.xyz/info"
 ASTER_BASE = "https://fapi.asterdex.com"
 
 
-async def fetch_hl_candles(session, coin, interval, lookback_hours):
+def post_json(url, body):
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data,
+                                headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def get_json(url, params=None):
+    if params:
+        url = url + "?" + urllib.parse.urlencode(params)
+    with urllib.request.urlopen(url, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def fetch_hl_candles(coin, interval, lookback_hours):
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - lookback_hours * 3600 * 1000
-    body = {
+    return post_json(HYPERLIQUID_API, {
         "type": "candleSnapshot",
         "req": {"coin": coin, "interval": interval,
                 "startTime": start_ms, "endTime": end_ms},
-    }
-    async with session.post(HYPERLIQUID_API, json=body,
-                            timeout=aiohttp.ClientTimeout(total=30)) as r:
-        return await r.json()
+    })
 
 
-async def fetch_aster_candles(session, symbol, interval, lookback_hours):
+def fetch_aster_candles(symbol, interval, lookback_hours):
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - lookback_hours * 3600 * 1000
     all_candles = []
     cur = start_ms
     while cur < end_ms:
-        params = {"symbol": symbol, "interval": interval,
-                  "startTime": cur, "endTime": end_ms, "limit": 1500}
-        async with session.get(f"{ASTER_BASE}/fapi/v1/klines", params=params,
-                               timeout=aiohttp.ClientTimeout(total=30)) as r:
-            data = await r.json()
+        data = get_json(f"{ASTER_BASE}/fapi/v1/klines", {
+            "symbol": symbol, "interval": interval,
+            "startTime": cur, "endTime": end_ms, "limit": 1500,
+        })
         if not data:
             break
         all_candles.extend(data)
@@ -47,35 +60,32 @@ async def fetch_aster_candles(session, symbol, interval, lookback_hours):
     return all_candles
 
 
-async def fetch_hl_funding(session, coin, lookback_hours):
+def fetch_hl_funding(coin, lookback_hours):
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - lookback_hours * 3600 * 1000
-    body = {"type": "fundingHistory", "coin": coin,
-            "startTime": start_ms, "endTime": end_ms}
-    async with session.post(HYPERLIQUID_API, json=body,
-                            timeout=aiohttp.ClientTimeout(total=30)) as r:
-        return await r.json()
+    return post_json(HYPERLIQUID_API, {
+        "type": "fundingHistory", "coin": coin,
+        "startTime": start_ms, "endTime": end_ms,
+    })
 
 
-async def fetch_aster_funding(session, symbol, lookback_hours):
+def fetch_aster_funding(symbol, lookback_hours):
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - lookback_hours * 3600 * 1000
-    params = {"symbol": symbol, "startTime": start_ms,
-              "endTime": end_ms, "limit": 1000}
-    async with session.get(f"{ASTER_BASE}/fapi/v1/fundingRate", params=params,
-                           timeout=aiohttp.ClientTimeout(total=30)) as r:
-        return await r.json()
+    return get_json(f"{ASTER_BASE}/fapi/v1/fundingRate", {
+        "symbol": symbol, "startTime": start_ms,
+        "endTime": end_ms, "limit": 1000,
+    })
 
 
-async def main():
+def main():
     hours = 48
-    async with aiohttp.ClientSession() as session:
-        hl_candles, aster_candles, hl_funding, aster_funding = await asyncio.gather(
-            fetch_hl_candles(session, "xyz:ZHIPU", "1m", hours),
-            fetch_aster_candles(session, "ZHIPUUSDT", "1m", hours),
-            fetch_hl_funding(session, "xyz:ZHIPU", hours),
-            fetch_aster_funding(session, "ZHIPUUSDT", hours),
-        )
+    print("Fetching data...")
+
+    hl_candles = fetch_hl_candles("xyz:ZHIPU", "1m", hours)
+    aster_candles = fetch_aster_candles("ZHIPUUSDT", "1m", hours)
+    hl_funding = fetch_hl_funding("xyz:ZHIPU", hours)
+    aster_funding = fetch_aster_funding("ZHIPUUSDT", hours)
 
     print(f"Fetched: {len(hl_candles)} HL candles, {len(aster_candles)} Aster candles")
 
@@ -125,12 +135,12 @@ async def main():
 
     W = 70
     print("=" * W)
-    print("ZHIPU  SPREAD ANALYSIS  (Aster − HL, bps)")
-    print(f"Period : {t0:%Y-%m-%d %H:%M} → {t1:%Y-%m-%d %H:%M} UTC")
+    print("ZHIPU  SPREAD ANALYSIS  (Aster - HL, bps)")
+    print(f"Period : {t0:%Y-%m-%d %H:%M} -> {t1:%Y-%m-%d %H:%M} UTC")
     print(f"Points : {len(vals)} minutes")
     print("=" * W)
 
-    # ── Basic stats ──
+    # -- Basic stats --
     avg = statistics.mean(vals)
     med = statistics.median(vals)
     std = statistics.stdev(vals) if len(vals) > 1 else 0
@@ -148,7 +158,7 @@ async def main():
     print(f"  75th pctl    {pcts[74]:+.1f} bps")
     print(f"  95th pctl    {pcts[94]:+.1f} bps")
 
-    # ── Distribution buckets ──
+    # -- Distribution buckets --
     print(f"\nSpread distribution:")
     buckets = [
         ("< -200", lambda x: x < -200),
@@ -163,34 +173,34 @@ async def main():
     ]
     for label, fn in buckets:
         c = sum(1 for v in vals if fn(v))
-        bar = "█" * int(c / len(vals) * 40)
+        bar = "#" * int(c / len(vals) * 40)
         print(f"  {label:>14}: {c:4d} ({c / len(vals) * 100:5.1f}%) {bar}")
 
-    # ── Direction bias ──
+    # -- Direction bias --
     pos = sum(1 for v in vals if v > 0)
     neg = sum(1 for v in vals if v < 0)
     print(f"\nDirection bias:")
     print(f"  Aster > HL : {pos} min ({pos / len(vals) * 100:.1f}%)")
     print(f"  HL > Aster : {neg} min ({neg / len(vals) * 100:.1f}%)")
 
-    # ── Time in regimes ──
+    # -- Time in regimes --
     print(f"\nTime in spread regimes:")
     regimes = [
-        ("Tight  (±30 bps)", lambda x: abs(x) <= 30),
-        ("Moderate (30–100)", lambda x: 30 < abs(x) <= 100),
-        ("Wide   (100–200)", lambda x: 100 < abs(x) <= 200),
+        ("Tight  (+/-30 bps)", lambda x: abs(x) <= 30),
+        ("Moderate (30-100)", lambda x: 30 < abs(x) <= 100),
+        ("Wide   (100-200)", lambda x: 100 < abs(x) <= 200),
         ("V.wide (>200)", lambda x: abs(x) > 200),
     ]
     for name, fn in regimes:
         c = sum(1 for v in vals if fn(v))
         print(f"  {name}: {c:4d} min ({c / len(vals) * 100:5.1f}%)")
 
-    # ── Convergence episodes ──
-    WIDE = 100   # bps to start tracking
-    CONV = 30    # bps to declare converged
+    # -- Convergence episodes --
+    WIDE = 100
+    CONV = 30
 
     print(f"\n{'=' * W}")
-    print(f"CONVERGENCE EPISODES  (wide ≥ {WIDE}bps → converged ≤ {CONV}bps)")
+    print(f"CONVERGENCE EPISODES  (wide >= {WIDE}bps -> converged <= {CONV}bps)")
     print("=" * W)
 
     episodes = []
@@ -223,8 +233,8 @@ async def main():
             s = datetime.fromtimestamp(ep["start"] / 1000, tz=timezone.utc)
             e = datetime.fromtimestamp(ep["end"] / 1000, tz=timezone.utc)
             tag = "CONVERGED" if ep["conv"] else "STILL WIDE"
-            print(f"  {s:%m-%d %H:%M} → {e:%m-%d %H:%M}  "
-                  f"peak {ep['peak']:+.0f} → {ep['end_bps']:+.0f} bps  "
+            print(f"  {s:%m-%d %H:%M} -> {e:%m-%d %H:%M}  "
+                  f"peak {ep['peak']:+.0f} -> {ep['end_bps']:+.0f} bps  "
                   f"({ep['dur']} min)  [{tag}]")
         conv = [e for e in episodes if e["conv"]]
         print(f"\n  Total episodes : {len(episodes)}")
@@ -234,9 +244,9 @@ async def main():
             print(f"  Min conv time  : {min(e['dur'] for e in conv)} min")
             print(f"  Max conv time  : {max(e['dur'] for e in conv)} min")
     else:
-        print("  No episodes where spread exceeded ±100 bps")
+        print("  No episodes where spread exceeded +/-100 bps")
 
-    # ── Mean-reversion half-life (autocorrelation) ──
+    # -- Mean-reversion half-life (autocorrelation) --
     print(f"\n{'=' * W}")
     print("MEAN-REVERSION SPEED")
     print("=" * W)
@@ -251,23 +261,21 @@ async def main():
             cov = sum(demeaned[i] * demeaned[i + lag] for i in range(n - lag)) / (n - lag)
             acf = cov / var
             print(f"  Autocorrelation (lag {lag:3d} min): {acf:.3f}")
-        # Estimate half-life from lag-1 ACF
         acf1_cov = sum(demeaned[i] * demeaned[i + 1] for i in range(n - 1)) / (n - 1)
         acf1 = acf1_cov / var
         if 0 < acf1 < 1:
-            import math
             half_life = -1 / math.log(acf1)
             print(f"\n  Estimated half-life: {half_life:.1f} min")
             if half_life < 60:
-                print(f"  → Spread mean-reverts fairly quickly ({half_life:.0f} min)")
+                print(f"  -> Spread mean-reverts fairly quickly ({half_life:.0f} min)")
             elif half_life < 240:
-                print(f"  → Moderate mean-reversion ({half_life / 60:.1f} hrs)")
+                print(f"  -> Moderate mean-reversion ({half_life / 60:.1f} hrs)")
             else:
-                print(f"  → Slow mean-reversion ({half_life / 60:.1f} hrs) — convergence is unreliable")
+                print(f"  -> Slow mean-reversion ({half_life / 60:.1f} hrs) — convergence is unreliable")
         else:
             print(f"  ACF(1) = {acf1:.3f} — spread is not mean-reverting")
 
-    # ── Funding ──
+    # -- Funding --
     print(f"\n{'=' * W}")
     print("FUNDING RATES")
     print("=" * W)
@@ -291,7 +299,7 @@ async def main():
             print(f"    Min  : {min(rates) * 10000:+.2f} bps/8hr")
             print(f"    Max  : {max(rates) * 10000:+.2f} bps/8hr")
 
-    # ── Hourly summary ──
+    # -- Hourly summary --
     print(f"\n{'=' * W}")
     print("HOURLY SPREAD SUMMARY")
     print("=" * W)
@@ -310,4 +318,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
