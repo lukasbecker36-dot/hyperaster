@@ -565,31 +565,33 @@ class Executor:
             log.info(f"drip {symbol}: mid={mid:.4f} — skipping")
             return
 
-        # Compute executable basis from the prices we'd actually trade at.
-        # long_hl_short_aster: buy HL ask, sell Aster bid → basis = (ast_bid - hl_ask) / mid
-        # long_aster_short_hl: buy Aster ask, sell HL bid → basis = (hl_bid - ast_ask) / mid
-        if direction == "long_hl_short_aster":
-            basis_bps = (aster_book.bid - hl_book.ask) / mid * 10000
-            aster_depth = aster_book.bid_size
-        else:
-            basis_bps = (hl_book.bid - aster_book.ask) / mid * 10000
-            aster_depth = aster_book.ask_size
-
-        if basis_bps < drip["min_basis_bps"]:
-            log.info(f"drip {symbol}: basis {basis_bps:.0f}bps < min {drip['min_basis_bps']:.0f}bps "
-                     f"(${drip['filled_notional']:.0f}/${drip['target_notional']:.0f} filled)")
-            return
-
-        # Size this bite: min of configured bite_qty and remaining qty.
-        # Don't cap to Aster depth — the IOC will partial-fill for whatever's
-        # available, and we check actual fill notional before hedging on HL.
+        # Size this bite first so we can compute VWAP-based basis.
         remaining_qty = remaining / mid if mid > 0 else 0
         raw_qty = min(drip["bite_qty"], remaining_qty)
+
+        # Compute executable basis using VWAP across the full bite qty.
+        # This ensures the basis gate accounts for sweeping multiple levels.
+        if direction == "long_hl_short_aster":
+            aster_vwap = aster_book.vwap_sell(raw_qty)   # selling into Aster bids
+            hl_vwap = hl_book.vwap_buy(raw_qty)          # buying from HL asks
+            basis_bps = (aster_vwap - hl_vwap) / mid * 10000
+        else:
+            hl_vwap = hl_book.vwap_sell(raw_qty)          # selling into HL bids
+            aster_vwap = aster_book.vwap_buy(raw_qty)     # buying from HL asks
+            basis_bps = (hl_vwap - aster_vwap) / mid * 10000
+
+        if basis_bps < drip["min_basis_bps"]:
+            tob_basis = ((aster_book.bid - hl_book.ask) / mid * 10000
+                         if direction == "long_hl_short_aster"
+                         else (hl_book.bid - aster_book.ask) / mid * 10000)
+            log.info(f"drip {symbol}: VWAP basis {basis_bps:.0f}bps (TOB {tob_basis:.0f}bps) "
+                     f"< min {drip['min_basis_bps']:.0f}bps for {raw_qty} shares "
+                     f"(${drip['filled_notional']:.0f}/${drip['target_notional']:.0f} filled)")
+            return
         bite_qty = self.client.snap_aster_qty(symbol, raw_qty)
         bite_notional_actual = bite_qty * mid
         if bite_qty <= 0:
-            log.info(f"drip {symbol}: bite_qty snapped to 0 "
-                     f"(mid={mid:.2f} ast_depth={aster_depth})")
+            log.info(f"drip {symbol}: bite_qty snapped to 0 (mid={mid:.2f})")
             return
 
         if direction == "long_hl_short_aster":

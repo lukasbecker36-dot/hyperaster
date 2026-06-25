@@ -47,6 +47,34 @@ class OrderBook:
     ask: float = 0.0
     bid_size: float = 0.0
     ask_size: float = 0.0
+    bids: list = field(default_factory=list)  # [(price, size), ...] best first
+    asks: list = field(default_factory=list)  # [(price, size), ...] best first
+
+    def vwap_sell(self, qty: float) -> float:
+        """VWAP for selling qty into bids (hitting bids)."""
+        remaining = qty
+        total = 0.0
+        for px, sz in self.bids:
+            fill = min(remaining, sz)
+            total += fill * px
+            remaining -= fill
+            if remaining <= 0:
+                break
+        filled = qty - remaining
+        return total / filled if filled > 0 else self.bid
+
+    def vwap_buy(self, qty: float) -> float:
+        """VWAP for buying qty from asks (lifting offers)."""
+        remaining = qty
+        total = 0.0
+        for px, sz in self.asks:
+            fill = min(remaining, sz)
+            total += fill * px
+            remaining -= fill
+            if remaining <= 0:
+                break
+        filled = qty - remaining
+        return total / filled if filled > 0 else self.ask
 
     @property
     def mid(self) -> float:
@@ -612,6 +640,8 @@ class ExchangeClient:
             return OrderBook(
                 bid=bid, ask=ask,
                 bid_size=float(bids[0][1]), ask_size=float(asks[0][1]),
+                bids=[(float(b[0]), float(b[1])) for b in bids],
+                asks=[(float(a[0]), float(a[1])) for a in asks],
             )
         except Exception as e:
             log.debug(f"Aster book error {symbol}: {e}")
@@ -642,6 +672,8 @@ class ExchangeClient:
                 bid=b0, ask=a0,
                 bid_size=float(bids_raw[0]["sz"]),
                 ask_size=float(asks_raw[0]["sz"]),
+                bids=[(float(l["px"]), float(l["sz"])) for l in bids_raw],
+                asks=[(float(l["px"]), float(l["sz"])) for l in asks_raw],
             )
         except Exception as e:
             log.debug(f"HL book error {symbol}: {e}")
