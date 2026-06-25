@@ -572,7 +572,8 @@ class Executor:
             aster_depth = aster_book.ask_size
 
         if basis_bps < drip["min_basis_bps"]:
-            log.debug(f"drip {symbol}: basis {basis_bps:.0f}bps < min {drip['min_basis_bps']:.0f}bps")
+            log.info(f"drip {symbol}: basis {basis_bps:.0f}bps < min {drip['min_basis_bps']:.0f}bps "
+                     f"(${drip['filled_notional']:.0f}/${drip['target_notional']:.0f} filled)")
             return
 
         # Size this bite: min of configured bite_qty, remaining qty, and Aster depth.
