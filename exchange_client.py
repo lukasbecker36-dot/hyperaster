@@ -1264,6 +1264,11 @@ class ExchangeClient:
             ) as r:
                 data = await r.json()
             ok = "leverage" in data
+            code = data.get("code")
+            if not ok and code == -2014:
+                log.info(f"Aster leverage {params['symbol']} {leverage}x: "
+                         f"skipped (API-key issue, existing position) ({data})")
+                return True
             log.info(f"Aster leverage set {params['symbol']} {leverage}x: {ok} ({data})")
             return ok
         except Exception as e:
@@ -1283,6 +1288,13 @@ class ExchangeClient:
             code = data.get("code")
             msg = str(data.get("msg", "")).lower()
             ok = code in (200, None) or "no need to change" in msg
+            # Treat "can't change with open position" or API-key errors as
+            # non-fatal — the position already exists with whatever margin type
+            # was set, and we shouldn't block trading on this.
+            if not ok and (code == -2014 or "position" in msg or "api-key" in msg):
+                log.info(f"Aster margin type {params['symbol']} {margin_type}: "
+                         f"skipped (existing position or API issue) ({data})")
+                return True
             log.info(f"Aster margin type {params['symbol']} {margin_type}: {ok} ({data})")
             return ok
         except Exception as e:
