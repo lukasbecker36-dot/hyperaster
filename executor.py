@@ -574,21 +574,29 @@ class Executor:
             log.debug(f"drip {symbol}: basis {basis_bps:.0f}bps < min {drip['min_basis_bps']:.0f}bps")
             return
 
-        # Size this bite: min of bite_notional, remaining, and available depth
+        # Size this bite: min of bite_notional, remaining, and available Aster depth.
+        # Capping to Aster depth avoids placing IOCs that can't fill because the
+        # book is too thin (common on equity perps with 0.01-0.02 per level).
         bite_usd = min(drip["bite_notional"], remaining)
-        bite_qty = self.client.snap_aster_qty(symbol, bite_usd / mid)
+        raw_qty = bite_usd / mid
+        if aster_depth > 0:
+            raw_qty = min(raw_qty, aster_depth)
+        bite_qty = self.client.snap_aster_qty(symbol, raw_qty)
         if bite_qty <= 0:
-            log.debug(f"drip {symbol}: bite_qty snapped to 0 (bite_usd=${bite_usd:.0f} mid={mid:.2f})")
+            log.debug(f"drip {symbol}: bite_qty snapped to 0 (bite_usd=${bite_usd:.0f} "
+                      f"mid={mid:.2f} ast_depth={aster_depth})")
             return
 
         if direction == "long_hl_short_aster":
             hl_side, aster_side = "buy", "sell"
             hl_ref = hl_book.ask
             aster_ref = aster_book.bid
+            aster_depth = aster_book.bid_size
         else:
             hl_side, aster_side = "sell", "buy"
             hl_ref = hl_book.bid
             aster_ref = aster_book.ask
+            aster_depth = aster_book.ask_size
 
         if self.paper_mode:
             fill_notional = bite_qty * mid
@@ -651,13 +659,44 @@ class Executor:
                         notes=f"qty={hl_res.filled_qty} px={hl_res.fill_price}")
         actual_qty = hl_res.filled_qty
 
-        # Aster taker leg
+        # Aster taker leg — snapshot position before, reconcile after.
+        # Aster IOC can return executedQty=0 in the POST response but fill
+        # asynchronously as a taker. If we trust the response and emergency-
+        # close HL, we'd create a naked Aster short. Instead, wait and check
+        # the actual position delta.
+        try:
+            pre_ap = await self.client.get_aster_position(symbol)
+            aster_pre_amt = float(pre_ap.get("positionAmt", 0) or 0)
+        except Exception:
+            aster_pre_amt = None
+
         ast_intent = record_intent(
             symbol=symbol, venue="aster", action="drip_ioc",
             direction=direction, side=aster_side, qty=actual_qty,
             ref_price=aster_ref, paper=False,
         )
         ast_res = await self.client.place_aster_ioc(symbol, aster_side, actual_qty, aster_ref)
+
+        if not ast_res.success or ast_res.filled_qty <= 0:
+            # Don't trust the response — Aster IOC may have filled async.
+            # Wait briefly and check the actual position delta.
+            if aster_pre_amt is not None:
+                await asyncio.sleep(2.0)
+                try:
+                    post_ap = await self.client.get_aster_position(symbol)
+                    aster_post_amt = float(post_ap.get("positionAmt", 0) or 0)
+                    delta = abs(aster_post_amt - aster_pre_amt)
+                    if delta >= actual_qty * 0.90:
+                        log.warning(
+                            f"drip {symbol}: Aster IOC reported no fill but position "
+                            f"moved {aster_pre_amt} -> {aster_post_amt} — reconciled as filled"
+                        )
+                        ast_res = OrderResult(
+                            success=True, order_id=ast_res.order_id or "RECONCILED",
+                            filled_qty=delta, fill_price=aster_ref,
+                        )
+                except Exception as e:
+                    log.warning(f"drip {symbol}: Aster position reconcile failed ({e})")
 
         if not ast_res.success or ast_res.filled_qty <= 0:
             complete_intent(ast_intent, "no_fill", notes=(ast_res.error or "no fill")[:200])
