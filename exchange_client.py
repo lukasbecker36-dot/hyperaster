@@ -144,6 +144,26 @@ class ExchangeClient:
         if self.session:
             await self.session.close()
 
+    async def ensure_symbol_loaded(self, symbol: str) -> bool:
+        """Dynamically load specs for a symbol not in the startup universe.
+
+        Returns True if the symbol is ready (specs + asset index populated)."""
+        hl_coin = f"xyz:{symbol}"
+        if hl_coin in self._hl_xyz_indices and symbol in self.hl_specs and symbol in self.aster_specs:
+            return True
+        log.info(f"Dynamically loading specs for {symbol}…")
+        await asyncio.gather(
+            self._load_aster_specs([symbol]),
+            self._load_hl_xyz_specs([symbol]),
+        )
+        if hl_coin not in self._hl_xyz_indices:
+            log.error(f"{symbol}: not found in HL XYZ universe after dynamic load")
+            return False
+        if symbol not in self.aster_specs:
+            log.error(f"{symbol}: not found on Aster after dynamic load")
+            return False
+        return True
+
     # ── Spec loading ──
 
     async def _load_aster_specs(self, symbols: list[str]):

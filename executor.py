@@ -518,6 +518,9 @@ class Executor:
                                f"trade — can't scale it this way")
             is_scale = True
 
+        if not await self.client.ensure_symbol_loaded(symbol):
+            return False, f"{symbol}: not found on one or both venues"
+
         try:
             aster_book, hl_book = await self.client.get_both_books(symbol)
         except Exception as e:
