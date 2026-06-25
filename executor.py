@@ -584,8 +584,9 @@ class Executor:
         if aster_depth > 0:
             raw_qty = min(raw_qty, aster_depth)
         bite_qty = self.client.snap_aster_qty(symbol, raw_qty)
-        if bite_qty <= 0:
-            log.debug(f"drip {symbol}: bite_qty snapped to 0 (bite_usd=${bite_usd:.0f} "
+        bite_notional_actual = bite_qty * mid
+        if bite_qty <= 0 or bite_notional_actual < 12.0:
+            log.debug(f"drip {symbol}: bite too small (qty={bite_qty} notional=${bite_notional_actual:.1f} "
                       f"mid={mid:.2f} ast_depth={aster_depth})")
             return
 
