@@ -567,8 +567,10 @@ class Executor:
         # long_aster_short_hl: buy Aster ask, sell HL bid → basis = (hl_bid - ast_ask) / mid
         if direction == "long_hl_short_aster":
             basis_bps = (aster_book.bid - hl_book.ask) / mid * 10000
+            aster_depth = aster_book.bid_size
         else:
             basis_bps = (hl_book.bid - aster_book.ask) / mid * 10000
+            aster_depth = aster_book.ask_size
 
         if basis_bps < drip["min_basis_bps"]:
             log.debug(f"drip {symbol}: basis {basis_bps:.0f}bps < min {drip['min_basis_bps']:.0f}bps")
@@ -591,12 +593,10 @@ class Executor:
             hl_side, aster_side = "buy", "sell"
             hl_ref = hl_book.ask
             aster_ref = aster_book.bid
-            aster_depth = aster_book.bid_size
         else:
             hl_side, aster_side = "sell", "buy"
             hl_ref = hl_book.bid
             aster_ref = aster_book.ask
-            aster_depth = aster_book.ask_size
 
         if self.paper_mode:
             fill_notional = bite_qty * mid
