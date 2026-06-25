@@ -538,14 +538,16 @@ class Executor:
         direction = drip["direction"]
 
         if not await self.client.ensure_symbol_loaded(symbol):
+            log.warning(f"drip {symbol}: ensure_symbol_loaded failed — skipping tick")
             return
 
         try:
             aster_book, hl_book = await self.client.get_both_books(symbol)
         except Exception as e:
-            log.debug(f"drip {symbol}: book fetch failed ({e})")
+            log.warning(f"drip {symbol}: book fetch failed ({e})")
             return
         if aster_book.bid <= 0 or hl_book.bid <= 0:
+            log.debug(f"drip {symbol}: empty book (HL bid={hl_book.bid} Ast bid={aster_book.bid})")
             return
 
         mid = (aster_book.mid + hl_book.mid) / 2
@@ -561,12 +563,14 @@ class Executor:
             basis_bps = (hl_book.bid - aster_book.ask) / mid * 10000
 
         if basis_bps < drip["min_basis_bps"]:
+            log.debug(f"drip {symbol}: basis {basis_bps:.0f}bps < min {drip['min_basis_bps']:.0f}bps")
             return
 
         # Size this bite: min of bite_notional, remaining, and available depth
         bite_usd = min(drip["bite_notional"], remaining)
         bite_qty = self.client.snap_aster_qty(symbol, bite_usd / mid)
         if bite_qty <= 0:
+            log.debug(f"drip {symbol}: bite_qty snapped to 0 (bite_usd=${bite_usd:.0f} mid={mid:.2f})")
             return
 
         if direction == "long_hl_short_aster":
