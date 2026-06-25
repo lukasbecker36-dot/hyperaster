@@ -606,8 +606,9 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 elif action == "drip_exit":
                     max_basis = float(cmd.get("max_basis_bps", 0) or 0)
                     bite_qty = float(cmd.get("bite_qty", 0) or 0)
+                    target_notional = float(cmd.get("target_notional", 0) or 0)
                     ok, msg = executor.start_drip_exit(
-                        symbol, max_basis, bite_qty)
+                        symbol, max_basis, bite_qty, target_notional)
                     send_alert(f"/drip_exit {symbol}: {'OK' if ok else 'FAILED'} — {msg}")
                 elif action == "import":
                     await _handle_import(symbol or None)

@@ -477,6 +477,28 @@ class PositionManager:
             f"total qty={pos.qty} ${pos.notional_usd:.0f}"
         )
 
+    def scale_out(
+        self, symbol: str, remove_qty: float, remove_notional: float,
+        hl_exit_price: float, aster_exit_price: float,
+    ):
+        """Reduce an existing open position (partial exit)."""
+        pos = self.positions.get(symbol)
+        if not pos or pos.status != "open":
+            return
+        pos.qty = max(0, pos.qty - remove_qty)
+        pos.notional_usd = max(0, (pos.notional_usd or 0) - remove_notional)
+        conn = get_connection()
+        conn.execute(
+            "UPDATE positions SET qty=?, notional_usd=? WHERE id=?",
+            (pos.qty, pos.notional_usd, pos.id),
+        )
+        conn.commit()
+        conn.close()
+        log.warning(
+            f"Position #{pos.id} SCALE-OUT: {symbol} -{remove_qty} qty -${remove_notional:.0f} → "
+            f"remaining qty={pos.qty} ${pos.notional_usd:.0f}"
+        )
+
     def confirm_aster_entry(self, symbol: str, aster_fill_price: float):
         """Called when the Aster GTX maker order fills. Position becomes open."""
         pos = self.positions.get(symbol)

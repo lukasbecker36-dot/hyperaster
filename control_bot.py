@@ -827,17 +827,19 @@ def cmd_drip(chat_id: str, arg: str):
 def cmd_drip_exit(chat_id: str, arg: str):
     """Taker-taker drip exit: unwind position in small bites when spread narrows.
 
-    Usage: /drip_exit SYMBOL MAX_BASIS_BPS BITE_QTY
+    Usage: /drip_exit SYMBOL MAX_BASIS_BPS BITE_QTY [NOTIONAL]
       MAX_BASIS_BPS: exit when executable spread ≤ this (e.g. 0 = fully converged)
       BITE_QTY: shares per bite (e.g. 0.04)
+      NOTIONAL (optional): USD to exit. Omit = exit full position.
 
     Reverses the position's entry direction. Use /cancel SYMBOL to stop.
     """
     toks = arg.split()
-    if len(toks) != 3:
+    if len(toks) not in (3, 4):
         send(chat_id,
-             "Usage: /drip_exit SYMBOL MAX_BASIS_BPS BITE_QTY\n"
-             "e.g. /drip_exit ZHIPU 0 0.04\n"
+             "Usage: /drip_exit SYMBOL MAX_BASIS_BPS BITE_QTY [NOTIONAL]\n"
+             "e.g. /drip_exit ZHIPU 30 0.04          (exit all)\n"
+             "     /drip_exit ZHIPU 30 0.04 500      (exit $500 worth)\n"
              "Exits when spread ≤ MAX_BASIS_BPS, in bites of BITE_QTY shares.")
         return
     symbol = toks[0].upper()
@@ -853,6 +855,15 @@ def cmd_drip_exit(chat_id: str, arg: str):
     except ValueError:
         send(chat_id, f"Bad bite qty {toks[2]!r} — must be a positive number (shares).")
         return
+    target_notional = 0.0
+    if len(toks) == 4:
+        try:
+            target_notional = float(toks[3])
+            if target_notional <= 0:
+                raise ValueError
+        except ValueError:
+            send(chat_id, f"Bad notional {toks[3]!r} — must be a positive number.")
+            return
 
     rc, active = run(["systemctl", "is-active", SERVICE], timeout=10)
     if active.strip() != "active":
@@ -861,17 +872,21 @@ def cmd_drip_exit(chat_id: str, arg: str):
 
     req = {"action": "drip_exit", "symbol": symbol,
            "max_basis_bps": max_basis, "bite_qty": bite_qty}
+    if target_notional:
+        req["target_notional"] = target_notional
     bite_str = f" bite={bite_qty}shares"
+    notional_str = f" ${target_notional:.0f}" if target_notional else " (full position)"
 
     if read_mode() == "live":
         _PENDING_ENTER[chat_id] = (req, time.time() + _CONFIRM_TTL)
         send(chat_id,
-             f"⚠️ LIVE drip_exit: {symbol} exit when spread ≤{max_basis:.0f}bps{bite_str}.\n"
+             f"⚠️ LIVE drip_exit: {symbol}{notional_str} exit when spread "
+             f"≤{max_basis:.0f}bps{bite_str}.\n"
              "This places REAL taker-taker exit orders each tick. Reply YES within 60s.")
         return
     _enqueue_manual(req)
     send(chat_id,
-         f"📩 queued [PAPER] drip_exit: {symbol} exit when spread "
+         f"📩 queued [PAPER] drip_exit: {symbol}{notional_str} exit when spread "
          f"≤{max_basis:.0f}bps{bite_str}. /cancel {symbol} to stop.")
 
 
@@ -939,7 +954,7 @@ def cmd_help(chat_id: str, _arg: str):
          "/close SYM [basis_bps] — close a position; basis_bps waits for a fill level\n"
          "/cancel SYM — cancel a pending basis-gated /enter or /close or /drip\n"
          "/drip SYM DIR NOTIONAL MIN_BPS BITE_QTY — taker-taker drip entry\n"
-         "/drip_exit SYM MAX_BPS BITE_QTY — taker-taker drip exit when spread narrows\n"
+         "/drip_exit SYM MAX_BPS BITE_QTY [NOTIONAL] — drip exit (partial or full)\n"
          "/import [SYM] — adopt existing venue positions into the bot for management\n"
          "/autoentry on|off — toggle auto basis-arb entry (exits unaffected)\n"
          "/autoexit on|off — toggle auto convergence/target exit (/drip_exit unaffected)\n"
@@ -1037,7 +1052,7 @@ def main():
             {"command": "close", "description": "Close a position: SYM [basis_bps]"},
             {"command": "cancel", "description": "Cancel a pending basis-gated order: SYM"},
             {"command": "drip", "description": "Taker-taker drip: SYM DIR NOTIONAL MIN_BPS BITE_QTY"},
-            {"command": "drip_exit", "description": "Taker-taker drip exit: SYM MAX_BPS BITE_QTY"},
+            {"command": "drip_exit", "description": "Drip exit: SYM MAX_BPS BITE_QTY [NOTIONAL]"},
             {"command": "import", "description": "Adopt existing venue positions: [SYM]"},
             {"command": "autoentry", "description": "Toggle auto basis-arb entry: on|off"},
             {"command": "autoexit", "description": "Toggle auto convergence/target exit: on|off"},

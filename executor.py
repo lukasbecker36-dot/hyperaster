@@ -528,6 +528,7 @@ class Executor:
 
     def start_drip_exit(
         self, symbol: str, max_basis_bps: float, bite_qty: float,
+        target_notional: float = 0.0,
     ) -> tuple[bool, str]:
         pos = self.pm.get(symbol)
         if not pos or pos.status != "open":
@@ -536,9 +537,18 @@ class Executor:
             return False, "bite_qty must be > 0 (shares per bite)"
         if symbol in self._drip_exits:
             return False, f"{symbol}: drip_exit already running — /cancel first"
+        if target_notional > 0:
+            # Convert notional to qty using current position's avg price
+            avg_price = (pos.hl_entry_price + pos.aster_entry_price) / 2
+            if avg_price > 0:
+                exit_qty = min(target_notional / avg_price, pos.qty)
+            else:
+                exit_qty = pos.qty
+        else:
+            exit_qty = pos.qty
         self._drip_exits[symbol] = {
             "direction": pos.direction,
-            "total_qty": pos.qty,
+            "total_qty": exit_qty,
             "exited_qty": 0.0,
             "exited_notional": 0.0,
             "max_basis_bps": max_basis_bps,
@@ -550,8 +560,9 @@ class Executor:
             "last_hl_exit_price": 0.0,
             "last_aster_exit_price": 0.0,
         }
+        partial = f" (partial, full pos={pos.qty:.4f})" if exit_qty < pos.qty else ""
         return True, (
-            f"drip_exit started: {symbol} {pos.direction} qty={pos.qty:.4f} "
+            f"drip_exit started: {symbol} {pos.direction} qty={exit_qty:.4f}{partial} "
             f"bite={bite_qty}shares max_basis={max_basis_bps:.0f}bps"
         )
 
@@ -816,11 +827,19 @@ class Executor:
         self._drip_exits.pop(symbol, None)
         pos = self.pm.get(symbol)
         if pos and pos.status == "open":
-            self.pm.start_exiting(
-                symbol, "drip_exit", "drip_exit",
-                de["last_hl_exit_price"], de["max_basis_bps"])
-            self.pm.confirm_aster_exit(
-                symbol, de["last_aster_exit_price"], "drip_exit_converge")
+            remaining_qty = pos.qty - de["exited_qty"]
+            if remaining_qty <= 0.0001:
+                # Full exit — close the position
+                self.pm.start_exiting(
+                    symbol, "drip_exit", "drip_exit",
+                    de["last_hl_exit_price"], de["max_basis_bps"])
+                self.pm.confirm_aster_exit(
+                    symbol, de["last_aster_exit_price"], "drip_exit_converge")
+            else:
+                # Partial exit — reduce position qty in DB
+                self.pm.scale_out(symbol, de["exited_qty"], de["exited_notional"],
+                                  de["last_hl_exit_price"], de["last_aster_exit_price"])
+                msg += f" (remaining: {remaining_qty:.4f})"
         log.warning(msg)
         return msg
 
