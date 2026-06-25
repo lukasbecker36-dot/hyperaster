@@ -660,6 +660,52 @@ class Executor:
         # Live: Aster first (buy back short / sell long), then HL hedge
         await self.client.ensure_perp_margin(symbol)
 
+        # If there's an unhedged buffer, try HL first — don't add more Aster risk.
+        unhedged = de.get("unhedged_qty", 0.0)
+        if unhedged > 0.0001:
+            hedge_qty = round(unhedged, 8)
+            hedge_notional = hedge_qty * mid
+            if hedge_notional >= 12.0:
+                log.info(f"drip_exit {symbol}: retrying HL hedge for buffer {hedge_qty}")
+                try:
+                    pre_pos = await self.client.get_hl_position(symbol)
+                    baseline_szi = float(pre_pos.get("szi", 0) or 0)
+                except Exception:
+                    baseline_szi = 0.0
+                hl_intent = record_intent(
+                    symbol=symbol, venue="hl", action="drip_exit_ioc",
+                    direction=direction, side=hl_side, qty=hedge_qty,
+                    ref_price=hl_ref, baseline_szi=baseline_szi, paper=False,
+                )
+                hl_res = await self.client.place_hl_ioc(symbol, hl_side, hedge_qty, hl_ref)
+                if hl_res.ambiguous:
+                    expected_signed = hedge_qty if hl_side == "buy" else -hedge_qty
+                    filled, actual_signed, _ = await self.client.reconcile_hl_position_delta(
+                        symbol, baseline_szi, expected_signed)
+                    if filled:
+                        hl_res = OrderResult(success=True, order_id="RECONCILED",
+                                             filled_qty=abs(actual_signed), fill_price=hl_ref)
+                if hl_res.success and hl_res.filled_qty > 0:
+                    complete_intent(hl_intent, "filled",
+                                    notes=f"qty={hl_res.filled_qty} px={hl_res.fill_price}")
+                    de["unhedged_qty"] = 0.0
+                    de["exited_qty"] += hedge_qty
+                    de["exited_notional"] += hedge_qty * mid
+                    de["fills"] += 1
+                    de["last_hl_exit_price"] = hl_res.fill_price
+                    pos = self.pm.get(symbol)
+                    if pos:
+                        self.pm.log_trade(pos.id, "hl", hl_side, "drip_exit_ioc",
+                                          hl_res.order_id, hedge_qty, hl_res.fill_price)
+                    log.warning(f"drip_exit {symbol}: -{hedge_qty} buffer hedged on HL "
+                                f"({de['exited_qty']:.3f}/{de['total_qty']:.3f})")
+                    if de["exited_qty"] >= de["total_qty"] - 0.0001:
+                        return self._finish_drip_exit(symbol, de)
+                else:
+                    complete_intent(hl_intent, "no_fill", notes=hl_res.error[:200])
+                    log.warning(f"drip_exit {symbol}: HL still no fill for buffer {hedge_qty} — waiting")
+                return
+
         try:
             pre_ap = await self.client.get_aster_position(symbol)
             aster_pre_amt = float(pre_ap.get("positionAmt", 0) or 0)
@@ -884,11 +930,72 @@ class Executor:
             return
 
         # ── Live: taker-taker (Aster first, then HL) ──
-        # Aster is the thin/illiquid side — fill it first. If it doesn't fill,
-        # no harm (no position taken). If it fills, HL has plenty of depth to
-        # hedge immediately. This avoids the leg-risk problem of filling HL
-        # first and then failing to fill the Aster hedge.
         await self.client.ensure_perp_margin(symbol)
+
+        # If there's an unhedged buffer from a previous tick, try to hedge it
+        # on HL first. Don't place new Aster IOCs until the buffer is cleared.
+        unhedged = drip.get("unhedged_qty", 0.0)
+        if unhedged > 0.0001:
+            hedge_qty = round(unhedged, 8)
+            hedge_notional = hedge_qty * mid
+            if hedge_notional < 12.0:
+                log.info(f"drip {symbol}: unhedged buffer {hedge_qty} (${hedge_notional:.1f}) "
+                         f"still below $12 — placing Aster to top up")
+            else:
+                log.info(f"drip {symbol}: retrying HL hedge for buffer {hedge_qty} (${hedge_notional:.1f})")
+                try:
+                    pre_pos = await self.client.get_hl_position(symbol)
+                    baseline_szi = float(pre_pos.get("szi", 0) or 0)
+                except Exception:
+                    baseline_szi = 0.0
+                hl_intent = record_intent(
+                    symbol=symbol, venue="hl", action="drip_ioc",
+                    direction=direction, side=hl_side, qty=hedge_qty,
+                    ref_price=hl_ref, baseline_szi=baseline_szi, paper=False,
+                )
+                hl_res = await self.client.place_hl_ioc(symbol, hl_side, hedge_qty, hl_ref)
+                if hl_res.ambiguous:
+                    expected_signed = hedge_qty if hl_side == "buy" else -hedge_qty
+                    filled, actual_signed, _ = await self.client.reconcile_hl_position_delta(
+                        symbol, baseline_szi, expected_signed)
+                    if filled:
+                        hl_res = OrderResult(success=True, order_id="RECONCILED",
+                                             filled_qty=abs(actual_signed), fill_price=hl_ref)
+                if hl_res.success and hl_res.filled_qty > 0:
+                    complete_intent(hl_intent, "filled",
+                                    notes=f"qty={hl_res.filled_qty} px={hl_res.fill_price}")
+                    drip["unhedged_qty"] = 0.0
+                    fill_notional = hedge_qty * mid
+                    hl_fr = self.client.get_hl_funding_rate(symbol)
+                    ast_fr = self.client.get_aster_funding_rate(symbol)
+                    existing = self.pm.get(symbol)
+                    if existing and existing.status == "open":
+                        self.pm.scale_in(symbol, hedge_qty, fill_notional,
+                                         hl_res.fill_price, hl_ref,
+                                         hl_funding_rate=hl_fr, aster_funding_rate=ast_fr)
+                    else:
+                        self.pm.import_position(
+                            symbol=symbol, hl_coin=f"xyz:{symbol}",
+                            aster_symbol=aster_symbol_for(symbol),
+                            direction=direction, qty=hedge_qty,
+                            hl_price=hl_res.fill_price, aster_price=hl_ref,
+                            hl_funding_rate=hl_fr, aster_funding_rate=ast_fr,
+                        )
+                    drip["filled_notional"] += fill_notional
+                    drip["fills"] += 1
+                    log.warning(f"drip {symbol}: +{hedge_qty} buffer hedged on HL "
+                                f"@ {hl_res.fill_price:.2f} "
+                                f"(${drip['filled_notional']:.0f}/${drip['target_notional']:.0f})")
+                    if drip["filled_notional"] >= drip["target_notional"]:
+                        msg = (f"drip complete: {symbol} ${drip['filled_notional']:.0f} "
+                               f"({drip['fills']} fills)")
+                        self._drips.pop(symbol, None)
+                        return msg
+                else:
+                    complete_intent(hl_intent, "no_fill", notes=hl_res.error[:200])
+                    log.warning(f"drip {symbol}: HL still no fill for buffer {hedge_qty} — "
+                                f"waiting (no new Aster orders)")
+                return
 
         # Snapshot Aster position before the order for reconciliation.
         try:
