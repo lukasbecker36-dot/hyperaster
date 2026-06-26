@@ -128,7 +128,7 @@ def _write_pending_gates(pending_entries: dict, pending_exits: dict,
                 for s, r in pending_entries.items()
             },
             "exits": {
-                s: {k: v for k, v in r.items() if k in ("target_bps", "maker_venue")}
+                s: {k: v for k, v in r.items() if k in ("target_bps", "maker_venue", "close_notional")}
                 for s, r in pending_exits.items()
             },
             "drips": {
@@ -559,22 +559,35 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                         send_alert(f"/close {symbol}: no open position")
                         continue
                     maker_venue = cmd.get("maker_venue", "")
+                    close_notional = float(cmd.get("close_notional", 0) or 0)
                     if target is not None:
                         pe = {"target_bps": float(target)}
                         if maker_venue:
                             pe["maker_venue"] = maker_venue
+                        if close_notional:
+                            pe["close_notional"] = close_notional
                         pending_exits[symbol] = pe
                         mv_str = f" maker={maker_venue}" if maker_venue else ""
+                        n_str = f" ${close_notional:.0f}" if close_notional else ""
                         send_alert(
-                            f"/close {symbol}: waiting for exit basis ≥ {float(target):.0f}bps{mv_str} "
+                            f"/close {symbol}{n_str}: waiting for exit basis ≥ {float(target):.0f}bps{mv_str} "
                             f"(safety stops still apply)"
                         )
                     else:
                         pending_exits.pop(symbol, None)
-                        aster_book, hl_book = await client.get_both_books(symbol)
-                        await executor.exit_position(
-                            symbol, aster_book, hl_book, "manual", maker_venue)
-                        send_alert(f"/close {symbol}: exit submitted")
+                        if close_notional and pos.qty > 0:
+                            avg_price = (pos.hl_entry_price + pos.aster_entry_price) / 2
+                            if avg_price <= 0:
+                                aster_book, hl_book = await client.get_both_books(symbol)
+                                avg_price = (aster_book.mid + hl_book.mid) / 2
+                            close_qty = min(close_notional / avg_price, pos.qty) if avg_price > 0 else pos.qty
+                            ok = await executor.partial_close(symbol, close_qty, "manual_partial")
+                            send_alert(f"/close {symbol}: partial close {'submitted' if ok else 'FAILED'}")
+                        else:
+                            aster_book, hl_book = await client.get_both_books(symbol)
+                            await executor.exit_position(
+                                symbol, aster_book, hl_book, "manual", maker_venue)
+                            send_alert(f"/close {symbol}: exit submitted")
                 elif action == "cancel":
                     had = pending_entries.pop(symbol, None) or pending_exits.pop(symbol, None)
                     # Cancel any active drip or drip_exit
@@ -787,9 +800,19 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 continue
             if basis >= pending_exits[symbol]["target_bps"]:
                 mv = pending_exits[symbol].get("maker_venue", "")
+                cn = float(pending_exits[symbol].get("close_notional", 0) or 0)
                 pending_exits.pop(symbol, None)
-                await executor.exit_position(symbol, aster_book, hl_book, "manual_target", mv)
-                send_alert(f"/close {symbol}: exit basis {basis:.0f}bps ≥ target — submitted")
+                if cn and pos.qty > 0:
+                    avg_price = (pos.hl_entry_price + pos.aster_entry_price) / 2
+                    if avg_price <= 0:
+                        avg_price = (aster_book.mid + hl_book.mid) / 2
+                    close_qty = min(cn / avg_price, pos.qty) if avg_price > 0 else pos.qty
+                    ok = await executor.partial_close(symbol, close_qty, "manual_target_partial")
+                    send_alert(f"/close {symbol}: basis {basis:.0f}bps ≥ target — "
+                               f"partial close {'submitted' if ok else 'FAILED'}")
+                else:
+                    await executor.exit_position(symbol, aster_book, hl_book, "manual_target", mv)
+                    send_alert(f"/close {symbol}: exit basis {basis:.0f}bps ≥ target — submitted")
 
     try:
         while True:

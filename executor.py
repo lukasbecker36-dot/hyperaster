@@ -1656,6 +1656,98 @@ class Executor:
     # = convergence forced closes.)
     URGENT_EXIT_REASONS = {"funding_stop", "blocked", "timeout", "funding_drag"}
 
+    async def partial_close(self, symbol: str, close_qty: float, reason: str = "manual_partial") -> bool:
+        """Close a portion of a position using taker-taker (IOC both sides), then scale_out."""
+        pos = self.pm.get(symbol)
+        if not pos or pos.status != "open":
+            return False
+        close_qty = min(close_qty, pos.qty)
+        if close_qty <= 0:
+            return False
+
+        try:
+            aster_book, hl_book = await self.client.get_both_books(symbol)
+        except Exception as e:
+            log.error(f"{symbol}: partial close book fetch failed ({e})")
+            return False
+
+        if pos.direction == "long_hl_short_aster":
+            hl_side, aster_side = "sell", "buy"
+            hl_ref = hl_book.bid
+            aster_ref = aster_book.ask
+        else:
+            hl_side, aster_side = "buy", "sell"
+            hl_ref = hl_book.ask
+            aster_ref = aster_book.bid
+
+        mid = (aster_book.mid + hl_book.mid) / 2
+        spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000 if mid > 0 else 0
+
+        log.info(
+            f"PARTIAL CLOSE {symbol} ({reason}): qty={close_qty:.4f}/{pos.qty:.4f} "
+            f"spread={spread_bps:.1f}bps | HL {hl_side} @ {hl_ref:.2f} | Aster {aster_side} @ {aster_ref:.2f}"
+        )
+
+        if self.paper_mode:
+            remove_notional = close_qty * mid
+            self.pm.scale_out(symbol, close_qty, remove_notional, hl_ref, aster_ref)
+            log.info(f"[PAPER] PARTIAL CLOSE {symbol} qty={close_qty:.4f} ${remove_notional:.0f}")
+            return True
+
+        try:
+            pre_pos = await self.client.get_hl_position(symbol)
+            baseline_szi = float(pre_pos.get("szi", 0) or 0)
+        except Exception as e:
+            log.error(f"{symbol}: partial close HL pre-snapshot failed ({e})")
+            return False
+
+        intent_id = record_intent(
+            symbol=symbol, venue="hl", action="partial_close_ioc",
+            direction=pos.direction, side=hl_side, qty=close_qty,
+            ref_price=hl_ref, baseline_szi=baseline_szi,
+            position_id=pos.id, paper=self.paper_mode,
+        )
+
+        hl_res = await self.client.place_hl_ioc(symbol, hl_side, close_qty, hl_ref)
+        if not hl_res.success or hl_res.filled_qty <= 0:
+            log.error(f"{symbol}: partial close HL IOC failed ({hl_res.error})")
+            complete_intent(intent_id, "rejected", notes=(hl_res.error or "no_fill")[:200],
+                            position_id=pos.id)
+            return False
+
+        complete_intent(intent_id, "filled",
+                        notes=f"hl_filled={hl_res.filled_qty}", position_id=pos.id)
+        log.info(f"{symbol}: partial close HL filled {hl_res.filled_qty} @ {hl_res.fill_price:.2f}")
+
+        aster_qty = self.client.snap_aster_qty(symbol, hl_res.filled_qty)
+        if aster_qty <= 0:
+            log.critical(f"{symbol}: partial close HL filled but Aster snap=0 — UNHEDGED")
+            return False
+
+        aster_res = await self.client.place_aster_ioc(symbol, aster_side, aster_qty, aster_ref)
+        if not aster_res.success or aster_res.filled_qty <= 0:
+            log.critical(f"{symbol}: partial close UNHEDGED — HL filled {hl_res.filled_qty} "
+                         f"but Aster IOC failed ({aster_res.error})")
+            return False
+
+        remove_notional = hl_res.filled_qty * mid
+        self.pm.log_trade(
+            pos.id, "hl", hl_side, "ioc_limit",
+            hl_res.order_id, hl_res.filled_qty, hl_res.fill_price, notes="partial_close",
+        )
+        self.pm.log_trade(
+            pos.id, "aster", aster_side, "ioc_limit",
+            aster_res.order_id, aster_res.filled_qty, aster_res.fill_price, notes="partial_close",
+        )
+        self.pm.scale_out(symbol, hl_res.filled_qty, remove_notional,
+                          hl_res.fill_price, aster_res.fill_price)
+        log.warning(
+            f"PARTIAL CLOSE OK {symbol}: closed {hl_res.filled_qty:.4f} "
+            f"(HL @ {hl_res.fill_price:.2f}, Aster @ {aster_res.fill_price:.2f}) "
+            f"remaining={pos.qty:.4f}"
+        )
+        return True
+
     async def exit_position(
         self, symbol: str, aster_book: OrderBook, hl_book: OrderBook, reason: str,
         maker_venue: str = "",
