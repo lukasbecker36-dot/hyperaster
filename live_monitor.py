@@ -581,7 +581,13 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                                 aster_book, hl_book = await client.get_both_books(symbol)
                                 avg_price = (aster_book.mid + hl_book.mid) / 2
                             close_qty = min(close_notional / avg_price, pos.qty) if avg_price > 0 else pos.qty
-                            ok = await executor.partial_close(symbol, close_qty, "manual_partial")
+                            if maker_venue:
+                                aster_book, hl_book = await client.get_both_books(symbol)
+                                ok = await executor.exit_position(
+                                    symbol, aster_book, hl_book, "manual_partial",
+                                    maker_venue, close_qty)
+                            else:
+                                ok = await executor.partial_close(symbol, close_qty, "manual_partial")
                             send_alert(f"/close {symbol}: partial close {'submitted' if ok else 'FAILED'}")
                         else:
                             aster_book, hl_book = await client.get_both_books(symbol)
@@ -807,7 +813,12 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     if avg_price <= 0:
                         avg_price = (aster_book.mid + hl_book.mid) / 2
                     close_qty = min(cn / avg_price, pos.qty) if avg_price > 0 else pos.qty
-                    ok = await executor.partial_close(symbol, close_qty, "manual_target_partial")
+                    if mv:
+                        ok = await executor.exit_position(
+                            symbol, aster_book, hl_book, "manual_target_partial",
+                            mv, close_qty)
+                    else:
+                        ok = await executor.partial_close(symbol, close_qty, "manual_target_partial")
                     send_alert(f"/close {symbol}: basis {basis:.0f}bps ≥ target — "
                                f"partial close {'submitted' if ok else 'FAILED'}")
                 else:

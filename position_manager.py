@@ -481,9 +481,9 @@ class PositionManager:
         self, symbol: str, remove_qty: float, remove_notional: float,
         hl_exit_price: float, aster_exit_price: float,
     ):
-        """Reduce an existing open position (partial exit)."""
+        """Reduce an existing position (partial exit). Works on open or exiting positions."""
         pos = self.positions.get(symbol)
-        if not pos or pos.status != "open":
+        if not pos or pos.status not in ("open", "exiting"):
             return
         pos.qty = max(0, pos.qty - remove_qty)
         pos.notional_usd = max(0, (pos.notional_usd or 0) - remove_notional)
@@ -498,6 +498,29 @@ class PositionManager:
             f"Position #{pos.id} SCALE-OUT: {symbol} -{remove_qty} qty -${remove_notional:.0f} → "
             f"remaining qty={pos.qty} ${pos.notional_usd:.0f}"
         )
+
+    def revert_partial_exit(self, symbol: str):
+        """Revert a position from 'exiting' back to 'open' after a partial close."""
+        pos = self.positions.get(symbol)
+        if not pos or pos.status != "exiting":
+            return
+        pos.status = "open"
+        pos.hl_exit_order_id = ""
+        pos.aster_exit_order_id = ""
+        pos.hl_baseline_szi = 0.0
+        pos.aster_hedged_qty = 0.0
+        pos.aster_hedge_attempts = 0
+        pos.exit_time = 0
+        conn = get_connection()
+        conn.execute(
+            "UPDATE positions SET status='open', hl_exit_order_id='', "
+            "aster_exit_order_id='', hl_baseline_szi=0, aster_hedged_qty=0, "
+            "exit_time=0 WHERE id=?",
+            (pos.id,),
+        )
+        conn.commit()
+        conn.close()
+        log.info(f"Position #{pos.id} reverted to OPEN after partial close")
 
     def confirm_aster_entry(self, symbol: str, aster_fill_price: float):
         """Called when the Aster GTX maker order fills. Position becomes open."""

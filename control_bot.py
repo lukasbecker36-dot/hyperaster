@@ -762,10 +762,6 @@ def cmd_close(chat_id: str, arg: str):
         req["maker_venue"] = maker_venue
     if close_notional:
         req["close_notional"] = close_notional
-    if close_notional and maker_venue:
-        send(chat_id, "Note: partial close always uses taker-taker — maker venue ignored.")
-        maker_venue = ""
-        req.pop("maker_venue", None)
     venue_str = f" maker={maker_venue}" if maker_venue else ""
     notional_str = f" ${close_notional:.0f}" if close_notional else " (full)"
     _enqueue_manual(req)
