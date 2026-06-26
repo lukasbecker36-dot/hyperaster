@@ -127,7 +127,10 @@ def _write_pending_gates(pending_entries: dict, pending_exits: dict,
                     "target_bps": r["target_bps"]}
                 for s, r in pending_entries.items()
             },
-            "exits": {s: {"target_bps": r["target_bps"]} for s, r in pending_exits.items()},
+            "exits": {
+                s: {k: v for k, v in r.items() if k in ("target_bps", "maker_venue")}
+                for s, r in pending_exits.items()
+            },
             "drips": {
                 s: {"direction": d["direction"],
                     "filled_notional": d["filled_notional"],
@@ -555,16 +558,22 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                         pending_exits.pop(symbol, None)
                         send_alert(f"/close {symbol}: no open position")
                         continue
+                    maker_venue = cmd.get("maker_venue", "")
                     if target is not None:
-                        pending_exits[symbol] = {"target_bps": float(target)}
+                        pe = {"target_bps": float(target)}
+                        if maker_venue:
+                            pe["maker_venue"] = maker_venue
+                        pending_exits[symbol] = pe
+                        mv_str = f" maker={maker_venue}" if maker_venue else ""
                         send_alert(
-                            f"/close {symbol}: waiting for exit basis ≥ {float(target):.0f}bps "
+                            f"/close {symbol}: waiting for exit basis ≥ {float(target):.0f}bps{mv_str} "
                             f"(safety stops still apply)"
                         )
                     else:
                         pending_exits.pop(symbol, None)
                         aster_book, hl_book = await client.get_both_books(symbol)
-                        await executor.exit_position(symbol, aster_book, hl_book, "manual")
+                        await executor.exit_position(
+                            symbol, aster_book, hl_book, "manual", maker_venue)
                         send_alert(f"/close {symbol}: exit submitted")
                 elif action == "cancel":
                     had = pending_entries.pop(symbol, None) or pending_exits.pop(symbol, None)
@@ -777,8 +786,9 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             if basis is None:
                 continue
             if basis >= pending_exits[symbol]["target_bps"]:
+                mv = pending_exits[symbol].get("maker_venue", "")
                 pending_exits.pop(symbol, None)
-                await executor.exit_position(symbol, aster_book, hl_book, "manual_target")
+                await executor.exit_position(symbol, aster_book, hl_book, "manual_target", mv)
                 send_alert(f"/close {symbol}: exit basis {basis:.0f}bps ≥ target — submitted")
 
     try:

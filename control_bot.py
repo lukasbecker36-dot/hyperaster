@@ -720,16 +720,19 @@ def cmd_enter(chat_id: str, arg: str):
 def cmd_close(chat_id: str, arg: str):
     """Manually close one open position via the monitor.
 
-    Usage: /close SYMBOL [BASIS_TARGET_BPS]
+    Usage: /close SYMBOL [BASIS_TARGET_BPS] [MAKER_VENUE]
       Omit target = close now (cross the book).
       With target = wait until the executable exit basis is at or better than the
       target (bps, in your favour). Safety stops still close it if it stays bad.
+      MAKER_VENUE = hl or aster — which side rests the limit order. Omit = auto.
     """
     toks = arg.split()
     if not toks:
-        send(chat_id, "Usage: /close SYMBOL [BASIS_TARGET_BPS]\n"
-                      "e.g. /close SMSN        (close now)\n"
-                      "     /close SMSN 5       (wait until exit basis ≥ 5bps)")
+        send(chat_id, "Usage: /close SYMBOL [BASIS_TARGET_BPS] [MAKER_VENUE]\n"
+                      "e.g. /close SMSN              (close now, taker-taker)\n"
+                      "     /close SMSN 5             (wait basis ≥ 5bps, auto maker)\n"
+                      "     /close SMSN 5 hl          (wait basis ≥ 5bps, maker on HL)\n"
+                      "     /close SMSN 0 aster       (close now, maker on Aster)")
         return
     symbol = toks[0].upper()
     req = {"action": "close", "symbol": symbol}
@@ -741,8 +744,17 @@ def cmd_close(chat_id: str, arg: str):
         except ValueError:
             send(chat_id, f"Bad basis target {toks[1]!r} — must be a number (bps).")
             return
+    maker_venue = ""
+    if len(toks) >= 3:
+        mv = toks[2].lower()
+        if mv not in ("hl", "aster"):
+            send(chat_id, f"Bad maker venue {toks[2]!r} — must be 'hl' or 'aster'.")
+            return
+        maker_venue = mv
+        req["maker_venue"] = maker_venue
+    venue_str = f" maker={maker_venue}" if maker_venue else ""
     _enqueue_manual(req)
-    send(chat_id, f"📩 queued close for {symbol}{gate}. You'll get an alert when the exit is submitted.")
+    send(chat_id, f"📩 queued close for {symbol}{gate}{venue_str}. You'll get an alert when the exit is submitted.")
 
 
 def cmd_cancel(chat_id: str, arg: str):
@@ -951,7 +963,7 @@ def cmd_help(chat_id: str, _arg: str):
          "/book SYM — top-5 order book on both venues\n"
          "/funding [n] — top funding-carry opportunities\n"
          "/enter SYM DIR NOTIONAL [basis_bps] — open a funding hold; basis_bps waits for a fill level\n"
-         "/close SYM [basis_bps] — close a position; basis_bps waits for a fill level\n"
+         "/close SYM [basis_bps] [hl|aster] — close; maker on hl or aster\n"
          "/cancel SYM — cancel a pending basis-gated /enter or /close or /drip\n"
          "/drip SYM DIR NOTIONAL MIN_BPS BITE_QTY — taker-taker drip entry\n"
          "/drip_exit SYM MAX_BPS BITE_QTY [NOTIONAL] — drip exit (partial or full)\n"
@@ -1049,7 +1061,7 @@ def main():
             {"command": "funding", "description": "Top funding-carry opportunities"},
             {"command": "positions", "description": "Open positions + pending basis gates"},
             {"command": "enter", "description": "Open a funding hold: SYM DIR NOTIONAL [basis_bps]"},
-            {"command": "close", "description": "Close a position: SYM [basis_bps]"},
+            {"command": "close", "description": "Close position: SYM [bps] [hl|aster]"},
             {"command": "cancel", "description": "Cancel a pending basis-gated order: SYM"},
             {"command": "drip", "description": "Taker-taker drip: SYM DIR NOTIONAL MIN_BPS BITE_QTY"},
             {"command": "drip_exit", "description": "Drip exit: SYM MAX_BPS BITE_QTY [NOTIONAL]"},

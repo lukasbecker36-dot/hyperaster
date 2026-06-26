@@ -1658,19 +1658,17 @@ class Executor:
 
     async def exit_position(
         self, symbol: str, aster_book: OrderBook, hl_book: OrderBook, reason: str,
+        maker_venue: str = "",
     ) -> bool:
-        """Dispatch an exit. A maker-first position (entry_maker_venue=='hl') closes
-        maker-first on HL with an Aster taker hedge — same convention as its entry,
-        so the executable exit basis matches what /positions and /close display, and
-        poll_hl_maker_exit escalates to taker-taker if that clears. Urgent reasons
-        and legacy taker positions use try_exit for an immediate fill."""
+        """Dispatch an exit.
+        maker_venue override: 'hl' = rest maker on HL, 'aster' = rest maker on Aster.
+        Empty = auto (use entry_maker_venue if set). Urgent reasons always taker-taker."""
         pos = self.pm.get(symbol)
-        if pos and pos.entry_maker_venue == "hl" and reason not in self.URGENT_EXIT_REASONS:
+        effective_maker = maker_venue or (pos.entry_maker_venue if pos else "")
+        if pos and effective_maker == "hl" and reason not in self.URGENT_EXIT_REASONS:
             ok = await self.force_exit_maker(symbol, reason)
             if ok:
                 return True
-            # Maker exit couldn't even be placed — fall back to taker so we're
-            # never stuck unable to close the position.
             log.warning(f"{symbol}: maker exit unavailable — falling back to taker exit")
         return await self.try_exit(symbol, aster_book, hl_book, reason)
 
