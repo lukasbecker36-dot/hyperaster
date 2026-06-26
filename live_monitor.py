@@ -576,18 +576,15 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     else:
                         pending_exits.pop(symbol, None)
                         if close_notional and pos.qty > 0:
+                            aster_book, hl_book = await client.get_both_books(symbol)
                             avg_price = (pos.hl_entry_price + pos.aster_entry_price) / 2
                             if avg_price <= 0:
-                                aster_book, hl_book = await client.get_both_books(symbol)
                                 avg_price = (aster_book.mid + hl_book.mid) / 2
                             close_qty = min(close_notional / avg_price, pos.qty) if avg_price > 0 else pos.qty
-                            if maker_venue:
-                                aster_book, hl_book = await client.get_both_books(symbol)
-                                ok = await executor.exit_position(
-                                    symbol, aster_book, hl_book, "manual_partial",
-                                    maker_venue, close_qty)
-                            else:
-                                ok = await executor.partial_close(symbol, close_qty, "manual_partial")
+                            # exit_position routes partials to HL-maker or taker-taker
+                            ok = await executor.exit_position(
+                                symbol, aster_book, hl_book, "manual_partial",
+                                maker_venue, close_qty)
                             send_alert(f"/close {symbol}: partial close {'submitted' if ok else 'FAILED'}")
                         else:
                             aster_book, hl_book = await client.get_both_books(symbol)
@@ -813,12 +810,9 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     if avg_price <= 0:
                         avg_price = (aster_book.mid + hl_book.mid) / 2
                     close_qty = min(cn / avg_price, pos.qty) if avg_price > 0 else pos.qty
-                    if mv:
-                        ok = await executor.exit_position(
-                            symbol, aster_book, hl_book, "manual_target_partial",
-                            mv, close_qty)
-                    else:
-                        ok = await executor.partial_close(symbol, close_qty, "manual_target_partial")
+                    ok = await executor.exit_position(
+                        symbol, aster_book, hl_book, "manual_target_partial",
+                        mv, close_qty)
                     send_alert(f"/close {symbol}: basis {basis:.0f}bps ≥ target — "
                                f"partial close {'submitted' if ok else 'FAILED'}")
                 else:
@@ -852,12 +846,14 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     # Maker-first carry entries: HL post-only resting, hedge on fill.
                     hl_makers = [s for s, p in pm.positions.items()
                                  if p.status == "entering" and p.entry_maker_venue == "hl"]
-                    # Maker-first exits (carry + convergence): HL post-only close
-                    # resting, Aster taker closes each HL fill. Distinguished from a
-                    # taker-fallback exit (which rests an Aster GTX) by the empty
-                    # aster_exit_order_id.
+                    # HL-maker exits: HL post-only close resting, Aster taker closes
+                    # each HL fill. Identified by exiting + a resting HL exit order +
+                    # NO Aster GTX (vs the Aster-GTX taker-fallback below). Covers both
+                    # carry exits (entered maker-first on HL) AND taker-entered
+                    # positions closed with an explicit /close ... hl. Must NOT gate on
+                    # entry_maker_venue or the latter's resting HL maker is never polled.
                     hl_exit_makers = [s for s, p in pm.positions.items()
-                                      if p.status == "exiting" and p.entry_maker_venue == "hl"
+                                      if p.status == "exiting" and p.hl_exit_order_id
                                       and not p.aster_exit_order_id]
                     # Legacy Aster-GTX flow: convergence entries + any exit with a
                     # resting Aster GTX (convergence exits + carry taker fallbacks).
