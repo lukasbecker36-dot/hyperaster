@@ -45,6 +45,7 @@ from config import (
 
 SLOW_SCAN_INTERVAL_SECONDS = 300   # re-rank all symbols every 5 min
 FAST_CANDIDATES = 3                # symbols to poll every tick between slow scans
+DISCOVERY_INTERVAL_SECONDS = 3600  # re-query both venues for newly-listed overlaps hourly
 from database import init_db
 from exchange_client import ExchangeClient
 from position_manager import PositionManager, estimate_funding_pnl
@@ -327,6 +328,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     last_heartbeat = start_time
     last_aster_poll = 0
     last_slow_scan = 0
+    last_discovery = start_time  # first auto-discovery runs DISCOVERY_INTERVAL after start
     tick_count = 0
     consecutive_errors = 0
     # symbol -> (excess_bps, direction_str, baseline_bps) from last scan
@@ -819,6 +821,42 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     await executor.exit_position(symbol, aster_book, hl_book, "manual_target", mv)
                     send_alert(f"/close {symbol}: exit basis {basis:.0f}bps ≥ target — submitted")
 
+    async def discover_new_symbols():
+        """Re-query both venues for the current overlap and add any newly-listed
+        equity perp that appears on BOTH exchanges to the live universe. Loads its
+        specs and warms its baseline so the scanner can pick it up on the next slow
+        scan. Excluded names (BLOCKED/NON_EQUITY) are skipped."""
+        try:
+            overlap = await client.discover_overlap_bases()
+        except Exception as e:
+            log.warning(f"auto-discovery failed: {e}")
+            return
+        if not overlap:
+            return
+        known = set(symbols)
+        new = sorted(overlap - known - exclude)
+        if not new:
+            return
+        log.info(f"Auto-discovery: {len(new)} candidate new overlap symbol(s): {new}")
+        added = []
+        for sym in new:
+            try:
+                if not await client.ensure_symbol_loaded(sym):
+                    log.info(f"Auto-discovery: {sym} specs unavailable — skipping")
+                    continue
+                await client.warmup_book_spread([sym])
+                symbols.append(sym)
+                added.append(sym)
+            except Exception as e:
+                log.warning(f"Auto-discovery: failed to add {sym} ({e})")
+        if added:
+            log.info(f"Auto-discovery: added {added} to live universe ({len(symbols)} total)")
+            send_alert(
+                f"🆕 Auto-added {len(added)} new equity perp(s) now on both venues: "
+                f"{', '.join(added)}\nWatching for arbs (default {ENTRY_THRESHOLD_BPS:.0f}bps "
+                f"threshold until calibrated)."
+            )
+
     try:
         while True:
             tick_start = time.time()
@@ -887,6 +925,11 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 except Exception as e:
                     log.error(f"drip_exit tick {ds} error: {e}")
                     send_alert(f"💧 drip_exit {ds}: ERROR {e}")
+
+            # ── 1d. Auto-discovery: add newly-listed cross-venue overlaps hourly ──
+            if now - last_discovery >= DISCOVERY_INTERVAL_SECONDS * 1000:
+                last_discovery = now
+                await discover_new_symbols()
 
             # ── 2. Slow scan: rank all symbols every 5 min ──
             if now - last_slow_scan >= SLOW_SCAN_INTERVAL_SECONDS * 1000:

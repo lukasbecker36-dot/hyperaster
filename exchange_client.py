@@ -192,6 +192,50 @@ class ExchangeClient:
             return False
         return True
 
+    async def discover_overlap_bases(self) -> set[str]:
+        """Live-query both venues and return the set of canonical bases listed on
+        BOTH (HL XYZ ∩ Aster). Applies cross-venue aliases (SAMSUNG→SMSN etc.).
+
+        No equity filtering here — the caller applies BLOCKED/NON_EQUITY excludes.
+        Returns an empty set on any fetch failure so the caller can skip this round
+        without mutating the universe."""
+        hl_bases: set[str] = set()
+        aster_bases: set[str] = set()
+        try:
+            async with self.session.post(
+                HYPERLIQUID_API,
+                json={"type": "metaAndAssetCtxs", "dex": "xyz"},
+                timeout=self.timeout,
+            ) as r:
+                data = await r.json()
+            for asset in data[0].get("universe", []):
+                name = asset.get("name", "")
+                if name:
+                    hl_bases.add(name.split(":")[-1])
+        except Exception as e:
+            log.warning(f"discover_overlap: HL universe fetch failed ({e})")
+            return set()
+        try:
+            async with self.session.get(ASTER_EXCHANGE_INFO_URL, timeout=self.timeout) as r:
+                info = await r.json()
+            for sym_info in info.get("symbols", []):
+                raw = sym_info.get("symbol", "")
+                for suffix in ("USDT", "USDC", "USD"):
+                    if raw.endswith(suffix):
+                        base = raw[: -len(suffix)]
+                        # Map Aster's tradeable book back to the canonical base;
+                        # skip the dead name-matching listings (SMSNUSDT etc.).
+                        if base in ASTER_BASE_TO_CANON:
+                            base = ASTER_BASE_TO_CANON[base]
+                        elif base in ASTER_BASE_ALIAS:
+                            break
+                        aster_bases.add(base)
+                        break
+        except Exception as e:
+            log.warning(f"discover_overlap: Aster exchangeInfo fetch failed ({e})")
+            return set()
+        return hl_bases & aster_bases
+
     # ── Spec loading ──
 
     async def _load_aster_specs(self, symbols: list[str]):
