@@ -7,7 +7,17 @@ from config import DB_PATH, DATA_DIR
 
 def get_connection() -> sqlite3.Connection:
     os.makedirs(DATA_DIR, exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+    # timeout: the trader and the control bot both write this DB — without a
+    # busy timeout a concurrent write raises "database is locked" mid-trade.
+    # WAL: lets readers proceed during writes (persistent once set, but cheap
+    # to re-issue per connection).
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=10000")
+    except sqlite3.OperationalError:
+        pass
+    return conn
 
 
 def init_db():
@@ -81,6 +91,14 @@ def init_db():
         ("scale_pre_hl_px", "REAL DEFAULT 0"),
         ("scale_pre_aster_px", "REAL DEFAULT 0"),
         ("scale_pre_notional", "REAL DEFAULT 0"),
+        # Cumulative fills of the current resting Aster GTX across reprices.
+        # Without this, a partial fill before a reprice was lost and the full
+        # size was reposted — over-filling the leg (naked exposure).
+        ("aster_gtx_filled", "REAL DEFAULT 0"),
+        # Order id whose (terminal) fill was last banked into aster_gtx_filled.
+        # Makes banking idempotent: the same dead order seen twice (repost
+        # failure, restart) must not be counted twice.
+        ("aster_gtx_banked_oid", "TEXT DEFAULT ''"),
     ):
         try:
             conn.execute(f"ALTER TABLE positions ADD COLUMN {_col} {_type}")

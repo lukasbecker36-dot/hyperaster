@@ -211,8 +211,8 @@ class Executor:
         )
 
         # Snapshot funding rates at entry (HL hourly, Aster 8h) for carry accounting.
-        hl_fr = self.client.get_hl_funding_rate(symbol)
-        aster_fr = self.client.get_aster_funding_rate(symbol)
+        # Actively fetched: a cold cache would silently snapshot 0.0 forever.
+        hl_fr, aster_fr = await self.client.get_funding_rates_fresh(symbol)
 
         if self.paper_mode:
             aster_fill = aster_book.bid if direction == "long_hl_short_aster" else aster_book.ask
@@ -332,8 +332,7 @@ class Executor:
         baseline = self.client.get_book_spread_baseline(symbol)
         baseline_bps = baseline if baseline is not None else 0.0
         spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000
-        hl_fr = self.client.get_hl_funding_rate(symbol)
-        aster_fr = self.client.get_aster_funding_rate(symbol)
+        hl_fr, aster_fr = await self.client.get_funding_rates_fresh(symbol)
 
         log.warning(
             f"MANUAL ENTRY {symbol}: {direction} | notional≈${actual_notional:.0f} "
@@ -406,6 +405,66 @@ class Executor:
         actual_qty = hl_result.filled_qty
         log.warning(f"{symbol}: HL {hl_side} filled {actual_qty} @ {hl_result.fill_price:.2f}")
 
+        if existing:
+            # Scale-in: the position must stay "open", so a resting Aster GTX
+            # would be untracked (poll_aster_maker only polls entering/exiting
+            # positions) — the old flow booked the hedge before it filled and
+            # nothing ever completed or unwound it. Cross Aster as an IOC taker
+            # (~0.9bps) and book only what actually fills; unwind any unmatched
+            # HL increment immediately.
+            aster_filled = 0.0
+            a_avg = 0.0
+            for attempt in range(3):
+                remaining = self.client.snap_aster_qty(symbol, actual_qty - aster_filled)
+                if remaining <= 0:
+                    break
+                try:
+                    book = aster_book if attempt == 0 else await self.client._get_aster_book(symbol)
+                except Exception:
+                    break
+                touch = book.bid if aster_side == "sell" else book.ask
+                if touch <= 0:
+                    break
+                res = await self.client.place_aster_ioc(symbol, aster_side, remaining, touch)
+                if res.success and res.filled_qty > 0:
+                    tot = aster_filled + res.filled_qty
+                    a_avg = (a_avg * aster_filled + res.fill_price * res.filled_qty) / tot
+                    aster_filled = tot
+
+            matched = min(actual_qty, aster_filled)
+            unmatched = actual_qty - matched
+            if unmatched > 0:
+                log.critical(
+                    f"{symbol}: scale-in Aster hedge only filled {aster_filled}/{actual_qty} "
+                    f"— unwinding {unmatched} HL"
+                )
+                close_side = "sell" if hl_side == "buy" else "buy"
+                unwind = await self.client.place_hl_ioc(
+                    symbol, close_side, unmatched, hl_result.fill_price)
+                if not unwind.success:
+                    log.critical(f"{symbol}: scale-in HL unwind FAILED — {unmatched} NAKED HL. "
+                                 f"Manual intervention!")
+            if matched <= 0:
+                return False, f"{symbol}: scale-in Aster leg unfilled — HL increment unwound"
+            actual_notional = matched * mid
+            self.pm.scale_in(
+                symbol, matched, actual_notional,
+                hl_result.fill_price, a_avg,
+                hl_funding_rate=hl_fr, aster_funding_rate=aster_fr,
+            )
+            self.pm.log_trade(
+                existing.id, "hl", hl_side, "ioc_limit",
+                hl_result.order_id, matched, hl_result.fill_price, notes="scale-in",
+            )
+            self.pm.log_trade(
+                existing.id, "aster", aster_side, "ioc_limit",
+                "", matched, a_avg, notes="scale-in hedge",
+            )
+            return True, (
+                f"scaled in {symbol} +${actual_notional:.0f} qty={matched} → "
+                f"${existing.notional_usd:.0f} total"
+            )
+
         aster_result = await self.client.place_aster_gtx(
             symbol, aster_side, actual_qty, aster_ref_price
         )
@@ -446,24 +505,6 @@ class Executor:
             return False, f"{symbol}: Aster leg failed, HL emergency-closed — no position"
 
         actual_notional = actual_qty * mid
-        if existing:
-            self.pm.scale_in(
-                symbol, actual_qty, actual_notional,
-                hl_result.fill_price, aster_ref_price,
-                hl_funding_rate=hl_fr, aster_funding_rate=aster_fr,
-            )
-            self.pm.log_trade(
-                existing.id, "hl", hl_side, "ioc_limit",
-                hl_result.order_id, actual_qty, hl_result.fill_price, notes="scale-in",
-            )
-            self.pm.log_trade(
-                existing.id, "aster", aster_side, "gtx_limit",
-                aster_result.order_id, actual_qty, aster_ref_price, notes="scale-in resting",
-            )
-            return True, (
-                f"scaled in {symbol} +${actual_notional:.0f} qty={actual_qty} → "
-                f"${existing.notional_usd:.0f} total"
-            )
         pos = self.pm.open_entering(
             symbol=symbol, hl_coin=f"xyz:{symbol}",
             aster_symbol=aster_symbol_for(symbol),
@@ -729,7 +770,8 @@ class Executor:
             direction=direction, side=aster_side, qty=bite_qty,
             ref_price=aster_ref, paper=False,
         )
-        ast_res = await self.client.place_aster_ioc(symbol, aster_side, bite_qty, aster_ref)
+        ast_res = await self.client.place_aster_ioc(
+            symbol, aster_side, bite_qty, aster_ref, reduce_only=True)
 
         if not ast_res.success or ast_res.filled_qty <= 0:
             if aster_pre_amt is not None:
@@ -927,8 +969,7 @@ class Executor:
         if self.paper_mode:
             fill_notional = bite_qty * mid
             existing = self.pm.get(symbol)
-            hl_fr = self.client.get_hl_funding_rate(symbol)
-            ast_fr = self.client.get_aster_funding_rate(symbol)
+            hl_fr, ast_fr = await self.client.get_funding_rates_fresh(symbol)
             if existing and existing.status == "open":
                 self.pm.scale_in(symbol, bite_qty, fill_notional, hl_ref, aster_ref,
                                  hl_funding_rate=hl_fr, aster_funding_rate=ast_fr)
@@ -986,8 +1027,7 @@ class Executor:
                                     notes=f"qty={hl_res.filled_qty} px={hl_res.fill_price}")
                     drip["unhedged_qty"] = 0.0
                     fill_notional = hedge_qty * mid
-                    hl_fr = self.client.get_hl_funding_rate(symbol)
-                    ast_fr = self.client.get_aster_funding_rate(symbol)
+                    hl_fr, ast_fr = await self.client.get_funding_rates_fresh(symbol)
                     existing = self.pm.get(symbol)
                     if existing and existing.status == "open":
                         self.pm.scale_in(symbol, hedge_qty, fill_notional,
@@ -1109,8 +1149,7 @@ class Executor:
         # Buffer hedged successfully — clear it.
         drip["unhedged_qty"] = 0.0
         fill_notional = hedge_qty * mid
-        hl_fr = self.client.get_hl_funding_rate(symbol)
-        ast_fr = self.client.get_aster_funding_rate(symbol)
+        hl_fr, ast_fr = await self.client.get_funding_rates_fresh(symbol)
         existing = self.pm.get(symbol)
         if existing and existing.status == "open":
             self.pm.scale_in(symbol, hedge_qty, fill_notional,
@@ -1217,8 +1256,7 @@ class Executor:
         if qty <= 0:
             return False, f"{symbol}: qty snapped to 0 (lot too large for ${notional:.0f})"
         spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000
-        hl_fr = self.client.get_hl_funding_rate(symbol)
-        aster_fr = self.client.get_aster_funding_rate(symbol)
+        hl_fr, aster_fr = await self.client.get_funding_rates_fresh(symbol)
 
         log.warning(
             f"MAKER ENTRY {symbol}: {direction} | notional≈${qty*mid:.0f} qty={qty} | "
@@ -1581,6 +1619,14 @@ class Executor:
             except Exception as e:
                 log.critical(f"{symbol}: entry escalation residual hedge failed ({e}) — CHECK MANUALLY")
         final_qty = min(hl_filled, pos.aster_hedged_qty)
+        naked_hl = hl_filled - final_qty
+        if naked_hl > 1e-9:
+            # A no-fill IOC (not just an exception) also lands here — without
+            # this check the naked remainder was silently absorbed.
+            log.critical(
+                f"{symbol}: entry escalation left {naked_hl:.4f} HL UNHEDGED "
+                f"(filled {hl_filled}, hedged {pos.aster_hedged_qty}) — CHECK MANUALLY"
+            )
         if final_qty <= 0:
             self.pm.drop_entering(symbol, "escalate_unfilled")
             return
@@ -1709,7 +1755,8 @@ class Executor:
             direction=pos.direction, side=aster_side, qty=aster_qty,
             ref_price=aster_ref, position_id=pos.id, paper=self.paper_mode,
         )
-        aster_res = await self.client.place_aster_ioc(symbol, aster_side, aster_qty, aster_ref)
+        aster_res = await self.client.place_aster_ioc(
+            symbol, aster_side, aster_qty, aster_ref, reduce_only=True)
         if not aster_res.success or aster_res.filled_qty <= 0:
             log.warning(f"{symbol}: partial close Aster IOC no fill ({aster_res.error}) — nothing closed")
             complete_intent(a_intent, "rejected", notes=(aster_res.error or "no_fill")[:200],
@@ -1954,7 +2001,8 @@ class Executor:
                     ref_price=touch, position_id=pos.id, paper=False,
                 )
                 pos.aster_hedge_attempts += 1
-                res = await self.client.place_aster_ioc(symbol, aster_hedge_side, lot, touch)
+                res = await self.client.place_aster_ioc(
+                    symbol, aster_hedge_side, lot, touch, reduce_only=True)
                 if res.success and res.filled_qty > 0:
                     complete_intent(hedge_intent, "filled",
                                     notes=f"qty={res.filled_qty} px={res.fill_price}",
@@ -2081,7 +2129,8 @@ class Executor:
             try:
                 aster_book = await self.client._get_aster_book(symbol)
                 touch = aster_book.ask if aster_hedge_side == "buy" else aster_book.bid
-                res = await self.client.place_aster_ioc(symbol, aster_hedge_side, residual, touch)
+                res = await self.client.place_aster_ioc(
+                    symbol, aster_hedge_side, residual, touch, reduce_only=True)
                 if res.success and res.filled_qty > 0:
                     new_closed = pos.aster_hedged_qty + res.filled_qty
                     old = pos.aster_hedged_qty
@@ -2203,13 +2252,42 @@ class Executor:
                     "buy" if pos.direction == "long_hl_short_aster" else "sell",
                     "gtx_limit", order_id, executed_qty, avg_price, notes="exit filled"
                 )
+                # Include fills banked by earlier reprice cycles of this flow.
                 self._advance_aster_exit_fill(
-                    symbol, executed_qty, pos.hl_exit_price, avg_price,
+                    symbol, pos.aster_gtx_filled + executed_qty,
+                    pos.hl_exit_price, avg_price,
                     pos.exit_reason or "converged")
             return
 
         if status in ASTER_TERMINAL_STATUSES - {"FILLED"}:
             log.warning(f"{symbol}: Aster GTX {order_id} is {status} — repricing")
+            # Bank any partial fill the dead order accumulated, or the repost
+            # below re-covers it and over-fills the leg. Keyed to the order id
+            # so seeing the same dead order twice never double-counts.
+            if executed_qty > 0 and order_id != pos.aster_gtx_banked_oid:
+                self.pm.set_gtx_filled(
+                    symbol, pos.aster_gtx_filled + executed_qty, banked_oid=order_id)
+            # If the banked fills complete the flow (or leave sub-lot dust),
+            # finalize here while the fill price is at hand — the reprice path
+            # would otherwise stall with nothing left to repost.
+            target = pos.qty if is_entry else self._aster_exit_size(symbol, pos)
+            remaining = self.client.snap_aster_qty(symbol, target - pos.aster_gtx_filled)
+            if pos.aster_gtx_filled > 0 and remaining <= 0:
+                log.warning(
+                    f"{symbol}: GTX flow complete at {pos.aster_gtx_filled}/{target} "
+                    f"via dead-order fills — finalizing"
+                )
+                if is_entry:
+                    if pos.aster_gtx_filled >= target * 0.999:
+                        self.pm.confirm_aster_entry(symbol, avg_price)
+                    else:
+                        self.pm.confirm_aster_entry_partial(
+                            symbol, avg_price, pos.aster_gtx_filled)
+                else:
+                    self._advance_aster_exit_fill(
+                        symbol, pos.aster_gtx_filled, pos.hl_exit_price,
+                        avg_price, pos.exit_reason or "converged")
+                return
             order_id = None  # fall through to repost below
 
         # Order still resting — check if price needs updating
@@ -2260,7 +2338,18 @@ class Executor:
         """Force-close Aster exit leg with a taker IOC after maker timeout."""
         symbol = pos.symbol
         close_side = "buy" if pos.direction == "long_hl_short_aster" else "sell"
-        force_qty = self._aster_exit_size(symbol, pos)
+        target = self._aster_exit_size(symbol, pos)
+        # Subtract fills already banked by the GTX flow's reprice cycles.
+        force_qty = self.client.snap_aster_qty(symbol, target - pos.aster_gtx_filled)
+        if force_qty <= 0 and pos.aster_gtx_filled > 0:
+            log.warning(
+                f"{symbol}: force-exit target already covered by GTX fills "
+                f"({pos.aster_gtx_filled}/{target}) — finalizing"
+            )
+            self._advance_aster_exit_fill(
+                symbol, pos.aster_gtx_filled, pos.hl_exit_price,
+                pos.aster_exit_price or 0.0, (pos.exit_reason or "converged"))
+            return
         aster_book = await self.client._get_aster_book(symbol)
         ref_price = aster_book.ask if close_side == "buy" else aster_book.bid
         if ref_price <= 0:
@@ -2272,7 +2361,8 @@ class Executor:
             direction=pos.direction, side=close_side, qty=force_qty,
             ref_price=ref_price, position_id=pos.id, paper=self.paper_mode,
         )
-        result = await self.client.place_aster_ioc(symbol, close_side, force_qty, ref_price)
+        result = await self.client.place_aster_ioc(
+            symbol, close_side, force_qty, ref_price, reduce_only=True)
         if result.success and result.filled_qty > 0:
             log.info(
                 f"{symbol}: Aster force-exit filled {result.filled_qty} @ {result.fill_price:.4f}"
@@ -2285,7 +2375,8 @@ class Executor:
                 result.order_id, result.filled_qty, result.fill_price, notes="exit forced taker",
             )
             self._advance_aster_exit_fill(
-                symbol, result.filled_qty, pos.hl_exit_price, result.fill_price,
+                symbol, pos.aster_gtx_filled + result.filled_qty,
+                pos.hl_exit_price, result.fill_price,
                 (pos.exit_reason or "converged") + "_taker")
         else:
             log.critical(
@@ -2317,12 +2408,16 @@ class Executor:
         spec = self.client.aster_specs.get(symbol)
         tick = spec.tick_size if spec else 0.01
 
-        # Size this (re)post must cover. Entry and full exit use pos.qty; a partial
-        # exit only covers the partial target so we never over-close the Aster leg.
+        # Size the WHOLE flow must cover. Entry and full exit use pos.qty; a
+        # partial exit only covers the partial target so we never over-close.
         order_size = pos.qty if is_entry else self._aster_exit_size(symbol, pos)
+        # Fills already consumed by earlier orders in this flow (persisted so a
+        # reprice — or a restart — reposts only the remainder, never the full
+        # size; reposting the full size after a partial fill over-fills the leg
+        # and flips the position past flat).
+        cum_filled = pos.aster_gtx_filled
 
-        # If we have an existing order, check its state first
-        new_qty = order_size
+        new_qty = self.client.snap_aster_qty(symbol, order_size - cum_filled)
         if current_order_id:
             q = await self.client.query_aster_order(symbol, current_order_id)
             current_price = float(q.get("price", 0) or 0)
@@ -2333,11 +2428,12 @@ class Executor:
             # Race: filled between last poll and now → advance state, don't repost
             if current_status == "FILLED":
                 log.info(f"{symbol}: GTX {current_order_id} filled during reprice check")
+                total = cum_filled + executed
                 if is_entry:
                     self.pm.confirm_aster_entry(symbol, avg_price)
                 else:
                     self._advance_aster_exit_fill(
-                        symbol, executed or order_size, pos.hl_exit_price,
+                        symbol, total or order_size, pos.hl_exit_price,
                         avg_price, pos.exit_reason or "converged")
                 return
 
@@ -2351,43 +2447,48 @@ class Executor:
             final_executed = float(q2.get("executedQty", executed) or executed)
             final_avg = float(q2.get("avgPrice", avg_price) or avg_price)
 
-            if final_executed >= order_size * 0.999:
-                # Fully filled in the race — advance state, don't repost
+            # Bank ANY fill this order accumulated — resting partials included,
+            # not just fills that landed inside the cancel window. Keyed to the
+            # order id: if this order was already banked (repost failed last
+            # tick), its fill is already inside cum_filled — don't re-add.
+            if final_executed > 0 and current_order_id != pos.aster_gtx_banked_oid:
+                cum_filled += final_executed
+                self.pm.set_gtx_filled(symbol, cum_filled, banked_oid=current_order_id)
                 log.warning(
-                    f"{symbol}: GTX {current_order_id} fully filled during cancel race"
+                    f"{symbol}: GTX {current_order_id} filled {final_executed} before "
+                    f"reprice — cumulative {cum_filled}/{order_size}"
                 )
+
+            if cum_filled >= order_size * 0.999:
+                # Flow fully filled across orders — advance state, don't repost
+                log.warning(f"{symbol}: GTX flow complete at {cum_filled} across reprices")
                 if is_entry:
-                    self.pm.confirm_aster_entry(symbol, final_avg)
+                    self.pm.confirm_aster_entry(symbol, final_avg or avg_price)
                 else:
                     self._advance_aster_exit_fill(
-                        symbol, final_executed, pos.hl_exit_price,
+                        symbol, cum_filled, pos.hl_exit_price,
+                        final_avg or avg_price, pos.exit_reason or "converged")
+                return
+
+            new_qty = self.client.snap_aster_qty(symbol, order_size - cum_filled)
+            if new_qty <= 0 and cum_filled > 0:
+                # Remainder is sub-lot dust — treat the flow as done at cum_filled.
+                log.warning(
+                    f"{symbol}: GTX remainder below lot size after {cum_filled} filled "
+                    f"— treating as complete"
+                )
+                if is_entry:
+                    self.pm.confirm_aster_entry_partial(symbol, final_avg, cum_filled)
+                else:
+                    self._advance_aster_exit_fill(
+                        symbol, cum_filled, pos.hl_exit_price,
                         final_avg, pos.exit_reason or "converged")
                 return
 
-            if final_executed > executed and final_executed > 0:
-                # Partial fill during cancel — repost only for the remainder
-                remainder = order_size - final_executed
-                snapped = self.client.snap_aster_qty(symbol, remainder)
-                if snapped > 0:
-                    log.warning(
-                        f"{symbol}: GTX partial-fill {final_executed} during cancel, "
-                        f"reposting remainder {snapped}"
-                    )
-                    new_qty = snapped
-                else:
-                    log.warning(
-                        f"{symbol}: GTX partial-fill {final_executed} during cancel, "
-                        f"remainder too small to repost — treating as filled"
-                    )
-                    if is_entry:
-                        self.pm.confirm_aster_entry_partial(symbol, final_avg, final_executed)
-                    else:
-                        self._advance_aster_exit_fill(
-                            symbol, final_executed, pos.hl_exit_price,
-                            final_avg, pos.exit_reason or "converged")
-                    return
-
-        new_result = await self.client.place_aster_gtx(symbol, side, new_qty, target_price)
+        if new_qty <= 0:
+            return
+        new_result = await self.client.place_aster_gtx(
+            symbol, side, new_qty, target_price, reduce_only=not is_entry)
         if new_result.success:
             new_oid = new_result.order_id
             if is_entry:
@@ -2553,7 +2654,7 @@ class Executor:
             return False
 
         aster_result = await self.client.place_aster_gtx(
-            symbol, aster_close_side, aster_qty, aster_ref_price
+            symbol, aster_close_side, aster_qty, aster_ref_price, reduce_only=True
         )
 
         # If maker fails, escalate to real IOC (taker) — pays ~0.9bps to escape stuck exit
@@ -2565,7 +2666,7 @@ class Executor:
                 ref_price=aster_ref_price, position_id=pos.id, paper=self.paper_mode,
             )
             aster_result = await self.client.place_aster_ioc(
-                symbol, aster_close_side, aster_qty, aster_ref_price
+                symbol, aster_close_side, aster_qty, aster_ref_price, reduce_only=True
             )
             if not aster_result.success or aster_result.filled_qty <= 0:
                 log.critical(f"{symbol}: Aster exit FAILED — UNHEDGED. Manual intervention!")

@@ -874,8 +874,16 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             if runtime_flags["auto_exit"] != prev_auto_exit:
                 state = "ENABLED" if runtime_flags["auto_exit"] else "DISABLED"
                 log.warning(f"Auto-exit {state} (runtime flag changed)")
-            await process_manual_commands()
-            await evaluate_gated_orders()
+            # An exception here must not kill the monitor — exits and safety
+            # stops would silently stop being evaluated for live positions.
+            try:
+                await process_manual_commands()
+            except Exception as e:
+                log.error(f"process_manual_commands errored: {e}", exc_info=True)
+            try:
+                await evaluate_gated_orders()
+            except Exception as e:
+                log.error(f"evaluate_gated_orders errored: {e}", exc_info=True)
 
             # ── 1. Poll resting maker orders (entering/exiting) ──
             if now - last_aster_poll >= ASTER_FILL_POLL_SECONDS * 1000:
@@ -902,7 +910,13 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                              + [executor.poll_hl_maker_exit(s) for s in hl_exit_makers]
                              + [executor.poll_aster_maker(s) for s in aster_makers])
                     if tasks:
-                        await asyncio.gather(*tasks)
+                        # return_exceptions: one symbol's poll blowing up must
+                        # not kill the others' polls (or the whole monitor).
+                        results = await asyncio.gather(*tasks, return_exceptions=True)
+                        poll_syms = hl_makers + hl_exit_makers + aster_makers
+                        for s, r in zip(poll_syms, results):
+                            if isinstance(r, Exception):
+                                log.error(f"poll for {s} errored: {r}", exc_info=r)
 
             # ── 1b. Drip entries: one taker-taker bite per active drip per tick ──
             drip_syms = list(executor._drips.keys())
@@ -1047,6 +1061,12 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
 
     except KeyboardInterrupt:
         log.info("Stopped by user (Ctrl+C)")
+    except Exception as e:
+        # CRITICAL routes to the Telegram alert handler — the operator must
+        # know the monitor died with live positions unmanaged.
+        log.critical(f"MONITOR CRASHED: {e} — live positions are UNMANAGED "
+                     f"until restart", exc_info=True)
+        raise
     finally:
         await client.close()
         log.info("Monitor shut down")

@@ -104,6 +104,11 @@ class Position:
     scale_pre_hl_px: float = 0.0
     scale_pre_aster_px: float = 0.0
     scale_pre_notional: float = 0.0
+    # Cumulative fills of the current resting Aster GTX across reprice cycles
+    # (entry or exit). Reset when the GTX flow completes or the state flips.
+    aster_gtx_filled: float = 0.0
+    # Order id whose terminal fill was last banked (idempotency guard).
+    aster_gtx_banked_oid: str = ""
 
 
 class PositionManager:
@@ -127,7 +132,8 @@ class PositionManager:
             "COALESCE(entry_maker_venue, ''), COALESCE(hl_baseline_szi, 0), "
             "COALESCE(aster_hedged_qty, 0), COALESCE(aster_baseline_amt, 0), "
             "COALESCE(scale_pre_qty, 0), COALESCE(scale_pre_hl_px, 0), "
-            "COALESCE(scale_pre_aster_px, 0), COALESCE(scale_pre_notional, 0) "
+            "COALESCE(scale_pre_aster_px, 0), COALESCE(scale_pre_notional, 0), "
+            "COALESCE(aster_gtx_filled, 0), COALESCE(aster_gtx_banked_oid, '') "
             "FROM positions WHERE status NOT IN ('closed', 'error') AND paper=?",
             (paper_val,)
         ).fetchall()
@@ -153,6 +159,8 @@ class PositionManager:
                 scale_pre_hl_px=r[26] or 0.0,
                 scale_pre_aster_px=r[27] or 0.0,
                 scale_pre_notional=r[28] or 0.0,
+                aster_gtx_filled=r[29] or 0.0,
+                aster_gtx_banked_oid=r[30] or "",
             )
             self.positions[p.symbol] = p
             log.warning(
@@ -485,8 +493,9 @@ class PositionManager:
         pos = self.positions.get(symbol)
         if not pos or pos.status not in ("open", "exiting"):
             return
-        pos.qty = max(0, pos.qty - remove_qty)
-        pos.notional_usd = max(0, (pos.notional_usd or 0) - remove_notional)
+        # round() kills float subtraction dust (2.5600000000000014-style qtys)
+        pos.qty = max(0.0, round(pos.qty - remove_qty, 10))
+        pos.notional_usd = max(0.0, (pos.notional_usd or 0) - remove_notional)
         conn = get_connection()
         conn.execute(
             "UPDATE positions SET qty=?, notional_usd=? WHERE id=?",
@@ -498,6 +507,25 @@ class PositionManager:
             f"Position #{pos.id} SCALE-OUT: {symbol} -{remove_qty} qty -${remove_notional:.0f} → "
             f"remaining qty={pos.qty} ${pos.notional_usd:.0f}"
         )
+
+    def set_gtx_filled(self, symbol: str, filled: float, banked_oid: str = ""):
+        """Persist the cumulative fill of the current resting Aster GTX so a
+        reprice (or restart) reposts only the remainder, never the full size.
+        banked_oid records which (terminal) order's fill was just counted, so
+        seeing the same dead order again never double-banks it."""
+        pos = self.positions.get(symbol)
+        if not pos:
+            return
+        pos.aster_gtx_filled = filled
+        if banked_oid:
+            pos.aster_gtx_banked_oid = banked_oid
+        conn = get_connection()
+        conn.execute(
+            "UPDATE positions SET aster_gtx_filled=?, aster_gtx_banked_oid=? WHERE id=?",
+            (filled, pos.aster_gtx_banked_oid, pos.id),
+        )
+        conn.commit()
+        conn.close()
 
     def revert_partial_exit(self, symbol: str):
         """Revert a position from 'exiting' back to 'open' after a partial close."""
@@ -511,11 +539,15 @@ class PositionManager:
         pos.aster_hedged_qty = 0.0
         pos.aster_hedge_attempts = 0
         pos.exit_time = 0
+        pos.hl_exit_price = 0.0
+        pos.aster_exit_price = 0.0
+        pos.aster_gtx_filled = 0.0
         conn = get_connection()
         conn.execute(
             "UPDATE positions SET status='open', hl_exit_order_id='', "
             "aster_exit_order_id='', hl_baseline_szi=0, aster_hedged_qty=0, "
-            "exit_time=0 WHERE id=?",
+            "exit_time=0, hl_exit_price=0, aster_exit_price=0, "
+            "aster_gtx_filled=0 WHERE id=?",
             (pos.id,),
         )
         conn.commit()
@@ -529,9 +561,11 @@ class PositionManager:
             return
         pos.aster_entry_price = aster_fill_price
         pos.status = "open"
+        pos.aster_gtx_filled = 0.0
         conn = get_connection()
         conn.execute(
-            "UPDATE positions SET status='open', aster_entry_price=? WHERE id=?",
+            "UPDATE positions SET status='open', aster_entry_price=?, "
+            "aster_gtx_filled=0 WHERE id=?",
             (aster_fill_price, pos.id),
         )
         conn.commit()
@@ -551,9 +585,11 @@ class PositionManager:
         pos.qty = matched_qty
         pos.aster_entry_price = aster_fill_price
         pos.status = "open"
+        pos.aster_gtx_filled = 0.0
         conn = get_connection()
         conn.execute(
-            "UPDATE positions SET status='open', aster_entry_price=?, qty=? WHERE id=?",
+            "UPDATE positions SET status='open', aster_entry_price=?, qty=?, "
+            "aster_gtx_filled=0 WHERE id=?",
             (aster_fill_price, matched_qty, pos.id),
         )
         conn.commit()
@@ -649,11 +685,12 @@ class PositionManager:
         pos.aster_exit_order_id = aster_exit_order_id
         pos.hl_exit_price = hl_exit_price
         pos.exit_spread_bps = exit_spread_bps
+        pos.aster_gtx_filled = 0.0
         conn = get_connection()
         conn.execute(
             "UPDATE positions SET status='exiting', exit_time=?, "
             "hl_exit_order_id=?, aster_exit_order_id=?, "
-            "hl_exit_price=?, exit_spread_bps=? WHERE id=?",
+            "hl_exit_price=?, exit_spread_bps=?, aster_gtx_filled=0 WHERE id=?",
             (pos.exit_time, hl_exit_order_id, aster_exit_order_id,
              hl_exit_price, exit_spread_bps, pos.id),
         )

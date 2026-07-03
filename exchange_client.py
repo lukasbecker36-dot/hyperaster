@@ -523,6 +523,28 @@ class ExchangeClient:
         cached = self._aster_funding_cache.get(symbol)
         return cached[0] if cached else 0.0
 
+    async def get_funding_rates_fresh(self, symbol: str) -> tuple[float, float]:
+        """Funding rates (hl_per_1h, aster_per_8h) for an entry snapshot,
+        refreshing the source feeds if the caches are cold. A silently-zero
+        snapshot poisons the position's funding P&L for its whole life, so
+        this actively fetches instead of trusting the scan-loop caches (which
+        only cover the scanned universe and may be cold right after restart
+        or for blocked/manual symbols)."""
+        if symbol not in self._hl_funding_cache:
+            await self.refresh_hl_oracles([symbol])
+        # premiumIndex populates the Aster funding cache as a side effect;
+        # force a fetch if the cache has never seen this symbol.
+        if symbol not in self._aster_funding_cache:
+            await self._get_aster_mark(symbol)
+        hl_fr = self.get_hl_funding_rate(symbol)
+        aster_fr = self.get_aster_funding_rate(symbol)
+        if hl_fr == 0.0 and aster_fr == 0.0:
+            log.warning(
+                f"{symbol}: funding rates both 0.0 at entry snapshot — "
+                f"funding P&L will read $0 for this position"
+            )
+        return hl_fr, aster_fr
+
     def record_oracle_delta(self, symbol: str, delta_bps: float):
         """
         Append a fresh oracle delta observation, deduped by source freshness.
@@ -781,12 +803,15 @@ class ExchangeClient:
         )
 
     async def place_aster_gtx(
-        self, symbol: str, side: str, qty: float, price: float
+        self, symbol: str, side: str, qty: float, price: float,
+        reduce_only: bool = False,
     ) -> OrderResult:
         """
         Place a GTX (post-only) limit order on Aster.
         GTX = Good Till Crossing: posts as maker at the given price.
         Rejected immediately if it would cross (take) — use to stay passive.
+        reduce_only: set on closing orders so an accounting slip can never
+        flip the position past flat (exchange truncates/rejects the excess).
         """
         aster_sym = aster_symbol_for(symbol)
         params = {
@@ -797,6 +822,8 @@ class ExchangeClient:
             "price": self.format_aster_price(symbol, price),
             "quantity": self.format_aster_qty(symbol, qty),
         }
+        if reduce_only:
+            params["reduceOnly"] = "true"
         signed = self._sign_aster(params)
         try:
             async with self.session.post(
@@ -824,11 +851,14 @@ class ExchangeClient:
             return OrderResult(success=False, error=str(e), ambiguous=True)
 
     async def place_aster_ioc(
-        self, symbol: str, side: str, qty: float, price: float
+        self, symbol: str, side: str, qty: float, price: float,
+        reduce_only: bool = False,
     ) -> OrderResult:
         """
         Place an IOC (taker) limit order on Aster to force-fill — used to escape
         a stuck maker exit. Pays Aster taker fee (~0.9bps); use sparingly.
+        reduce_only: set on closing orders so an accounting slip can never
+        flip the position past flat.
         """
         aster_sym = aster_symbol_for(symbol)
         is_buy = side.lower() == "buy"
@@ -842,6 +872,8 @@ class ExchangeClient:
             "price": self.format_aster_price(symbol, limit_px),
             "quantity": self.format_aster_qty(symbol, qty),
         }
+        if reduce_only:
+            params["reduceOnly"] = "true"
         signed = self._sign_aster(params)
         try:
             async with self.session.post(

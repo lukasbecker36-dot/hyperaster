@@ -101,6 +101,10 @@ def send_alert(text: str):
     last = _LAST_SENT.get(full)
     if last is not None and now - last < _DEDUPE_SECONDS:
         return
+    # Prune expired dedupe entries so the dict doesn't grow forever.
+    if len(_LAST_SENT) > 500:
+        for k in [k for k, t in _LAST_SENT.items() if now - t >= _DEDUPE_SECONDS]:
+            _LAST_SENT.pop(k, None)
     _LAST_SENT[full] = now
     _ensure_worker()
     try:
