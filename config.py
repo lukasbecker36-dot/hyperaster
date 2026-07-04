@@ -87,6 +87,21 @@ ORACLE_BASELINE_MIN_SAMPLES = 20       # oracle-delta samples in-window before t
 ORACLE_STALENESS_GUARD_ENABLED = True
 ORACLE_STALE_MINUTES = 15
 
+# ── Executable (bid/offer) entry signal ──
+# The raw signal measures the book MID spread and adds a bid-ask cost floor to
+# the threshold. But you don't trade mids — you rest the HL leg as a maker and
+# cross Aster as a taker, so the real entry edge is the executable HL-maker/
+# Aster-taker basis (see _carry_basis_bps). That basis decomposes exactly as
+#   exec_basis_dir = ±mid_spread + half_diff,   half_diff = (hl_spread − aster_spread)/2
+# so the mid part keeps its candle-warmed 8h baseline while the half-spread
+# differential gets its own live baseline. The entry excess then becomes the
+# deviation of the EXECUTABLE basis from its structural norm — which neutralises
+# mid-spread phantoms caused by transient one-sided books (a book widening on one
+# side moves the mid but not the executable price). half_diff can't be warmed from
+# candles, so until its baseline fills the correction is 0 and the signal is the
+# prior mid-spread deviation (no regression at cold start).
+EXECUTABLE_SIGNAL_ENABLED = True
+
 # ── Strategy parameters ──
 # Spread in bps above which we enter.  Round-trip cost ~9-14bps so 30bps = ~2x cushion.
 ENTRY_THRESHOLD_BPS = 30.0

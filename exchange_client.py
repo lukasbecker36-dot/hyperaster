@@ -37,6 +37,7 @@ from config import (
     ASTER_LEVERAGE_URL, ASTER_MARGIN_TYPE_URL, LEVERAGE, ASTER_MARGIN_TYPE,
     ORACLE_CORRECTION_ENABLED, ORACLE_BASELINE_MIN_SAMPLES,
     ORACLE_STALENESS_GUARD_ENABLED, ORACLE_STALE_MINUTES,
+    EXECUTABLE_SIGNAL_ENABLED,
 )
 from src import history
 
@@ -165,6 +166,14 @@ class ExchangeClient:
         self._book_spread_history: dict[str, deque] = {}
         self._book_spread_window_ms: int = BASELINE_WINDOW_MINUTES * 60 * 1000
         self._last_book_spread_ts: dict[str, int] = {}  # dedupe to ~1/min
+
+        # Rolling half-spread-differential history: deque of (ts_ms, half_diff_bps),
+        # half_diff = (hl_spread − aster_spread)/2. The transient, book-positioning
+        # component of the executable HL-maker/Aster-taker entry basis. Live-only
+        # (can't be warmed from candles); its 8h median is the structural norm the
+        # entry signal measures deviations from. Same 1/min cadence as book spread.
+        self._half_spread_diff_history: dict[str, deque] = {}
+        self._last_half_spread_ts: dict[str, int] = {}
 
     async def start(self, symbols: list[str]):
         """Load specs for all symbols."""
@@ -658,6 +667,45 @@ class ExchangeClient:
             return 0
         cutoff = now_ms() - self._book_spread_window_ms
         return sum(1 for ts, _ in hist if ts >= cutoff)
+
+    def _record_half_spread_diff(self, symbol: str, half_diff_bps: float):
+        """Append a half-spread-differential sample, deduped to ~1/min."""
+        now = now_ms()
+        last = self._last_half_spread_ts.get(symbol, 0)
+        if now - last < BASELINE_SAMPLE_INTERVAL_SECONDS * 1000:
+            return
+        self._last_half_spread_ts[symbol] = now
+        if symbol not in self._half_spread_diff_history:
+            self._half_spread_diff_history[symbol] = deque(maxlen=BASELINE_WINDOW_MINUTES + 120)
+        self._half_spread_diff_history[symbol].append((now, half_diff_bps))
+
+    def executable_deviation_bps(self, symbol: str, aster_book, hl_book, mid: float) -> float:
+        """Deviation of the executable HL-maker/Aster-taker basis from its
+        structural norm, i.e. the part of the entry edge the MID spread can't see.
+
+        The executable basis decomposes as ±mid_spread + half_diff, where
+        half_diff = (hl_spread − aster_spread)/2. The mid part is already handled
+        by the (candle-warmed) book baseline, so this returns only the deviation
+        of half_diff from its own 8h median — added identically to both direction
+        excesses (you always maker-on-HL / taker-on-Aster). Records the live
+        sample as a side effect. Returns 0.0 when disabled or the baseline isn't
+        warm yet, so the signal degrades cleanly to the pure mid-spread basis."""
+        if mid <= 0:
+            return 0.0
+        hl_spread = (hl_book.ask - hl_book.bid) / mid * 10000
+        aster_spread = (aster_book.ask - aster_book.bid) / mid * 10000
+        half_diff = (hl_spread - aster_spread) / 2.0
+        self._record_half_spread_diff(symbol, half_diff)
+        if not EXECUTABLE_SIGNAL_ENABLED:
+            return 0.0
+        hist = self._half_spread_diff_history.get(symbol)
+        if not hist:
+            return 0.0
+        cutoff = now_ms() - self._book_spread_window_ms
+        recent = [d for ts, d in hist if ts >= cutoff]
+        if len(recent) < BASELINE_MIN_SAMPLES:
+            return 0.0
+        return half_diff - statistics.median(recent)
 
     async def warmup_book_spread(self, symbols: list[str]):
         """Seed book-spread history from 1m candles so baselines are usable at startup.

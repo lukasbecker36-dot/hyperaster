@@ -370,18 +370,23 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             if book_base is None:
                 return None
             # Fair spread = book baseline + oracle fair-value correction (0 when
-            # oracle history is insufficient → pure book baseline). Displayed as
-            # the baseline so excess = spread − displayed base always holds.
+            # oracle history is insufficient → pure book baseline). exec_dev adds
+            # the executable HL-maker/Aster-taker basis refinement (0 until warm),
+            # matching try_entry so ranking/display track the actual decision.
             fair_spread = book_base + client.get_oracle_correction(symbol)
-            aster_excess = spread_bps - fair_spread    # long_hl_short_aster
-            hl_excess    = -(spread_bps - fair_spread)  # long_aster_short_hl
+            exec_dev = client.executable_deviation_bps(symbol, aster_book, hl_book, mid)
+            aster_excess = (spread_bps - fair_spread) + exec_dev    # long_hl_short_aster
+            hl_excess    = -(spread_bps - fair_spread) + exec_dev    # long_aster_short_hl
             if aster_excess >= hl_excess:
                 executable_excess = aster_excess
                 direction = "L-HL/S-AST"
             else:
                 executable_excess = hl_excess
                 direction = "L-AST/S-HL"
-            return symbol, executable_excess, direction, fair_spread, aster_book, hl_book
+            # Return the EFFECTIVE reference (fair minus the executable dev) so
+            # the display invariant excess == spread − base still holds exactly.
+            effective_base = fair_spread - exec_dev
+            return symbol, executable_excess, direction, effective_base, aster_book, hl_book
         except Exception as e:
             log.debug(f"scan_symbol {symbol}: {e}")
             return None
