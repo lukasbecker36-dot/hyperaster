@@ -35,6 +35,8 @@ from config import (
     aster_symbol_for, ASTER_BASE_ALIAS, ASTER_BASE_TO_CANON,
     BASELINE_WINDOW_MINUTES, BASELINE_MIN_SAMPLES, BASELINE_SAMPLE_INTERVAL_SECONDS,
     ASTER_LEVERAGE_URL, ASTER_MARGIN_TYPE_URL, LEVERAGE, ASTER_MARGIN_TYPE,
+    ORACLE_CORRECTION_ENABLED, ORACLE_BASELINE_MIN_SAMPLES,
+    ORACLE_STALENESS_GUARD_ENABLED, ORACLE_STALE_MINUTES,
 )
 from src import history
 
@@ -141,14 +143,19 @@ class ExchangeClient:
         self._hl_funding_cache: dict[str, tuple[float, int]] = {}
         self._aster_funding_cache: dict[str, tuple[float, int]] = {}
 
-        # Rolling oracle delta history per symbol: deque of (ts_ms, delta_bps).
-        # Used by get_smoothed_oracle_delta() to return the median over the last
-        # ORACLE_DELTA_WINDOW_MS, which suppresses noisy point-in-time spikes.
-        # We dedupe by source-timestamp so the deque holds genuinely fresh
-        # observations rather than 1s-tick duplicates of the same stale oracle.
+        # Rolling oracle-delta history per symbol: deque of (ts_ms, delta_bps),
+        # delta_bps = (aster_index - hl_oracle) / mid * 10000. Its 8h median is
+        # the STRUCTURAL feed offset; the deviation of the live delta from that
+        # median is a zero-lag fair-value correction to the book baseline (see
+        # get_oracle_correction). Sampled ~1/min from the live oracle caches.
         self._oracle_delta_history: dict[str, deque] = {}
-        self._last_recorded_source_ts: dict[str, tuple[int, int]] = {}  # (hl_ts, aster_ts)
-        self._oracle_delta_window_ms: int = 30 * 60 * 1000  # 30 min
+        self._last_oracle_sample_ts: dict[str, int] = {}       # dedupe to ~1/min
+        self._oracle_delta_window_ms: int = BASELINE_WINDOW_MINUTES * 60 * 1000
+        # Staleness detection: last HL-oracle price seen and the last time it
+        # actually MOVED. A frozen oracle (market closed) means a book
+        # "dislocation" has no arbitrageable anchor — the entry guard skips it.
+        self._hl_oracle_last_px: dict[str, float] = {}
+        self._hl_oracle_last_move: dict[str, int] = {}
 
         # Rolling book mid-spread history per symbol: deque of (ts_ms, spread_bps).
         # spread_bps = (aster_mid - hl_mid) / mid * 10000. The median over the
@@ -545,46 +552,69 @@ class ExchangeClient:
             )
         return hl_fr, aster_fr
 
-    def record_oracle_delta(self, symbol: str, delta_bps: float):
-        """
-        Append a fresh oracle delta observation, deduped by source freshness.
-        Only records when the underlying oracle timestamps have changed since
-        the last recording — otherwise we'd accumulate duplicates of the same
-        5-minute-stale HL oracle value, and the median would track a noisy
-        point-in-time spike rather than smooth it out.
-        """
-        hl_cached = self._hl_oracle_cache.get(symbol)
-        aster_cached = self._mark_cache.get(symbol)
-        if not hl_cached or not aster_cached:
-            return  # source not loaded yet
-        hl_ts = hl_cached[1]
-        aster_ts = aster_cached[2]
-        last = self._last_recorded_source_ts.get(symbol)
-        if last == (hl_ts, aster_ts):
-            return  # neither feed has updated since last recording
-        self._last_recorded_source_ts[symbol] = (hl_ts, aster_ts)
-        if symbol not in self._oracle_delta_history:
-            self._oracle_delta_history[symbol] = deque(maxlen=200)
-        self._oracle_delta_history[symbol].append((now_ms(), delta_bps))
+    def record_oracle_delta(self, symbol: str):
+        """Sample the live oracle/index delta (~1/min) into the rolling window
+        and track HL-oracle staleness.
 
-    def get_smoothed_oracle_delta(self, symbol: str, current: float) -> float:
-        """
-        Median of oracle-delta observations from the last 30 minutes.
-        Falls back to the current point-in-time value until we have at least 5
-        fresh observations — paired with the MIN_EXECUTABLE_PREMIUM_BPS floor
-        in executor, so cold-start entries still need to clear the fee floor.
-        """
+        delta_bps = (aster_index - hl_oracle) / mid * 10000 — same orientation
+        as the book spread (positive = Aster rich). Computed from the live
+        oracle caches (HL oraclePx refreshed each slow scan; Aster indexPrice
+        refreshed on each book fetch). No-op if either source is missing."""
+        hl_oracle = self.get_hl_oracle(symbol)
+        aster_index = self.get_aster_index(symbol)
+        if hl_oracle <= 0 or aster_index <= 0:
+            return
+        now = now_ms()
+        # Staleness: advance last_move only when the HL oracle price changes.
+        prev_px = self._hl_oracle_last_px.get(symbol)
+        if prev_px is None or abs(hl_oracle - prev_px) > 1e-9:
+            self._hl_oracle_last_px[symbol] = hl_oracle
+            self._hl_oracle_last_move[symbol] = now
+        elif symbol not in self._hl_oracle_last_move:
+            self._hl_oracle_last_move[symbol] = now
+        # Sample the delta ~1/min (same cadence as the book baseline).
+        last = self._last_oracle_sample_ts.get(symbol, 0)
+        if now - last < BASELINE_SAMPLE_INTERVAL_SECONDS * 1000:
+            return
+        self._last_oracle_sample_ts[symbol] = now
+        mid = (hl_oracle + aster_index) / 2
+        if mid <= 0:
+            return
+        delta_bps = (aster_index - hl_oracle) / mid * 10000
+        if symbol not in self._oracle_delta_history:
+            self._oracle_delta_history[symbol] = deque(maxlen=BASELINE_WINDOW_MINUTES + 120)
+        self._oracle_delta_history[symbol].append((now, delta_bps))
+
+    def get_oracle_correction(self, symbol: str) -> float:
+        """Fair-value correction to add to the book baseline: how far the live
+        oracle delta sits from its own 8h structural median. 0.0 if the
+        correction is disabled or there isn't enough oracle history yet, so the
+        signal degrades cleanly to the pure book baseline."""
+        if not ORACLE_CORRECTION_ENABLED:
+            return 0.0
         hist = self._oracle_delta_history.get(symbol)
         if not hist:
-            return current
+            return 0.0
         cutoff = now_ms() - self._oracle_delta_window_ms
         recent = [d for ts, d in hist if ts >= cutoff]
-        if len(recent) < 5:
-            return current
-        return statistics.median(recent)
+        if len(recent) < ORACLE_BASELINE_MIN_SAMPLES:
+            return 0.0
+        return recent[-1] - statistics.median(recent)
+
+    def oracle_is_stale(self, symbol: str) -> bool:
+        """True when the HL oracle price hasn't moved in ORACLE_STALE_MINUTES —
+        i.e. the market is likely closed and any book dislocation lacks an
+        arbitrageable anchor. Only fires once staleness tracking exists for the
+        symbol; an untracked name is never blocked here."""
+        if not ORACLE_STALENESS_GUARD_ENABLED:
+            return False
+        last_move = self._hl_oracle_last_move.get(symbol)
+        if last_move is None:
+            return False
+        return (now_ms() - last_move) > ORACLE_STALE_MINUTES * 60 * 1000
 
     def oracle_delta_sample_count(self, symbol: str) -> int:
-        """Number of fresh observations in the current window (for logging/health)."""
+        """Number of oracle-delta samples in the current window (health/logging)."""
         hist = self._oracle_delta_history.get(symbol)
         if not hist:
             return 0

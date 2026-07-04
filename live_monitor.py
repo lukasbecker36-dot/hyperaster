@@ -361,22 +361,27 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 return None
 
             # Match try_entry exactly: deviation of book mid-spread from its
-            # rolling baseline. Record the sample, then read the baseline.
+            # oracle-corrected fair spread. Record both samples, then baseline.
             spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000
             client.record_book_spread(symbol, spread_bps)
-            baseline = client.get_book_spread_baseline(symbol)
+            client.record_oracle_delta(symbol)
+            book_base = client.get_book_spread_baseline(symbol)
             # No baseline yet (cold start) — return None so the protocol skips it.
-            if baseline is None:
+            if book_base is None:
                 return None
-            aster_excess = spread_bps - baseline    # long_hl_short_aster
-            hl_excess    = -(spread_bps - baseline)  # long_aster_short_hl
+            # Fair spread = book baseline + oracle fair-value correction (0 when
+            # oracle history is insufficient → pure book baseline). Displayed as
+            # the baseline so excess = spread − displayed base always holds.
+            fair_spread = book_base + client.get_oracle_correction(symbol)
+            aster_excess = spread_bps - fair_spread    # long_hl_short_aster
+            hl_excess    = -(spread_bps - fair_spread)  # long_aster_short_hl
             if aster_excess >= hl_excess:
                 executable_excess = aster_excess
                 direction = "L-HL/S-AST"
             else:
                 executable_excess = hl_excess
                 direction = "L-AST/S-HL"
-            return symbol, executable_excess, direction, baseline, aster_book, hl_book
+            return symbol, executable_excess, direction, fair_spread, aster_book, hl_book
         except Exception as e:
             log.debug(f"scan_symbol {symbol}: {e}")
             return None
@@ -459,17 +464,20 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 elif elapsed_hours >= MAX_HOLD_HOURS:
                     should_exit, reason = True, "timeout"
                 else:
-                    # Convergence exit: spread has reverted to the baseline that
-                    # existed AT ENTRY TIME. Using the current rolling baseline
-                    # would let the goalposts shift — a spread that stays wide for
-                    # 8h+ gets absorbed into the rolling median, making excess drop
-                    # to 0 even though the spread never actually reverted.
+                    # Convergence exit: spread has reverted to the FAIR spread —
+                    # the frozen entry book-median (so a persistent dislocation
+                    # absorbed into the rolling median can't shift the goalposts)
+                    # PLUS the LIVE oracle correction (so a genuine fair-value
+                    # move during the hold carries the exit target with it, not
+                    # stranding the position waiting for a reversion that won't come).
                     entry_base = pos.entry_baseline_bps
                     if not entry_base:
                         log.warning(f"{symbol}: entry_baseline_bps=0 — skipping convergence check")
                     else:
+                        client.record_oracle_delta(symbol)
+                        fair_spread = entry_base + client.get_oracle_correction(symbol)
                         spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000
-                        raw_excess = spread_bps - entry_base
+                        raw_excess = spread_bps - fair_spread
                         pos_dir = pos.direction or "long_hl_short_aster"
                         own_excess = raw_excess if pos_dir == "long_hl_short_aster" else -raw_excess
                         # Gate on est_net (executable bid/ask P&L), NOT just the mid
@@ -482,6 +490,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                             log.info(
                                 f"CONVERGE {symbol}: own_excess={own_excess:.1f} "
                                 f"spread={spread_bps:.1f} entry_base={entry_base:.1f} "
+                                f"fair={fair_spread:.1f} "
                                 f"est_net=${est_net:.2f} dir={pos_dir} held={elapsed_hours:.1f}h "
                                 f"HL={hl_book.mid:.2f} Ast={aster_book.mid:.2f}"
                             )

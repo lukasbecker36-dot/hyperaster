@@ -61,6 +61,32 @@ BASELINE_WINDOW_MINUTES = 480          # 8h rolling median
 BASELINE_MIN_SAMPLES = 30              # need this many before a baseline is usable
 BASELINE_SAMPLE_INTERVAL_SECONDS = 55  # dedupe live samples to ~1/min (matches 1m candles)
 
+# ── Oracle fair-value correction ──
+# The entry/exit signal baselines the book spread against its own 8h median.
+# That median is purely historical, so a genuine shift in FAIR VALUE (an oracle
+# methodology change, a real re-rate of the underlying) is misread as tradeable
+# "excess" for up to BASELINE_WINDOW hours until the median catches up — and you
+# enter against a move that won't revert. The HL-oracle-minus-Aster-index delta
+# is a zero-lag fair-value anchor: correcting the book baseline by how far the
+# oracle delta has drifted from its own 8h norm distinguishes a convergeable
+# book dislocation (trade it) from a fair-value shift (don't).
+#   fair_spread = median_book_spread_8h + (oracle_delta_now − median_oracle_delta_8h)
+#   excess      = book_spread_now − fair_spread
+# When oracle history is insufficient (or this is off), the correction is 0 and
+# the signal degrades to the pure book baseline (prior behaviour).
+ORACLE_CORRECTION_ENABLED = True
+ORACLE_BASELINE_MIN_SAMPLES = 20       # oracle-delta samples in-window before the correction is trusted
+
+# ── Oracle staleness / market-hours guard ──
+# Equity oracles stop ticking outside US market hours and on weekends. A book
+# "dislocation" with a frozen oracle has no arbitrageable anchor and often can't
+# converge until the oracle re-anchors (meanwhile mark-price margining can bleed
+# the position). Skip AUTO entries when the HL oracle price hasn't moved in this
+# many minutes. Only applies once oracle tracking is established for a symbol —
+# a name with no oracle history yet is not blocked (other guards still apply).
+ORACLE_STALENESS_GUARD_ENABLED = True
+ORACLE_STALE_MINUTES = 15
+
 # ── Strategy parameters ──
 # Spread in bps above which we enter.  Round-trip cost ~9-14bps so 30bps = ~2x cushion.
 ENTRY_THRESHOLD_BPS = 30.0

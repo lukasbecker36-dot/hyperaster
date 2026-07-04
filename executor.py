@@ -109,24 +109,40 @@ class Executor:
         # Aster / long HL; spread_bps < baseline => the reverse.
         spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000
         self.client.record_book_spread(symbol, spread_bps)
-        baseline_bps = self.client.get_book_spread_baseline(symbol)
+        self.client.record_oracle_delta(symbol)
+        book_base = self.client.get_book_spread_baseline(symbol)
         # No baseline yet (cold start, not enough samples) = no entry. Substituting
         # 0 would treat the entire structural gap as tradeable edge — the failure
         # mode that bled fees before.
-        if baseline_bps is None:
+        if book_base is None:
             log.debug(
                 f"{symbol}: baseline not ready "
                 f"({self.client.book_spread_sample_count(symbol)} samples) — skipping"
             )
             return False
 
+        # Oracle staleness guard: outside market hours the oracle freezes and a
+        # book "dislocation" has no arbitrageable anchor — skip it.
+        if self.client.oracle_is_stale(symbol):
+            log.debug(f"{symbol}: HL oracle stale (market likely closed) — skipping entry")
+            self._entry_streak.pop(symbol, None)
+            return False
+
+        # Fair-value correction: shift the book baseline by how far the oracle
+        # delta has moved from its own norm, so a genuine fair-value move isn't
+        # misread as tradeable excess. entry_baseline_bps is stored RAW (the
+        # frozen book median) so the exit can re-apply the LIVE correction.
+        correction = self.client.get_oracle_correction(symbol)
+        baseline_bps = book_base          # stored at entry (raw book median)
+        fair_spread = book_base + correction
+
         # raw_premium_bps removed — the cost floor (fees + book spreads) is the
         # real protection. The old abs(spread) guard blocked legitimate baseline-
         # deviation trades on names with negative baselines (e.g. AMZN at 69bps
         # excess but only 10bps raw spread due to -59bps baseline).
 
-        aster_excess_bps = spread_bps - baseline_bps   # long_hl_short_aster
-        hl_excess_bps = -(spread_bps - baseline_bps)    # long_aster_short_hl
+        aster_excess_bps = spread_bps - fair_spread   # long_hl_short_aster
+        hl_excess_bps = -(spread_bps - fair_spread)    # long_aster_short_hl
 
         base_threshold = ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(symbol, ENTRY_THRESHOLD_BPS)
         # Maker-first cost floor: we rest the HL leg as a maker (no HL crossing) and
@@ -206,7 +222,8 @@ class Executor:
 
         log.info(
             f"ENTRY {symbol}: {direction} maker-first | excess={excess_bps:.1f}bps "
-            f"spread={spread_bps:+.1f}bps base={baseline_bps:+.1f}bps | "
+            f"spread={spread_bps:+.1f}bps base={baseline_bps:+.1f}bps "
+            f"orac_corr={correction:+.1f}bps fair={fair_spread:+.1f}bps | "
             f"qty={qty} | HL {hl_maker_side} maker @ {hl_ref:.2f}"
         )
 
@@ -1547,8 +1564,11 @@ class Executor:
         baseline = self.client.get_book_spread_baseline(symbol)
         if mid <= 0 or baseline is None:
             return False
+        # Same oracle-corrected fair spread the entry used.
+        self.client.record_oracle_delta(symbol)
+        fair_spread = baseline + self.client.get_oracle_correction(symbol)
         spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000
-        raw_excess = spread_bps - baseline
+        raw_excess = spread_bps - fair_spread
         excess = raw_excess if long_hl else -raw_excess
 
         base_threshold = ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(symbol, ENTRY_THRESHOLD_BPS)
