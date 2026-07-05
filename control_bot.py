@@ -346,7 +346,10 @@ def cmd_positions(chat_id: str, _arg: str):
         short_dir = "HL↑ Ast↓" if "long_hl" in (direction or "") else "HL↓ Ast↑"
         sym_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(sym, EXIT_TARGET_NET_USD)
 
-        # Current excess vs ENTRY baseline (what convergence exit uses)
+        # Current MID excess vs the ENTRY baseline — an approximation of the
+        # convergence proximity. The live exit also folds in the oracle
+        # correction and the executable half-spread deviation (not carried in
+        # latest_spreads.json); est_net below is the real executable gate.
         sym_live = live.get(sym, {})
         est_net_str = ""
         if sym_live and isinstance(sym_live, dict):

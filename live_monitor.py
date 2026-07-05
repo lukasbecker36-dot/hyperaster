@@ -469,33 +469,40 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 elif elapsed_hours >= MAX_HOLD_HOURS:
                     should_exit, reason = True, "timeout"
                 else:
-                    # Convergence exit: spread has reverted to the FAIR spread —
-                    # the frozen entry book-median (so a persistent dislocation
+                    # Convergence exit: the EXECUTABLE entry-edge that motivated
+                    # the trade has decayed to <= 0 — i.e. if we were flat we'd no
+                    # longer enter this direction, so there's nothing left to
+                    # capture. Same yardstick as the entry signal:
+                    #   own_excess = (spread − fair)·dir + exec_dev
+                    # fair = frozen entry book-median (so a persistent dislocation
                     # absorbed into the rolling median can't shift the goalposts)
-                    # PLUS the LIVE oracle correction (so a genuine fair-value
-                    # move during the hold carries the exit target with it, not
-                    # stranding the position waiting for a reversion that won't come).
+                    # + LIVE oracle correction (a genuine fair-value move during the
+                    # hold carries the target with it) + LIVE executable deviation
+                    # (exit sooner if the executable basis deteriorates, hold if real
+                    # edge remains). Mirrors try_entry exactly.
                     entry_base = pos.entry_baseline_bps
                     if not entry_base:
                         log.warning(f"{symbol}: entry_baseline_bps=0 — skipping convergence check")
                     else:
                         client.record_oracle_delta(symbol)
                         fair_spread = entry_base + client.get_oracle_correction(symbol)
+                        exec_dev = client.executable_deviation_bps(symbol, aster_book, hl_book, mid)
                         spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000
                         raw_excess = spread_bps - fair_spread
                         pos_dir = pos.direction or "long_hl_short_aster"
-                        own_excess = raw_excess if pos_dir == "long_hl_short_aster" else -raw_excess
-                        # Gate on est_net (executable bid/ask P&L), NOT just the mid
-                        # spread. A thin book can balloon at exit time: the mid says
-                        # "converged, take profit" while the executable price would
-                        # lose money crossing a blown-out bid/ask. We're mid-neutral
-                        # once converged, so there's no directional urgency — hold
-                        # until the book tightens (est_net >= 0) or the timeout fires.
+                        own_excess = (raw_excess if pos_dir == "long_hl_short_aster"
+                                      else -raw_excess) + exec_dev
+                        # Gate on est_net (executable bid/ask P&L), NOT just the
+                        # trigger. A thin book can balloon at exit time: the signal
+                        # says "converged, take profit" while the executable price
+                        # would lose money crossing a blown-out bid/ask. We're mid-
+                        # neutral once converged, so there's no directional urgency —
+                        # hold until the book tightens (est_net >= 0) or timeout fires.
                         if own_excess <= 0 and elapsed_hours >= 0.5 and est_net >= 0:
                             log.info(
                                 f"CONVERGE {symbol}: own_excess={own_excess:.1f} "
                                 f"spread={spread_bps:.1f} entry_base={entry_base:.1f} "
-                                f"fair={fair_spread:.1f} "
+                                f"fair={fair_spread:.1f} exec_dev={exec_dev:+.1f} "
                                 f"est_net=${est_net:.2f} dir={pos_dir} held={elapsed_hours:.1f}h "
                                 f"HL={hl_book.mid:.2f} Ast={aster_book.mid:.2f}"
                             )
