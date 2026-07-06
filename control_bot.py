@@ -1250,6 +1250,24 @@ def main():
         print(f"setMyCommands failed: {e}", flush=True)
 
     offset = 0
+    # Skip the backlog on startup. Otherwise any command still queued at
+    # Telegram gets replayed on every boot — and a /restart in the queue makes
+    # the bot restart itself, re-read the same /restart, and restart again: an
+    # endless loop (the self-restart tears us down before the update is
+    # confirmed, so Telegram redelivers it). getUpdates(offset=-1) returns just
+    # the newest update; starting the poll one past it discards everything
+    # older. Commands sent while the bot was down are intentionally dropped
+    # (safer than replaying a stale /restart or /flatten on boot).
+    try:
+        resp = _api("getUpdates", {"offset": -1, "timeout": 0}, timeout=10)
+        results = resp.get("result", [])
+        if results:
+            offset = results[-1]["update_id"] + 1
+            print(f"Skipped {len(results)} backlog update(s); starting at offset {offset}",
+                  flush=True)
+    except Exception as e:
+        print(f"backlog skip failed ({e}) — starting at offset 0", flush=True)
+
     while True:
         try:
             resp = _api("getUpdates", {"offset": offset, "timeout": 30}, timeout=40)
