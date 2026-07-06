@@ -63,8 +63,9 @@ BALANCES_FILE = BASE_DIR / "data" / "balances.json"
 TOKEN = os.getenv("ALERT_TELEGRAM_BOT_TOKEN", "")
 SERVICE = os.getenv("CONTROL_SERVICE_NAME", "hyperaster")
 # The control bot's OWN systemd unit, so /restart can restart it too (to pick up
-# control_bot.py changes). Defaults to "<trader>-bot"; override if yours differs.
-CONTROL_BOT_SERVICE = os.getenv("CONTROL_BOT_SERVICE_NAME", f"{SERVICE}-bot")
+# control_bot.py changes). Defaults to "<trader>-control"; override via
+# CONTROL_BOT_SERVICE_NAME if yours differs.
+CONTROL_BOT_SERVICE = os.getenv("CONTROL_BOT_SERVICE_NAME", f"{SERVICE}-control")
 BRANCH = os.getenv("CONTROL_BRANCH", "")
 
 def _allowed_chat_ids() -> set[str]:
