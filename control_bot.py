@@ -24,7 +24,7 @@ Commands:
   /log [n]     last n journal lines (default 20)
   /start       start the trader service
   /stop        stop the trader  (requires: /stop YES)
-  /restart     git pull + restart the trader
+  /restart     git pull + restart the trader AND the control bot
   /flatten     emergency close ALL positions (requires: /flatten YES)
   /help        command list
 """
@@ -61,6 +61,9 @@ MANUAL_CMD_DIR = BASE_DIR / "data" / "manual_cmds"
 
 TOKEN = os.getenv("ALERT_TELEGRAM_BOT_TOKEN", "")
 SERVICE = os.getenv("CONTROL_SERVICE_NAME", "hyperaster")
+# The control bot's OWN systemd unit, so /restart can restart it too (to pick up
+# control_bot.py changes). Defaults to "<trader>-bot"; override if yours differs.
+CONTROL_BOT_SERVICE = os.getenv("CONTROL_BOT_SERVICE_NAME", f"{SERVICE}-bot")
 BRANCH = os.getenv("CONTROL_BRANCH", "")
 
 def _allowed_chat_ids() -> set[str]:
@@ -481,10 +484,36 @@ def cmd_restart(chat_id: str, _arg: str):
         pull_cmd += ["origin", BRANCH]
     rc, out = run(pull_cmd, timeout=60)
     send(chat_id, f"git pull:\n{out}")
+
+    # 1. Restart the trader first — THIS process survives it, so we can confirm.
     rc, out = run(["systemctl", "restart", SERVICE], timeout=30)
     time.sleep(2)
     _, active = run(["systemctl", "is-active", SERVICE], timeout=10)
-    send(chat_id, f"restart: {'ok' if rc == 0 else 'FAILED'} — now {active}\n{out}")
+    send(chat_id, f"trader restart: {'ok' if rc == 0 else 'FAILED'} — now {active}\n{out}".strip())
+
+    # 2. Restart the control bot itself LAST — this tears down THIS process, so it
+    #    must be the final step and can't confirm afterwards. Skip if it's the same
+    #    unit as the trader (already restarted above). Verify the unit exists first
+    #    so we don't kill ourselves for a wrong service name.
+    if CONTROL_BOT_SERVICE == SERVICE:
+        return
+    _, load_state = run(
+        ["systemctl", "show", CONTROL_BOT_SERVICE, "--property=LoadState", "--value"],
+        timeout=10,
+    )
+    if load_state.strip() != "loaded":
+        send(chat_id,
+             f"⚠️ control-bot service '{CONTROL_BOT_SERVICE}' not found "
+             f"(LoadState={load_state.strip() or '?'}). Trader is updated, but "
+             f"control_bot.py changes need a manual bot restart. Set "
+             f"CONTROL_BOT_SERVICE_NAME to your bot unit if the name differs.")
+        return
+    send(chat_id,
+         f"🔁 restarting the control bot ('{CONTROL_BOT_SERVICE}') now — last message "
+         f"from this instance. Give it a few seconds, then /status to confirm I'm back.")
+    # --no-block: enqueue the restart in systemd (PID 1) and return immediately;
+    # the job completes independently of this process being torn down by it.
+    run(["systemctl", "restart", "--no-block", CONTROL_BOT_SERVICE], timeout=10)
 
 
 def cmd_flatten(chat_id: str, arg: str):
@@ -1050,7 +1079,7 @@ def cmd_help(chat_id: str, _arg: str):
          "/live YES — switch to live mode (restarts)\n"
          "/start — start trader\n"
          "/stop YES — stop trader (positions left open!)\n"
-         "/restart — git pull + restart\n"
+         "/restart — git pull + restart trader & control bot\n"
          "/flatten YES — emergency close ALL positions")
 
 
@@ -1149,7 +1178,7 @@ def main():
             {"command": "live", "description": "Switch to live mode (YES to confirm)"},
             {"command": "start", "description": "Start trader"},
             {"command": "stop", "description": "Stop trader (YES to confirm)"},
-            {"command": "restart", "description": "Git pull + restart"},
+            {"command": "restart", "description": "Git pull + restart trader & bot"},
             {"command": "flatten", "description": "Emergency close ALL positions"},
             {"command": "help", "description": "Command list"},
         ])}, timeout=10)
