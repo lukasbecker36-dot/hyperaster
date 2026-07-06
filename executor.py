@@ -1901,7 +1901,8 @@ class Executor:
         if is_partial:
             if effective_maker == "hl" and reason not in self.URGENT_EXIT_REASONS:
                 self._partial_closes[symbol] = close_qty
-                ok = await self.force_exit_maker(symbol, reason, close_qty)
+                ok = await self.force_exit_maker(symbol, reason, close_qty,
+                                                 dec_aster_book=aster_book, dec_hl_book=hl_book)
                 if ok:
                     return True
                 self._partial_closes.pop(symbol, None)
@@ -1910,27 +1911,39 @@ class Executor:
 
         # Full close
         if pos and effective_maker == "hl" and reason not in self.URGENT_EXIT_REASONS:
-            ok = await self.force_exit_maker(symbol, reason)
+            ok = await self.force_exit_maker(symbol, reason,
+                                             dec_aster_book=aster_book, dec_hl_book=hl_book)
             if ok:
                 return True
             log.warning(f"{symbol}: maker exit unavailable — falling back to taker exit")
         return await self.try_exit(symbol, aster_book, hl_book, reason)
 
-    async def force_exit_maker(self, symbol: str, reason: str, close_qty: float = 0.0) -> bool:
+    async def force_exit_maker(self, symbol: str, reason: str, close_qty: float = 0.0,
+                               dec_aster_book: OrderBook = None,
+                               dec_hl_book: OrderBook = None) -> bool:
         """Close via HL maker: rest a post-only HL order on the close side
         (sell@ask for a long-HL leg, buy@bid for a short-HL leg) and let
         poll_hl_maker_exit cross Aster (IOC taker) to close each HL fill. Returns
         False if the HL maker can't be placed (caller falls back to taker).
-        close_qty > 0: partial close (only close this many shares)."""
+        close_qty > 0: partial close (only close this many shares).
+
+        dec_*_book: the book snapshot the EXIT DECISION was made on. In paper
+        mode the fill is fabricated from the book, so it MUST reuse the decision
+        snapshot — re-fetching gives a different (thin-book) reading than the one
+        est_net was judged on, which is how a 'target' (profit) exit can book a
+        loss. Live mode always re-fetches (real orders fill at the live book)."""
         pos = self.pm.get(symbol)
         if not pos or pos.status != "open":
             return False
         qty = close_qty if (close_qty > 0 and close_qty < pos.qty) else pos.qty
-        try:
-            aster_book, hl_book = await self.client.get_both_books(symbol)
-        except Exception as e:
-            log.error(f"{symbol}: maker-exit book fetch failed ({e})")
-            return False
+        if self.paper_mode and dec_aster_book is not None and dec_hl_book is not None:
+            aster_book, hl_book = dec_aster_book, dec_hl_book
+        else:
+            try:
+                aster_book, hl_book = await self.client.get_both_books(symbol)
+            except Exception as e:
+                log.error(f"{symbol}: maker-exit book fetch failed ({e})")
+                return False
         if aster_book.bid <= 0 or hl_book.bid <= 0:
             log.warning(f"{symbol}: empty book on maker exit")
             return False
