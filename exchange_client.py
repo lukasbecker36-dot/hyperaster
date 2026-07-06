@@ -31,6 +31,7 @@ from auth import sign_aster_request, now_ms
 from config import (
     HYPERLIQUID_API, HL_EXCHANGE_URL,
     ASTER_ORDER_URL, ASTER_OPEN_ORDERS_URL, ASTER_POSITION_URL, ASTER_EXCHANGE_INFO_URL,
+    ASTER_BALANCE_URL,
     ORDER_TIMEOUT_SECONDS, HL_IOC_BUFFER_BPS, ASTER_IOC_BUFFER_BPS,
     aster_symbol_for, ASTER_BASE_ALIAS, ASTER_BASE_TO_CANON,
     BASELINE_WINDOW_MINUTES, BASELINE_MIN_SAMPLES, BASELINE_SAMPLE_INTERVAL_SECONDS,
@@ -1402,6 +1403,57 @@ class ExchangeClient:
         except Exception as e:
             log.error(f"Aster all positions query error: {e}")
             return []
+
+    async def get_hl_balance(self) -> dict:
+        """HL XYZ-dex account balance (USDC). HIP-3 margin is isolated to the
+        builder dex, so this queries the xyz-dex clearinghouse state — the funds
+        the bot actually trades these perps against. Returns {} on failure."""
+        try:
+            async with self.session.post(
+                HYPERLIQUID_API,
+                json={
+                    "type": "clearinghouseState",
+                    "user": self.api_keys["hl_account_address"],
+                    "dex": "xyz",
+                },
+                timeout=self.timeout,
+            ) as r:
+                data = await r.json()
+            ms = data.get("marginSummary", {}) or {}
+            return {
+                "account_value": float(ms.get("accountValue", 0) or 0),
+                "margin_used": float(ms.get("totalMarginUsed", 0) or 0),
+                "withdrawable": float(data.get("withdrawable", 0) or 0),
+                "asset": "USDC",
+            }
+        except Exception as e:
+            log.error(f"HL balance query error: {e}")
+            return {}
+
+    async def get_aster_balance(self, asset: str = "USDT") -> dict:
+        """Aster futures wallet balance for `asset` (default USDT). Signed
+        GET /fapi/v3/balance returns a per-asset list. Returns {} on failure."""
+        signed = self._sign_aster({})
+        try:
+            async with self.session.get(
+                ASTER_BALANCE_URL, params=signed, timeout=self.timeout
+            ) as r:
+                data = await r.json()
+            if not isinstance(data, list):
+                log.error(f"Aster balance unexpected response: {str(data)[:200]}")
+                return {}
+            for a in data:
+                if str(a.get("asset", "")).upper() == asset.upper():
+                    return {
+                        "balance": float(a.get("balance", 0) or 0),
+                        "available": float(a.get("availableBalance", 0) or 0),
+                        "unrealized_pnl": float(a.get("crossUnPnl", 0) or 0),
+                        "asset": asset,
+                    }
+            return {"balance": 0.0, "available": 0.0, "unrealized_pnl": 0.0, "asset": asset}
+        except Exception as e:
+            log.error(f"Aster balance query error: {e}")
+            return {}
 
     async def set_hl_leverage(self, symbol: str, leverage: int, cross: bool = True) -> bool:
         """Set leverage for a symbol on HL XYZ. updateLeverage wants the integer

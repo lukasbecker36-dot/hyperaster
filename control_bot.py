@@ -58,6 +58,7 @@ AUTO_ENTRY_FILE = BASE_DIR / "data" / "auto_entry"
 AUTO_EXIT_FILE = BASE_DIR / "data" / "auto_exit"
 AUTO_NOTIONAL_FILE = BASE_DIR / "data" / "auto_notional"
 MANUAL_CMD_DIR = BASE_DIR / "data" / "manual_cmds"
+BALANCES_FILE = BASE_DIR / "data" / "balances.json"
 
 TOKEN = os.getenv("ALERT_TELEGRAM_BOT_TOKEN", "")
 SERVICE = os.getenv("CONTROL_SERVICE_NAME", "hyperaster")
@@ -440,6 +441,65 @@ def cmd_pnl(chat_id: str, _arg: str):
         send(chat_id, f"DB error: {e}")
         return
     send(chat_id, "\n\n".join(sections))
+
+
+def _render_balances(snap: dict) -> str:
+    """Format a cached balances snapshot (written by the monitor)."""
+    hl = snap.get("hl") or {}
+    aster = snap.get("aster") or {}
+    ts = snap.get("_ts", 0)
+    age = int(time.time() - ts) if ts else None
+    age_str = ""
+    if age is not None:
+        age_str = f" (as of {age}s ago)" if age < 120 else f" (as of {age // 60}m ago)"
+    lines = [f"💰 Balances{age_str}"]
+    if hl:
+        lines.append(
+            f"HL (xyz): ${hl.get('account_value', 0):.2f} {hl.get('asset', 'USDC')} "
+            f"(free ${hl.get('withdrawable', 0):.2f}, margin used ${hl.get('margin_used', 0):.2f})"
+        )
+    else:
+        lines.append("HL (xyz): —")
+    if aster:
+        lines.append(
+            f"Aster: ${aster.get('balance', 0):.2f} {aster.get('asset', 'USDT')} "
+            f"(free ${aster.get('available', 0):.2f}, uPnL ${aster.get('unrealized_pnl', 0):+.2f})"
+        )
+    else:
+        lines.append("Aster: —")
+    if hl and aster:
+        lines.append(f"Total ≈ ${hl.get('account_value', 0) + aster.get('balance', 0):.2f} (USDC+USDT)")
+    return "\n".join(lines)
+
+
+def cmd_balance(chat_id: str, _arg: str):
+    """Show exchange balances. The control bot holds no API keys, so it asks the
+    monitor (the single API-touching process) to fetch fresh balances — which it
+    replies with over the alert channel — and shows the last cached snapshot now
+    for instant feedback."""
+    _, active = run(["systemctl", "is-active", SERVICE], timeout=10)
+    trader_up = active.strip() == "active"
+
+    cached = None
+    try:
+        cached = json.loads(BALANCES_FILE.read_text())
+    except Exception:
+        cached = None
+
+    if trader_up:
+        _enqueue_manual({"action": "balance"})
+        if cached:
+            send(chat_id, _render_balances(cached) + "\n\n⏳ fetching fresh balances…")
+        else:
+            send(chat_id, "⏳ requesting balances from the trader… (reply arrives shortly)")
+    else:
+        if cached:
+            send(chat_id, _render_balances(cached) +
+                 "\n\n⚠️ trader not running — this is the last cached snapshot; "
+                 "start it to refresh.")
+        else:
+            send(chat_id, "⚠️ trader not running and no cached balances — "
+                          "start the trader (/start) to query live balances.")
 
 
 def cmd_log(chat_id: str, arg: str):
@@ -1073,6 +1133,7 @@ def cmd_help(chat_id: str, _arg: str):
          "/positions — open positions detail\n"
          "/trades [n] — last n closed trades with P&L detail\n"
          "/pnl — realised P&L (today + all-time)\n"
+         "/balance — USDC/USDT balances on both venues\n"
          "/log [n] — last n journal lines\n"
          "/mode — show configured mode\n"
          "/paper — switch to paper mode (restarts)\n"
@@ -1086,6 +1147,7 @@ def cmd_help(chat_id: str, _arg: str):
 HANDLERS = {
     "/status": cmd_status, "/positions": cmd_positions, "/pos": cmd_positions,
     "/pnl": cmd_pnl, "/trades": cmd_trades,
+    "/balance": cmd_balance, "/balances": cmd_balance,
     "/book": cmd_book,
     "/funding": cmd_funding, "/carry": cmd_funding,
     "/enter": cmd_enter, "/close": cmd_close, "/cancel": cmd_cancel,
@@ -1172,6 +1234,7 @@ def main():
             {"command": "notional", "description": "Set auto-entry size per leg: USD|reset"},
             {"command": "trades", "description": "Last N closed trades with P&L"},
             {"command": "pnl", "description": "Realised P&L today + all-time"},
+            {"command": "balance", "description": "USDC/USDT balances on both venues"},
             {"command": "log", "description": "Last n journal lines"},
             {"command": "mode", "description": "Show configured mode"},
             {"command": "paper", "description": "Switch to paper mode"},

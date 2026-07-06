@@ -117,6 +117,9 @@ _AUTO_NOTIONAL_FILE = os.path.join(DATA_DIR, "auto_notional")
 _MANUAL_CMD_DIR = os.path.join(DATA_DIR, "manual_cmds")
 # Snapshot of basis-gated orders still waiting for their target, for /positions.
 _PENDING_GATES_FILE = os.path.join(DATA_DIR, "pending_gates.json")
+# Last-fetched exchange balances, written on the /balance request so the control
+# bot (which holds no API keys) can display them.
+_BALANCES_FILE = os.path.join(DATA_DIR, "balances.json")
 
 
 def _write_pending_gates(pending_entries: dict, pending_exits: dict,
@@ -687,11 +690,48 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     send_alert(f"/drip_exit {symbol}: {'OK' if ok else 'FAILED'} — {msg}")
                 elif action == "import":
                     await _handle_import(symbol or None)
+                elif action == "balance":
+                    await _handle_balance()
                 else:
                     log.warning(f"manual cmd: unknown action {action!r}")
             except Exception as e:
                 log.error(f"manual cmd {action} {symbol} failed: {e}")
                 send_alert(f"/{action} {symbol}: ERROR {e}")
+
+    async def _handle_balance():
+        """Fetch balances on both venues, cache them for the control bot, and
+        reply over the Telegram alert channel."""
+        hl, aster = await asyncio.gather(
+            client.get_hl_balance(),
+            client.get_aster_balance(),
+        )
+        snap = {"hl": hl, "aster": aster, "_ts": time.time()}
+        try:
+            tmp = _BALANCES_FILE + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(snap, fh)
+            os.replace(tmp, _BALANCES_FILE)
+        except Exception:
+            pass
+        lines = ["💰 Balances"]
+        if hl:
+            lines.append(
+                f"HL (xyz): ${hl['account_value']:.2f} {hl['asset']} "
+                f"(free ${hl['withdrawable']:.2f}, margin used ${hl['margin_used']:.2f})"
+            )
+        else:
+            lines.append("HL (xyz): query failed")
+        if aster:
+            upnl = aster.get("unrealized_pnl", 0.0)
+            lines.append(
+                f"Aster: ${aster['balance']:.2f} {aster['asset']} "
+                f"(free ${aster['available']:.2f}, uPnL ${upnl:+.2f})"
+            )
+        else:
+            lines.append("Aster: query failed")
+        if hl and aster:
+            lines.append(f"Total ≈ ${hl['account_value'] + aster['balance']:.2f} (USDC+USDT)")
+        send_alert("\n".join(lines))
 
     async def _handle_import(filter_symbol: str | None = None):
         """Scan both venues for offsetting positions and import them into the DB."""
