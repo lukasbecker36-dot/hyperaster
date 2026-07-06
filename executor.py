@@ -71,6 +71,7 @@ class Executor:
         symbol: str,
         aster_book: OrderBook,
         hl_book: OrderBook,
+        notional: float = NOTIONAL_PER_LEG,
     ) -> bool:
         """
         Attempt to enter a position for the given symbol.
@@ -198,7 +199,8 @@ class Executor:
         # Size in base tokens, capped by top-of-book liquidity on both venues.
         # Maker-first sizes the full notional (the HL leg rests passively, no
         # top-of-book cap; the Aster taker hedges incrementally as HL fills).
-        target_qty = NOTIONAL_PER_LEG / mid
+        # `notional` is the per-leg USD size (runtime-overridable for live testing).
+        target_qty = notional / mid
         qty = self.client.snap_aster_qty(symbol, target_qty)
         if qty <= 0:
             log.debug(f"{symbol}: qty snapped to 0 (target={target_qty:.2f})")
@@ -208,8 +210,12 @@ class Executor:
 
         # Reject if max theoretical profit can't reach target. Full reversion
         # of excess_bps on this notional is the ceiling; require 1.5× target
-        # so we're not entering trades that can only breakeven at best.
-        sym_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(symbol, EXIT_TARGET_NET_USD)
+        # so we're not entering trades that can only breakeven at best. The
+        # target scales with the chosen notional (vs the default), so the check
+        # stays a fixed bps-edge requirement at any size — otherwise a small
+        # test notional would fail this gate on every name.
+        base_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(symbol, EXIT_TARGET_NET_USD)
+        sym_target = base_target * (actual_notional / NOTIONAL_PER_LEG)
         est_fees = actual_notional * CARRY_ROUND_TRIP_FEE
         max_gross = actual_notional * excess_bps / 10000
         if max_gross < sym_target * 1.5 + est_fees:

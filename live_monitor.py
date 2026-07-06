@@ -106,6 +106,10 @@ _SPREADS_FILE = os.path.join(DATA_DIR, "latest_spreads.json")
 # go live for a manual funding trade without the auto-scanner also trading live.
 _AUTO_ENTRY_FILE = os.path.join(DATA_DIR, "auto_entry")
 _AUTO_EXIT_FILE = os.path.join(DATA_DIR, "auto_exit")
+# Runtime per-leg notional override for AUTO convergence entries. When absent,
+# NOTIONAL_PER_LEG (config) is used. Lets you dial size down for live testing
+# without a restart; manual /enter and /drip size independently.
+_AUTO_NOTIONAL_FILE = os.path.join(DATA_DIR, "auto_notional")
 # Manual command inbox: the control bot drops one JSON file per request here
 # ({"action":"enter","symbol":..,"direction":..,"notional":..} or
 # {"action":"close","symbol":..}). The monitor is the single order-placing
@@ -176,6 +180,21 @@ def _auto_exit_enabled() -> bool:
         return True
     except Exception:
         return True
+
+
+def _auto_notional() -> float:
+    """Per-leg notional (USD) for auto convergence entries. Runtime override from
+    the auto_notional file, else NOTIONAL_PER_LEG. Clamped to a sane floor so a
+    bad file can't size to ~0; falls back to the config default on any error."""
+    try:
+        v = float(Path(_AUTO_NOTIONAL_FILE).read_text().strip())
+        if v < 1.0:
+            return NOTIONAL_PER_LEG
+        return v
+    except FileNotFoundError:
+        return NOTIONAL_PER_LEG
+    except Exception:
+        return NOTIONAL_PER_LEG
 
 
 def _carry_basis_bps(direction: str, action: str, aster_book, hl_book):
@@ -336,7 +355,8 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     # symbol -> est_net USD (executable bid/ask P&L) for open positions
     latest_est_net: dict[str, float] = {}
     # Runtime flags refreshed once per tick from their control files.
-    runtime_flags = {"auto_entry": True, "auto_exit": True}
+    runtime_flags = {"auto_entry": True, "auto_exit": True,
+                     "auto_notional": float(NOTIONAL_PER_LEG)}
     # Basis-gated manual orders waiting for a good fill level.
     #   pending_entries: symbol -> {direction, notional, target_bps, expires_ms}
     #   pending_exits:   symbol -> {target_bps}
@@ -433,7 +453,13 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 latest_est_net[symbol] = est_net
 
                 should_exit, reason = False, ""
-                sym_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(symbol, EXIT_TARGET_NET_USD)
+                # Profit target scales with THIS position's notional, so a trade
+                # opened at reduced size still exits on the same bps-edge as a
+                # full-size one (a fixed $3 target on a $200 position would need
+                # ~150bps and almost never fire → rides to timeout instead).
+                base_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(symbol, EXIT_TARGET_NET_USD)
+                size_frac = (pos.notional_usd / NOTIONAL_PER_LEG) if pos.notional_usd else 1.0
+                sym_target = base_target * size_frac
 
                 # Skip auto-exit when disabled, or when a drip/drip_exit is active
                 if (not runtime_flags["auto_exit"]
@@ -519,7 +545,8 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     await executor.exit_position(symbol, aster_book, hl_book, reason)
             elif not pos:
                 if runtime_flags["auto_entry"] and pm.active_count < MAX_CONCURRENT_POSITIONS:
-                    await executor.try_entry(symbol, aster_book, hl_book)
+                    await executor.try_entry(symbol, aster_book, hl_book,
+                                             notional=runtime_flags["auto_notional"])
         except Exception as e:
             log.error(f"Error processing {symbol}: {e}")
             consecutive_errors += 1
@@ -895,6 +922,11 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             if runtime_flags["auto_exit"] != prev_auto_exit:
                 state = "ENABLED" if runtime_flags["auto_exit"] else "DISABLED"
                 log.warning(f"Auto-exit {state} (runtime flag changed)")
+            prev_notional = runtime_flags["auto_notional"]
+            runtime_flags["auto_notional"] = _auto_notional()
+            if runtime_flags["auto_notional"] != prev_notional:
+                log.warning(f"Auto-entry notional set to ${runtime_flags['auto_notional']:.0f}/leg "
+                            f"(runtime override changed)")
             # An exception here must not kill the monitor — exits and safety
             # stops would silently stop being evaluated for live positions.
             try:

@@ -56,6 +56,7 @@ MODE_FILE = BASE_DIR / "data" / "mode.env"
 # enqueued as files here rather than executed by this stdlib-only control bot.
 AUTO_ENTRY_FILE = BASE_DIR / "data" / "auto_entry"
 AUTO_EXIT_FILE = BASE_DIR / "data" / "auto_exit"
+AUTO_NOTIONAL_FILE = BASE_DIR / "data" / "auto_notional"
 MANUAL_CMD_DIR = BASE_DIR / "data" / "manual_cmds"
 
 TOKEN = os.getenv("ALERT_TELEGRAM_BOT_TOKEN", "")
@@ -223,10 +224,13 @@ def cmd_status(chat_id: str, _arg: str):
     mode = read_mode()
     uptime = _uptime_str()
     spreads = _latest_spreads()
+    notl, is_override = _current_auto_notional()
+    notl_str = f"${notl:.0f}/leg" + (" (override)" if is_override else "")
     send(chat_id,
          f"🤖 {SERVICE}: {active.upper()} ({uptime})\n"
          f"mode: {mode}\n"
-         f"open positions: {open_live} live / {open_paper} paper\n\n"
+         f"open positions: {open_live} live / {open_paper} paper\n"
+         f"auto-entry size: {notl_str}\n\n"
          f"📈 spreads: {spreads}")
 
 
@@ -654,6 +658,58 @@ def cmd_autoexit(chat_id: str, arg: str):
         send(chat_id, "✅ auto-exit ENABLED — positions will auto-close on convergence/target/timeout again.")
 
 
+def _current_auto_notional() -> tuple[float, bool]:
+    """Return (per-leg notional USD, is_override). Override from auto_notional
+    file, else the config default."""
+    from config import NOTIONAL_PER_LEG
+    try:
+        v = float(AUTO_NOTIONAL_FILE.read_text().strip())
+        if v >= 1.0:
+            return v, True
+    except Exception:
+        pass
+    return float(NOTIONAL_PER_LEG), False
+
+
+def cmd_notional(chat_id: str, arg: str):
+    """Set the per-leg notional (USD) for AUTO convergence entries. Manual /enter
+    and /drip size independently. Takes effect within ~1s, no restart."""
+    from config import NOTIONAL_PER_LEG
+    a = arg.strip().lower()
+    cur, is_override = _current_auto_notional()
+    if not a:
+        src = "override" if is_override else "config default"
+        send(chat_id,
+             f"auto-entry notional: ${cur:.0f}/leg ({src})\n"
+             f"/notional 250 — set auto entries to $250/leg\n"
+             f"/notional reset — revert to config default (${NOTIONAL_PER_LEG:.0f})\n"
+             "Affects NEW auto convergence entries only; open positions and "
+             "manual /enter are unchanged. The profit target scales with size.")
+        return
+    if a in ("reset", "default", "off"):
+        try:
+            AUTO_NOTIONAL_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        send(chat_id, f"↩️ auto-entry notional reset to config default ${NOTIONAL_PER_LEG:.0f}/leg.")
+        return
+    try:
+        v = float(a.replace("$", "").replace(",", ""))
+    except ValueError:
+        send(chat_id, f"Usage: /notional <USD> | reset  (got {arg!r})")
+        return
+    if v < 1.0:
+        send(chat_id, "Notional must be ≥ $1.")
+        return
+    AUTO_NOTIONAL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    AUTO_NOTIONAL_FILE.write_text(f"{v}\n")
+    warn = "  ⚠️ larger than the config default" if v > NOTIONAL_PER_LEG else ""
+    send(chat_id,
+         f"✅ auto-entry notional set to ${v:.0f}/leg.{warn}\n"
+         "New auto convergence entries will size to this (takes effect within ~1s, "
+         "no restart). Open positions unchanged; the profit target scales with size.")
+
+
 def cmd_enter(chat_id: str, arg: str):
     """Manually open ONE delta-neutral funding-carry hold via the monitor.
 
@@ -984,6 +1040,7 @@ def cmd_help(chat_id: str, _arg: str):
          "/import [SYM] — adopt existing venue positions into the bot for management\n"
          "/autoentry on|off — toggle auto basis-arb entry (exits unaffected)\n"
          "/autoexit on|off — toggle auto convergence/target exit (/drip_exit unaffected)\n"
+         "/notional [USD|reset] — set auto-entry size per leg (live, no restart)\n"
          "/positions — open positions detail\n"
          "/trades [n] — last n closed trades with P&L detail\n"
          "/pnl — realised P&L (today + all-time)\n"
@@ -1005,6 +1062,7 @@ HANDLERS = {
     "/enter": cmd_enter, "/close": cmd_close, "/cancel": cmd_cancel,
     "/drip": cmd_drip, "/drip_exit": cmd_drip_exit, "/import": cmd_import,
     "/autoentry": cmd_autoentry, "/autoexit": cmd_autoexit,
+    "/notional": cmd_notional,
     "/log": cmd_log, "/logs": cmd_log,
     "/spreads": cmd_spreads, "/spread": cmd_spreads,
     "/mode": cmd_mode, "/paper": cmd_paper, "/live": cmd_live,
@@ -1082,6 +1140,7 @@ def main():
             {"command": "import", "description": "Adopt existing venue positions: [SYM]"},
             {"command": "autoentry", "description": "Toggle auto basis-arb entry: on|off"},
             {"command": "autoexit", "description": "Toggle auto convergence/target exit: on|off"},
+            {"command": "notional", "description": "Set auto-entry size per leg: USD|reset"},
             {"command": "trades", "description": "Last N closed trades with P&L"},
             {"command": "pnl", "description": "Realised P&L today + all-time"},
             {"command": "log", "description": "Last n journal lines"},
