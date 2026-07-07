@@ -217,6 +217,13 @@ ORDER_TIMEOUT_SECONDS = 8        # HTTP request timeout
 # ── Paper mode ──
 PAPER_MODE = True                # set False for live execution
 
+# Send reduceOnly on Aster closing orders. Default OFF: it was added as a
+# naked-flip backstop but Aster appears to REJECT reduce-only orders (opens with
+# plain IOC fill; closes with reduceOnly fail → naked legs / stuck exits). The
+# real over-close protection is the qty accounting + live-position reconcile, so
+# closes go out as plain IOCs. Only enable if Aster is confirmed to accept it.
+ASTER_REDUCE_ONLY = False
+
 # ── Alerting ──
 HEARTBEAT_INTERVAL_MINUTES = 60
 # Send a Telegram message when a LIVE position opens or closes. Paper trades

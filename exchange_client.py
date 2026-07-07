@@ -38,7 +38,7 @@ from config import (
     ASTER_LEVERAGE_URL, ASTER_MARGIN_TYPE_URL, LEVERAGE, ASTER_MARGIN_TYPE,
     ORACLE_CORRECTION_ENABLED, ORACLE_BASELINE_MIN_SAMPLES,
     ORACLE_STALENESS_GUARD_ENABLED, ORACLE_STALE_MINUTES,
-    EXECUTABLE_SIGNAL_ENABLED,
+    EXECUTABLE_SIGNAL_ENABLED, ASTER_REDUCE_ONLY,
 )
 from src import history
 
@@ -901,7 +901,7 @@ class ExchangeClient:
             "price": self.format_aster_price(symbol, price),
             "quantity": self.format_aster_qty(symbol, qty),
         }
-        if reduce_only:
+        if reduce_only and ASTER_REDUCE_ONLY:
             params["reduceOnly"] = "true"
         signed = self._sign_aster(params)
         try:
@@ -951,7 +951,7 @@ class ExchangeClient:
             "price": self.format_aster_price(symbol, limit_px),
             "quantity": self.format_aster_qty(symbol, qty),
         }
-        if reduce_only:
+        if reduce_only and ASTER_REDUCE_ONLY:
             params["reduceOnly"] = "true"
         signed = self._sign_aster(params)
         try:

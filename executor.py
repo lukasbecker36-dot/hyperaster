@@ -2315,25 +2315,49 @@ class Executor:
             except Exception as e:
                 log.critical(f"{symbol}: maker-exit taker-complete errored ({e}) — CHECK MANUALLY")
 
-        # Close any Aster residual to match what HL has now closed.
-        residual = self.client.snap_aster_qty(symbol, hl_closed - pos.aster_hedged_qty)
-        if residual > 0:
+        # Reconcile the Aster close against the live position first — an earlier
+        # IOC may have filled async without being credited (and once flat a
+        # reduce_only retry just rejects). Then close any residual, RETRYING with
+        # a fresh book: a single missed IOC must not leave the leg naked (SNDK:
+        # HL closed 0.01, Aster closed 0.0 -> naked, marked error after one try).
+        try:
+            ap = await self.client.get_aster_position(symbol)
+            aster_amt = abs(float(ap.get("positionAmt", 0) or 0))
+            closed_live = min(max(0.0, pos.qty - aster_amt), hl_closed)
+            if closed_live > pos.aster_hedged_qty + 1e-9:
+                self.pm.record_hl_maker_exit_progress(
+                    symbol, closed_live, pos.aster_exit_price or 0.0)
+        except Exception:
+            pass
+
+        for attempt in range(4):
+            residual = self.client.snap_aster_qty(symbol, hl_closed - pos.aster_hedged_qty)
+            if residual <= 0:
+                break
             try:
                 aster_book = await self.client._get_aster_book(symbol)
-                touch = aster_book.ask if aster_hedge_side == "buy" else aster_book.bid
-                res = await self.client.place_aster_ioc(
-                    symbol, aster_hedge_side, residual, touch, reduce_only=True)
-                if res.success and res.filled_qty > 0:
-                    new_closed = pos.aster_hedged_qty + res.filled_qty
-                    old = pos.aster_hedged_qty
-                    a_avg = ((pos.aster_exit_price * old + res.fill_price * res.filled_qty)
-                             / new_closed) if new_closed > 0 else res.fill_price
-                    self.pm.record_hl_maker_exit_progress(symbol, new_closed, a_avg)
-                    self.pm.log_trade(pos.id, "aster", aster_hedge_side, "ioc_close",
-                                      res.order_id, res.filled_qty, res.fill_price,
-                                      notes="maker-exit residual close")
-            except Exception as e:
-                log.critical(f"{symbol}: maker-exit residual Aster close failed ({e}) — CHECK MANUALLY")
+            except Exception:
+                await asyncio.sleep(0.3)
+                continue
+            touch = aster_book.ask if aster_hedge_side == "buy" else aster_book.bid
+            if touch <= 0:
+                await asyncio.sleep(0.3)
+                continue
+            res = await self.client.place_aster_ioc(
+                symbol, aster_hedge_side, residual, touch, reduce_only=True)
+            if res.success and res.filled_qty > 0:
+                new_closed = pos.aster_hedged_qty + res.filled_qty
+                old = pos.aster_hedged_qty
+                a_avg = ((pos.aster_exit_price * old + res.fill_price * res.filled_qty)
+                         / new_closed) if new_closed > 0 else res.fill_price
+                self.pm.record_hl_maker_exit_progress(symbol, new_closed, a_avg)
+                self.pm.log_trade(pos.id, "aster", aster_hedge_side, "ioc_close",
+                                  res.order_id, res.filled_qty, res.fill_price,
+                                  notes="maker-exit residual close")
+            else:
+                log.warning(f"{symbol}: maker-exit Aster close attempt {attempt+1}/4 "
+                            f"no fill ({res.error}) — retrying")
+                await asyncio.sleep(0.3)
 
         final_qty = min(hl_closed, pos.aster_hedged_qty)
         naked = abs(hl_closed - pos.aster_hedged_qty)
