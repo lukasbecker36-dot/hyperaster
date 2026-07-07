@@ -702,6 +702,8 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     send_alert(f"/drip_exit {symbol}: {'OK' if ok else 'FAILED'} — {msg}")
                 elif action == "import":
                     await _handle_import(symbol or None)
+                elif action == "forget":
+                    await _handle_forget(symbol)
                 elif action == "balance":
                     await _handle_balance()
                 else:
@@ -744,6 +746,39 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
         if hl and aster:
             lines.append(f"Total ≈ ${hl['account_value'] + aster['balance']:.2f} (USDC+USDT)")
         send_alert("\n".join(lines))
+
+    async def _handle_forget(symbol: str):
+        """Drop a tracked position from the DB/memory WITHOUT placing any orders —
+        for a position already closed on the venue by hand, so /positions is out
+        of sync. Verifies BOTH venues are flat first; refuses otherwise so we
+        can never orphan a real (naked) leg."""
+        pos = pm.get(symbol)
+        if not pos:
+            send_alert(f"/forget {symbol}: no such tracked position")
+            return
+        try:
+            hlp = await client.get_hl_position(symbol)
+            szi = abs(float(hlp.get("szi", 0) or 0))
+        except Exception as e:
+            send_alert(f"/forget {symbol}: HL position check failed ({e}) — aborting, retry")
+            return
+        try:
+            ap = await client.get_aster_position(symbol)
+            amt = abs(float(ap.get("positionAmt", 0) or 0))
+        except Exception as e:
+            send_alert(f"/forget {symbol}: Aster position check failed ({e}) — aborting, retry")
+            return
+        # "Flat" = under 5% of the tracked qty remaining on each venue (dust-safe).
+        thresh = max(pos.qty * 0.05, 1e-9)
+        if szi >= thresh or amt >= thresh:
+            send_alert(
+                f"/forget {symbol}: REFUSED — venue still shows a position "
+                f"(HL szi={szi:.4f}, Aster amt={amt:.4f}; tracked qty={pos.qty:.4f}). "
+                f"Close it on the venue (or /close) first, then /forget."
+            )
+            return
+        pm.drop_entering(symbol, "manual_forget_venue_flat")
+        send_alert(f"/forget {symbol}: removed from tracking — both venues confirmed flat.")
 
     async def _handle_import(filter_symbol: str | None = None):
         """Scan both venues for offsetting positions and import them into the DB."""

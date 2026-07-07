@@ -1092,6 +1092,25 @@ def cmd_import(chat_id: str, arg: str):
         send(chat_id, "📩 scanning both venues for importable offsetting positions…")
 
 
+def cmd_forget(chat_id: str, arg: str):
+    """Remove a tracked position from /positions WITHOUT placing any orders —
+    for one you already closed on the venue by hand (DB out of sync). The
+    monitor verifies both venues are flat first and refuses otherwise, so it
+    can never orphan a real naked leg. Places NO orders (unlike /close)."""
+    symbol = arg.strip().upper().split()[0] if arg.strip() else ""
+    if not symbol:
+        send(chat_id, "Usage: /forget SYMBOL — drop a position already closed on "
+                      "the venue (verifies both venues are flat; places no orders).")
+        return
+    rc, active = run(["systemctl", "is-active", SERVICE], timeout=10)
+    if active.strip() != "active":
+        send(chat_id, f"⚠️ trader service is {active.strip()} — start it first (/start); "
+                      "the monitor must query the venues to confirm it's flat.")
+        return
+    _enqueue_manual({"action": "forget", "symbol": symbol})
+    send(chat_id, f"📩 /forget {symbol}: checking both venues are flat, then removing…")
+
+
 def cmd_funding(chat_id: str, arg: str):
     """Rank funding-carry opportunities across the equity universe.
 
@@ -1136,6 +1155,7 @@ def cmd_help(chat_id: str, _arg: str):
          "/drip SYM DIR NOTIONAL MIN_BPS BITE_QTY — taker-taker drip entry\n"
          "/drip_exit SYM MAX_BPS BITE_QTY [NOTIONAL] — drip exit (partial or full)\n"
          "/import [SYM] — adopt existing venue positions into the bot for management\n"
+         "/forget SYM — drop a position already closed on the venue (no orders; verifies flat)\n"
          "/autoentry on|off — toggle auto basis-arb entry (exits unaffected)\n"
          "/autoexit on|off — toggle auto convergence/target exit (/drip_exit unaffected)\n"
          "/notional [USD|reset] — set auto-entry size per leg (live, no restart)\n"
@@ -1161,6 +1181,7 @@ HANDLERS = {
     "/funding": cmd_funding, "/carry": cmd_funding,
     "/enter": cmd_enter, "/close": cmd_close, "/cancel": cmd_cancel,
     "/drip": cmd_drip, "/drip_exit": cmd_drip_exit, "/import": cmd_import,
+    "/forget": cmd_forget,
     "/autoentry": cmd_autoentry, "/autoexit": cmd_autoexit,
     "/notional": cmd_notional,
     "/log": cmd_log, "/logs": cmd_log,
@@ -1238,6 +1259,7 @@ def main():
             {"command": "drip", "description": "Taker-taker drip: SYM DIR NOTIONAL MIN_BPS BITE_QTY"},
             {"command": "drip_exit", "description": "Drip exit: SYM MAX_BPS BITE_QTY [NOTIONAL]"},
             {"command": "import", "description": "Adopt existing venue positions: [SYM]"},
+            {"command": "forget", "description": "Drop a position already closed on the venue: SYM"},
             {"command": "autoentry", "description": "Toggle auto basis-arb entry: on|off"},
             {"command": "autoexit", "description": "Toggle auto convergence/target exit: on|off"},
             {"command": "notional", "description": "Set auto-entry size per leg: USD|reset"},
