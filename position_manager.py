@@ -326,6 +326,19 @@ class PositionManager:
         if not pos:
             return
 
+        # A real hedged position always has an Aster fill price. Booking one with
+        # aster_entry_price=0 corrupts est_net and fires a bogus immediate exit
+        # (the ARM incident). If neither the passed nor the stored price is set,
+        # refuse to open — mark error so it's surfaced, not silently traded.
+        if final_qty > 0 and pos.scale_pre_qty <= 0 \
+                and aster_avg_price <= 0 and pos.aster_entry_price <= 0:
+            log.critical(
+                f"Position #{pos.id} {symbol}: cannot open — no Aster hedge price "
+                f"(qty={final_qty}). Marking error; CHECK VENUE for a naked leg."
+            )
+            self.mark_error(symbol, "open_no_aster_price")
+            return
+
         if pos.scale_pre_qty > 0:
             # Blend the increment into the existing position by notional weight.
             inc_qty = final_qty

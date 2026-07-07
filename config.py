@@ -186,6 +186,16 @@ MAKER_REPRICE_TICK_FRAC = 0.5         # reprice the HL maker if it drifts > this
 # unfilled remainder as a taker to complete the exit (we asked to get out).
 MAKER_EXIT_TIMEOUT_SEC = 300          # 5 min to fill the resting HL exit maker, else taker-complete
 
+# Maker→taker ENTRY escalation: when a convergence edge is so strong it clears
+# the (wider) taker gate, cross the unfilled HL remainder as a taker instead of
+# waiting on the resting maker. Disabled by default: it crosses additional HL
+# sized from a possibly-stale fill count, and a maker fill racing the cancel
+# double-filled HL in live (ARM: 0.06 intended → 0.12 executed, naked leg). The
+# resting maker + reprice still fills strong edges; this only trades a little
+# fill-rate for safety. If re-enabled, the cross now re-reads the true HL
+# position after cancelling so it can't double-fill.
+ENTRY_TAKER_ESCALATION_ENABLED = False
+
 # A manual /enter or /close can carry a basis target (bps) — the trade only
 # executes once the executable basis (from bid/ask, in the position's favour) is
 # at or better than the target, so you don't cross at a bad level. A gated entry

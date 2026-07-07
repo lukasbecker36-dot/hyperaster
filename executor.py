@@ -33,6 +33,7 @@ from config import (
     EXIT_TARGET_NET_USD, EXIT_TARGET_NET_USD_BY_SYMBOL,
     MAKER_ENTRY_TIMEOUT_SEC, MAKER_REPRICE_TICK_FRAC,
     LIQUIDITY_GUARD_ENABLED, MIN_TOB_NOTIONAL_USD, MAX_VENUE_SPREAD_BPS,
+    ENTRY_TAKER_ESCALATION_ENABLED,
     aster_symbol_for,
 )
 from auth import now_ms
@@ -1469,9 +1470,15 @@ class Executor:
                     f"{symbol}: Aster hedge reconciled "
                     f"{pos.aster_hedged_qty:.4f} -> {hedged_live:.4f} from live position"
                 )
+                # Take the price from the venue's position entry when the
+                # order-ack accumulator never recorded one — otherwise
+                # aster_entry_price stays 0, corrupting est_net and firing a
+                # bogus immediate exit (part of the ARM incident).
+                venue_px = float(ap.get("entryPrice", 0) or 0)
+                aster_px = venue_px if venue_px > 0 else (pos.aster_entry_price or 0.0)
                 self.pm.record_hl_maker_progress(
                     symbol, hl_filled, hedged_live,
-                    pos.hl_entry_price, pos.aster_entry_price or 0.0)
+                    pos.hl_entry_price, aster_px)
         except Exception as e:
             log.warning(f"{symbol}: Aster position reconcile failed ({e}) — using accumulator")
 
@@ -1629,7 +1636,8 @@ class Executor:
 
         # Edge so strong that even paying both taker spreads clears the gate →
         # stop waiting on the maker, cross both as taker now to guarantee the fill.
-        if excess >= threshold_taker:
+        # Disabled by default (see config): the cross could double-fill HL.
+        if ENTRY_TAKER_ESCALATION_ENABLED and excess >= threshold_taker:
             log.warning(
                 f"{symbol}: convergence excess {excess:.1f}bps ≥ taker gate "
                 f"{threshold_taker:.0f}bps — escalating maker→taker entry"
@@ -1655,6 +1663,21 @@ class Executor:
         symbol = pos.symbol
         if pos.hl_entry_order_id and pos.hl_entry_order_id != "PAPER":
             await self.client.cancel_hl_order(symbol, pos.hl_entry_order_id)
+            # The resting maker may have filled between the poll's szi snapshot
+            # and this cancel (or the cancel raced a fill). Re-read the TRUE HL
+            # position so we cross only the genuine remainder — crossing
+            # pos.qty − stale_filled double-fills HL (observed ARM: 0.06 → 0.12).
+            await asyncio.sleep(0.5)
+            try:
+                hlp = await self.client.get_hl_position(symbol)
+                signed_delta = float(hlp.get("szi", 0) or 0) - pos.hl_baseline_szi
+                true_filled = max(0.0, signed_delta if long_hl else -signed_delta)
+                if true_filled > hl_filled:
+                    log.warning(f"{symbol}: escalation re-read HL fill {hl_filled:.4f} → "
+                                f"{true_filled:.4f} (maker filled during cancel)")
+                    hl_filled = true_filled
+            except Exception as e:
+                log.warning(f"{symbol}: escalation szi re-read failed ({e}) — using poll value")
         remaining = self.client.snap_aster_qty(symbol, pos.qty - hl_filled)
         if remaining > 0:
             try:
