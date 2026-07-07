@@ -1004,6 +1004,18 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             if runtime_flags["auto_entry"] != prev_auto:
                 state = "ENABLED" if runtime_flags["auto_entry"] else "DISABLED"
                 log.warning(f"Auto-entry {state} (runtime flag changed)")
+            # Auto-entry off must also abort AUTO entries still in-flight (a
+            # resting maker not yet filled) — not just stop new ones — or a
+            # position keeps completing after you disabled it (ZM did). Manual
+            # /enter (funding holds) are left alone. The poll finalizes each
+            # aborted entry: nothing filled → dropped, partial → opened hedged.
+            if not runtime_flags["auto_entry"]:
+                for s, p in list(pm.positions.items()):
+                    if (p.status == "entering" and p.entry_maker_venue == "hl"
+                            and not p.hold_for_funding
+                            and s not in executor._abort_entering):
+                        executor._abort_entering.add(s)
+                        log.warning(f"{s}: auto-entry OFF — aborting in-flight auto entry")
             prev_auto_exit = runtime_flags["auto_exit"]
             runtime_flags["auto_exit"] = _auto_exit_enabled()
             if runtime_flags["auto_exit"] != prev_auto_exit:
@@ -1190,6 +1202,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 log.info(
                     f"HEARTBEAT | uptime={uptime:.0f}min | ticks={tick_count} | "
                     f"positions={pm.active_count}/{MAX_CONCURRENT_POSITIONS} | "
+                    f"cycles: {pm.session_cycles_ok} ok / {pm.session_cycles_error} error | "
                     f"threshold={ENTRY_THRESHOLD_BPS:.0f}bps\n"
                     + (("  Open positions:\n" + "\n".join(pos_lines) + "\n") if pos_lines else "  No open positions\n")
                     + "  Closest to entry:\n" + ("\n".join(watch_lines) if watch_lines else "  (no data yet)")

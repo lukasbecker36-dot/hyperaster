@@ -127,6 +127,9 @@ class PositionManager:
         self.paper_mode = paper_mode
         # symbol -> Position (only one per symbol at a time)
         self.positions: dict[str, Position] = {}
+        # Session cycle health (for the heartbeat): clean closes vs errors.
+        self.session_cycles_ok = 0
+        self.session_cycles_error = 0
         self._load_open_positions()
 
     def _load_open_positions(self):
@@ -797,6 +800,7 @@ class PositionManager:
             f"Position #{pos.id} CLOSED: {symbol} | {exit_reason} | "
             f"gross=${gross:.2f} fees=${fees:.2f} funding=${funding:.2f} net=${net:.2f}"
         )
+        self.session_cycles_ok += 1
         emoji = "🔴" if net < 0 else "✅"
         held_h = max(0.0, (pos.exit_time - pos.entry_time) / 3_600_000)
         self._trade_alert(
@@ -817,6 +821,7 @@ class PositionManager:
         )
         conn.commit()
         conn.close()
+        self.session_cycles_error += 1
         log.error(f"Position #{pos.id} ERROR: {symbol} | {reason}")
         self._trade_alert(f"⚠️ {symbol} → ERROR ({reason}) — removed from tracking, CHECK VENUE")
         del self.positions[symbol]
