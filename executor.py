@@ -2084,16 +2084,46 @@ class Executor:
         signed = (pos.hl_baseline_szi - current_szi) if closing_long else (current_szi - pos.hl_baseline_szi)
         hl_closed = max(0.0, signed)
 
+        target_qty = self._partial_closes.get(symbol, pos.qty)
+
+        # Reconcile the Aster close against the LIVE position — the exit IOC can
+        # fill asynchronously (POST returns filled_qty=0, then fills as taker) and
+        # once the leg is flat a reduce_only retry just rejects, so trusting only
+        # the order-ack accumulator loops forever (observed DELL: circuit breaker
+        # spamming while the venue was already closed). The venue is the truth.
+        try:
+            ap = await self.client.get_aster_position(symbol)
+            aster_amt = abs(float(ap.get("positionAmt", 0) or 0))
+            closed_live = min(max(0.0, pos.qty - aster_amt), target_qty)
+            if closed_live > pos.aster_hedged_qty + 1e-9:
+                px = pos.aster_exit_price if pos.aster_exit_price > 0 else 0.0
+                if px <= 0:
+                    try:
+                        ab = await self.client._get_aster_book(symbol)
+                        px = ab.bid if aster_hedge_side == "sell" else ab.ask
+                    except Exception:
+                        px = 0.0
+                log.warning(
+                    f"{symbol}: Aster exit reconciled {pos.aster_hedged_qty:.4f} -> "
+                    f"{closed_live:.4f} from live position"
+                )
+                self.pm.record_hl_maker_exit_progress(symbol, closed_live, px)
+        except Exception as e:
+            log.warning(f"{symbol}: Aster exit reconcile failed ({e}) — using accumulator")
+
         # Close any newly-filled HL qty on Aster with an IOC taker.
         new_fill = hl_closed - pos.aster_hedged_qty
         lot = self.client.snap_aster_qty(symbol, new_fill) if new_fill > 0 else 0.0
         if lot > 0:
             MAX_HEDGE_ATTEMPTS = 10
             if pos.aster_hedge_attempts >= MAX_HEDGE_ATTEMPTS:
+                # Terminal action (not a bare return that loops forever):
+                # reconcile both legs and finalize if flat, else mark error.
                 log.error(
                     f"{symbol}: Aster exit hedge circuit breaker tripped "
-                    f"({pos.aster_hedge_attempts} attempts) — CHECK MANUALLY"
+                    f"({pos.aster_hedge_attempts} attempts) — reconciling to finalize"
                 )
+                await self._force_finalize_maker_exit(symbol, closing_long)
                 return
 
             try:
@@ -2130,9 +2160,10 @@ class Executor:
                     log.error(f"{symbol}: Aster exit IOC failed ({res.error}) — will retry next tick")
                     return
 
-        # Fully closed and hedged → finalise.
-        target_qty = self._partial_closes.get(symbol, pos.qty)
-        if hl_closed >= target_qty * 0.999 and pos.aster_hedged_qty >= hl_closed * 0.999:
+        # Fully closed and hedged → finalise. Also finalise when the HL leg is
+        # done and the Aster leg is confirmed flat on the venue (reconcile above
+        # credited it) even if hl_closed slightly exceeds due to szi rounding.
+        if hl_closed >= target_qty * 0.999 and pos.aster_hedged_qty >= min(hl_closed, target_qty) * 0.999:
             if pos.hl_exit_order_id and pos.hl_exit_order_id != "PAPER":
                 await self.client.cancel_hl_order(symbol, pos.hl_exit_order_id)
             if symbol in self._partial_closes:
@@ -2154,6 +2185,45 @@ class Executor:
         # fill, so the recorded exit price stays clean.
         if hl_closed <= 0:
             await self._reprice_hl_maker_exit(pos, hl_side)
+
+    async def _force_finalize_maker_exit(self, symbol: str, closing_long: bool):
+        """Terminal action for a stuck maker exit (circuit breaker): read BOTH
+        legs from the venue. If both are flat, the close actually completed —
+        book it and finalize. Otherwise a real leg is still open → mark error so
+        it's surfaced, not looped on forever."""
+        pos = self.pm.get(symbol)
+        if not pos:
+            return
+        try:
+            hlp = await self.client.get_hl_position(symbol)
+            hl_amt = abs(float(hlp.get("szi", 0) or 0))
+        except Exception:
+            hl_amt = None
+        try:
+            ap = await self.client.get_aster_position(symbol)
+            aster_amt = abs(float(ap.get("positionAmt", 0) or 0))
+        except Exception:
+            aster_amt = None
+        dust = max(pos.qty * 0.05, 1e-9)
+        hl_flat = hl_amt is not None and hl_amt < dust
+        aster_flat = aster_amt is not None and aster_amt < dust
+        if hl_flat and aster_flat:
+            if pos.hl_exit_order_id and pos.hl_exit_order_id != "PAPER":
+                await self.client.cancel_hl_order(symbol, pos.hl_exit_order_id)
+            aster_px = pos.aster_exit_price if pos.aster_exit_price > 0 else pos.hl_exit_price
+            log.warning(f"{symbol}: stuck maker exit — both legs flat on venue, finalizing")
+            if symbol in self._partial_closes:
+                self._finalize_partial_close(symbol, pos.qty, pos.hl_exit_price, aster_px)
+            else:
+                self.pm.confirm_hl_maker_exit(
+                    symbol, pos.qty, pos.hl_exit_price, aster_px,
+                    (pos.exit_reason or "manual") + "_reconciled")
+        else:
+            log.critical(
+                f"{symbol}: stuck maker exit — venue NOT flat (HL={hl_amt}, Aster={aster_amt}), "
+                f"CHECK VENUE — marking error"
+            )
+            self.pm.mark_error(symbol, "maker_exit_stuck_leg")
 
     async def _check_taker_escalation(self, pos, closing_long, hl_side, aster_hedge_side):
         """If the taker-taker exit is net-positive after fees+b/o, escalate from
