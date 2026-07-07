@@ -120,6 +120,9 @@ _PENDING_GATES_FILE = os.path.join(DATA_DIR, "pending_gates.json")
 # Last-fetched exchange balances, written on the /balance request so the control
 # bot (which holds no API keys) can display them.
 _BALANCES_FILE = os.path.join(DATA_DIR, "balances.json")
+# Session health (cycle counts, auto-entry state) for /status — the control bot
+# is a separate process and can't read the trader's in-memory counters.
+_HEALTH_FILE = os.path.join(DATA_DIR, "bot_health.json")
 
 
 def _write_pending_gates(pending_entries: dict, pending_exits: dict,
@@ -1137,6 +1140,20 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             _write_latest_spreads(latest_spreads, latest_est_net)
             _write_pending_gates(pending_entries, pending_exits,
                                  executor._drips, executor._drip_exits)
+            try:
+                tmp = _HEALTH_FILE + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump({
+                        "cycles_ok": pm.session_cycles_ok,
+                        "cycles_error": pm.session_cycles_error,
+                        "auto_entry": runtime_flags["auto_entry"],
+                        "auto_exit": runtime_flags["auto_exit"],
+                        "uptime_min": round((now_ms() - start_time) / 60_000, 1),
+                        "_ts": time.time(),
+                    }, fh)
+                os.replace(tmp, _HEALTH_FILE)
+            except Exception:
+                pass
 
             # ── 4. Periodic tick log ──
             if tick_count % 20 == 0:

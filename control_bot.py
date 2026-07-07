@@ -231,11 +231,23 @@ def cmd_status(chat_id: str, _arg: str):
     spreads = _latest_spreads()
     notl, is_override = _current_auto_notional()
     notl_str = f"${notl:.0f}/leg" + (" (override)" if is_override else "")
+    # Session health (cycles + auto flags) published by the trader.
+    health_line = ""
+    try:
+        h = json.loads((BASE_DIR / "data" / "bot_health.json").read_text())
+        ae = "on" if h.get("auto_entry", True) else "OFF"
+        ax = "on" if h.get("auto_exit", True) else "OFF"
+        health_line = (f"cycles: {h.get('cycles_ok', 0)} ok / "
+                       f"{h.get('cycles_error', 0)} error  |  "
+                       f"auto-entry {ae} · auto-exit {ax}\n")
+    except Exception:
+        pass
     send(chat_id,
          f"🤖 {SERVICE}: {active.upper()} ({uptime})\n"
          f"mode: {mode}\n"
          f"open positions: {open_live} live / {open_paper} paper\n"
-         f"auto-entry size: {notl_str}\n\n"
+         f"auto-entry size: {notl_str}\n"
+         f"{health_line}\n"
          f"📈 spreads: {spreads}")
 
 
