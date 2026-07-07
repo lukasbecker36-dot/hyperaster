@@ -751,6 +751,23 @@ class PositionManager:
         pos = self.positions.get(symbol)
         if not pos:
             return
+        # Guard against a missing (0) exit price. A 0 makes that leg look like it
+        # gained the ENTIRE entry price — fake +$15/+$20 P&L (observed on a
+        # reconciled close where the HL fill price wasn't captured). Fall back to
+        # the entry price (0 P&L on that leg) so the recorded number is
+        # conservative/approximate, never fictitious.
+        if aster_exit_price <= 0:
+            log.critical(
+                f"{symbol}: exit booked with Aster price 0 — using entry price "
+                f"{pos.aster_entry_price:.2f}; P&L on that leg is approximate"
+            )
+            aster_exit_price = pos.aster_entry_price
+        if pos.hl_exit_price <= 0:
+            log.critical(
+                f"{symbol}: exit booked with HL price 0 — using entry price "
+                f"{pos.hl_entry_price:.2f}; P&L on that leg is approximate"
+            )
+            pos.hl_exit_price = pos.hl_entry_price
         pos.aster_exit_price = aster_exit_price
         pos.status = "closed"
 

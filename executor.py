@@ -2210,13 +2210,28 @@ class Executor:
         if hl_flat and aster_flat:
             if pos.hl_exit_order_id and pos.hl_exit_order_id != "PAPER":
                 await self.client.cancel_hl_order(symbol, pos.hl_exit_order_id)
-            aster_px = pos.aster_exit_price if pos.aster_exit_price > 0 else pos.hl_exit_price
-            log.warning(f"{symbol}: stuck maker exit — both legs flat on venue, finalizing")
+            # Estimate the exit fills from the current book (the fills already
+            # happened on the venue; pos.hl_exit_price may be 0/stale, which would
+            # book fake P&L). Close side: long_hl sells HL @ bid / buys Aster @ ask.
+            hl_px = pos.hl_exit_price
+            ast_px = pos.aster_exit_price
+            try:
+                ab, hb = await self.client.get_both_books(symbol)
+                hl_px = (hb.bid if closing_long else hb.ask) or hl_px
+                ast_px = (ab.ask if closing_long else ab.bid) or ast_px
+            except Exception:
+                pass
+            if hl_px <= 0:
+                hl_px = pos.hl_entry_price
+            if ast_px <= 0:
+                ast_px = pos.aster_entry_price
+            log.warning(f"{symbol}: stuck maker exit — both legs flat on venue, "
+                        f"finalizing @ HL {hl_px:.2f} / Ast {ast_px:.2f}")
             if symbol in self._partial_closes:
-                self._finalize_partial_close(symbol, pos.qty, pos.hl_exit_price, aster_px)
+                self._finalize_partial_close(symbol, pos.qty, hl_px, ast_px)
             else:
                 self.pm.confirm_hl_maker_exit(
-                    symbol, pos.qty, pos.hl_exit_price, aster_px,
+                    symbol, pos.qty, hl_px, ast_px,
                     (pos.exit_reason or "manual") + "_reconciled")
         else:
             log.critical(
