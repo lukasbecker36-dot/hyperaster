@@ -17,9 +17,20 @@ from auth import now_ms
 from database import get_connection
 from config import (
     ASTER_MAKER_FEE, ASTER_TAKER_FEE, HL_MAKER_FEE, HL_TAKER_FEE,
+    TRADE_ALERTS_ENABLED,
 )
 
+try:
+    from notify import send_alert
+except Exception:  # notify is optional (e.g. isolated tests)
+    def send_alert(_text: str):
+        pass
+
 log = logging.getLogger(__name__)
+
+
+def _dir_short(direction: str) -> str:
+    return "HL↑ Ast↓" if "long_hl" in (direction or "") else "HL↓ Ast↑"
 
 
 def estimate_funding_pnl(
@@ -166,6 +177,11 @@ class PositionManager:
             log.warning(
                 f"Crash recovery: {p.symbol} position #{p.id} status={p.status}"
             )
+
+    def _trade_alert(self, text: str):
+        """Telegram notification for a LIVE open/close. Paper is silent."""
+        if TRADE_ALERTS_ENABLED and not self.paper_mode:
+            send_alert(text)
 
     @property
     def active_count(self) -> int:
@@ -371,6 +387,11 @@ class PositionManager:
             f"Position #{pos.id} OPEN (HL maker): {symbol} | qty={final_qty} | "
             f"HL @ {pos.hl_entry_price:.2f} | Aster @ {pos.aster_entry_price:.2f}"
         )
+        self._trade_alert(
+            f"🟢 ENTERED {symbol} {_dir_short(pos.direction)} | qty={final_qty} "
+            f"${pos.notional_usd:.0f} | HL @ {pos.hl_entry_price:.2f} "
+            f"Ast @ {pos.aster_entry_price:.2f}"
+        )
 
     def start_scale_in(
         self, *, symbol: str, hl_maker_order_id: str, increment_qty: float,
@@ -574,6 +595,11 @@ class PositionManager:
             f"Position #{pos.id} OPEN: {symbol} | "
             f"HL @ {pos.hl_entry_price:.2f} | Aster @ {aster_fill_price:.2f}"
         )
+        self._trade_alert(
+            f"🟢 ENTERED {symbol} {_dir_short(pos.direction)} | qty={pos.qty} "
+            f"${pos.notional_usd:.0f} | HL @ {pos.hl_entry_price:.2f} "
+            f"Ast @ {aster_fill_price:.2f}"
+        )
 
     def confirm_aster_entry_partial(
         self, symbol: str, aster_fill_price: float, matched_qty: float
@@ -597,6 +623,11 @@ class PositionManager:
         log.warning(
             f"Position #{pos.id} OPEN (partial): {symbol} | qty shrunk to {matched_qty} | "
             f"HL @ {pos.hl_entry_price:.2f} | Aster @ {aster_fill_price:.2f}"
+        )
+        self._trade_alert(
+            f"🟢 ENTERED {symbol} {_dir_short(pos.direction)} (partial) | qty={matched_qty} "
+            f"${pos.notional_usd:.0f} | HL @ {pos.hl_entry_price:.2f} "
+            f"Ast @ {aster_fill_price:.2f}"
         )
 
     def start_exiting_hl_maker(
@@ -753,6 +784,13 @@ class PositionManager:
             f"Position #{pos.id} CLOSED: {symbol} | {exit_reason} | "
             f"gross=${gross:.2f} fees=${fees:.2f} funding=${funding:.2f} net=${net:.2f}"
         )
+        emoji = "🔴" if net < 0 else "✅"
+        held_h = max(0.0, (pos.exit_time - pos.entry_time) / 3_600_000)
+        self._trade_alert(
+            f"{emoji} CLOSED {symbol} {_dir_short(pos.direction)} ({exit_reason}) | "
+            f"net=${net:+.2f} (gross ${gross:+.2f}, fees ${fees:.2f}, funding ${funding:+.2f}) | "
+            f"held {held_h:.1f}h"
+        )
         del self.positions[symbol]
 
     def mark_error(self, symbol: str, reason: str):
@@ -767,6 +805,7 @@ class PositionManager:
         conn.commit()
         conn.close()
         log.error(f"Position #{pos.id} ERROR: {symbol} | {reason}")
+        self._trade_alert(f"⚠️ {symbol} → ERROR ({reason}) — removed from tracking, CHECK VENUE")
         del self.positions[symbol]
 
     def drop_entering(self, symbol: str, reason: str = "maker_entry_unfilled"):

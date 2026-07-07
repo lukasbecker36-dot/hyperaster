@@ -209,6 +209,9 @@ PAPER_MODE = True                # set False for live execution
 
 # ── Alerting ──
 HEARTBEAT_INTERVAL_MINUTES = 60
+# Send a Telegram message when a LIVE position opens or closes. Paper trades
+# never alert (they'd be far too noisy). Set False to silence.
+TRADE_ALERTS_ENABLED = True
 
 # ── Per-symbol entry thresholds (bps) ──
 # Derived from p75 of historical cross-exchange spread, rounded to nearest 5bps.
