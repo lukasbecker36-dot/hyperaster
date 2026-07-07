@@ -39,7 +39,7 @@ from config import (
     BLOCKED_SYMBOLS, NON_EQUITY_SYMBOLS, ENTRY_CONFIRM_TICKS, ADVERSE_STOP_BPS,
     ROUND_TRIP_FEE, CARRY_ROUND_TRIP_FEE, NOTIONAL_PER_LEG, EXIT_TARGET_NET_USD,
     EXIT_TARGET_NET_USD_BY_SYMBOL, MAX_FUNDING_DRAG_USD,
-    FUNDING_ADVERSE_STOP_USD,
+    FUNDING_ADVERSE_STOP_USD, BASIS_ADVERSE_STOP_USD,
     MANUAL_ENTRY_GATE_TIMEOUT_MIN, aster_symbol_for, ASTER_BASE_TO_CANON,
 )
 
@@ -484,6 +484,18 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                         should_exit, reason = True, "funding_stop"
                     # No timeout — funding-carry trades are held indefinitely
                     # (only the adverse stop closes them automatically).
+                elif BASIS_ADVERSE_STOP_USD > 0 and est_net <= -(BASIS_ADVERSE_STOP_USD * size_frac):
+                    # Mark-to-market stop: the ADVERSE_STOP_BPS guard only fires
+                    # when the excess INVERTS, so a position that just diverges or
+                    # never converges would otherwise bleed to the 12h timeout
+                    # (RKLB −$15.68, STRC −$12.62). Cap that at a dollar loss,
+                    # scaled to the position's size.
+                    log.warning(
+                        f"BASIS-STOP {symbol}: est_net=${est_net:.2f} <= "
+                        f"-${BASIS_ADVERSE_STOP_USD * size_frac:.2f} — bailing | "
+                        f"held={elapsed_hours:.1f}h"
+                    )
+                    should_exit, reason = True, "stop_loss"
                 elif est_net >= sym_target:
                     should_exit, reason = True, "target"
                 elif symbol in BLOCKED_SYMBOLS:

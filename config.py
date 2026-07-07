@@ -103,6 +103,26 @@ ORACLE_STALE_MINUTES = 15
 # prior mid-spread deviation (no regression at cold start).
 EXECUTABLE_SIGNAL_ENABLED = True
 
+# ── Thin-book liquidity guard ──
+# Skip AUTO entries on names whose books are too thin/unstable to trade — the
+# class of junk (e.g. ZHIPU) that produces wild tick-to-tick prices, big
+# divergence losses, and unexecutable paper P&L. Two checks, both venues:
+#   - top-of-book notional (size×price on the thinner side) must clear the floor
+#   - each venue's own bid-ask spread must be under the cap
+# 0 disables a check. Manual /enter and /drip are NOT gated (deliberate).
+LIQUIDITY_GUARD_ENABLED = True
+MIN_TOB_NOTIONAL_USD = 150.0     # min top-of-book depth on the thinner side, each venue
+MAX_VENUE_SPREAD_BPS = 150.0     # reject if either venue's own spread exceeds this
+
+# ── Convergence stop-loss ──
+# Basis (non-funding-hold) positions had no mark-to-market stop: the adverse
+# stop only fires if the excess INVERTS, so a position that just diverges or
+# fails to converge bled to the 12h timeout (observed RKLB −$15.68, STRC
+# −$12.62). Close a basis position when its executable mark-to-market loss
+# (est_net) reaches this. Scales with the position's notional (like the profit
+# target), so small test sizes stop proportionally. 0 disables.
+BASIS_ADVERSE_STOP_USD = 10.0
+
 # ── Strategy parameters ──
 # Spread in bps above which we enter.  Round-trip cost ~9-14bps so 30bps = ~2x cushion.
 ENTRY_THRESHOLD_BPS = 30.0
@@ -271,6 +291,9 @@ BLOCKED_SYMBOLS: set = {
     "NFLX", "RIVN", "LITE", "HYUNDAI", "NOW", "TSM", "HOOD", "HIMS",
     # New listings with no data, unusable spreads, or no liquidity
     "GME", "EBAY", "COST", "BE", "NOK", "MINIMAX", "SPCX",
+    # Thin/unstable book: wild tick-to-tick prices, big divergence losses,
+    # extreme volatile funding (observed −$13.84 funding_drag). See liquidity guard.
+    "ZHIPU",
 }
 
 # ── Backward-compat aliases (fetch_data.py / live_scan.py) ──

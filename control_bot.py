@@ -653,7 +653,7 @@ def cmd_trades(chat_id: str, arg: str):
             "hl_entry_price, hl_exit_price, aster_entry_price, aster_exit_price, "
             "qty, notional_usd, gross_pnl, fee_cost, "
             "COALESCE(funding_pnl,0), net_pnl, exit_reason, "
-            "entry_time, exit_time, paper "
+            "entry_time, exit_time, paper, COALESCE(entry_baseline_bps,0) "
             "FROM positions WHERE status='closed' "
             "ORDER BY exit_time DESC LIMIT ?",
             (n,),
@@ -666,13 +666,21 @@ def cmd_trades(chat_id: str, arg: str):
         return
     lines = [f"📋 Last {len(rows)} trade(s):"]
     for (sym, direction, entry_sp, exit_sp, hl_in, hl_out, ast_in, ast_out,
-         qty, notional, gross, fees, funding, net, reason, etime, xtime, paper) in rows:
+         qty, notional, gross, fees, funding, net, reason, etime, xtime, paper,
+         entry_base) in rows:
         tag = " [paper]" if paper else ""
         held_h = ((xtime or 0) - (etime or 0)) / 3_600_000
-        short_dir = "HL↑ Ast↓" if "long_hl" in (direction or "") else "HL↓ Ast↑"
+        long_hl = "long_hl" in (direction or "")
+        short_dir = "HL↑ Ast↓" if long_hl else "HL↓ Ast↑"
+        # entry_spread_bps stored the ENTRY EXCESS (deviation vs baseline); the
+        # exit stored the RAW mid spread. Convert the exit to the position's own
+        # EXCESS too (raw − entry baseline, oriented) so both numbers are the
+        # same metric — convergence reads as excess falling toward/below 0.
+        raw_exit_excess = (exit_sp or 0) - (entry_base or 0)
+        exit_excess = raw_exit_excess if long_hl else -raw_exit_excess
         lines.append(
             f"\n• {sym}{tag} {short_dir} — {reason}\n"
-            f"  entry spread={entry_sp or 0:.1f}bps → exit={exit_sp or 0:.1f}bps\n"
+            f"  entry excess={entry_sp or 0:.1f}bps → exit excess={exit_excess:.1f}bps\n"
             f"  HL: {hl_in:.2f}→{hl_out:.2f}  Ast: {ast_in:.2f}→{ast_out:.2f}\n"
             f"  qty={qty}  notional=${notional or 0:.0f}\n"
             f"  gross=${gross:.4f}  fees=${fees:.4f}  funding=${funding:+.4f}\n"

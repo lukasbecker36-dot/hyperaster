@@ -32,6 +32,7 @@ from config import (
     ENTRY_CONFIRM_TICKS, ENTRY_COST_MARGIN_BPS, ROUND_TRIP_FEE, CARRY_ROUND_TRIP_FEE,
     EXIT_TARGET_NET_USD, EXIT_TARGET_NET_USD_BY_SYMBOL,
     MAKER_ENTRY_TIMEOUT_SEC, MAKER_REPRICE_TICK_FRAC,
+    LIQUIDITY_GUARD_ENABLED, MIN_TOB_NOTIONAL_USD, MAX_VENUE_SPREAD_BPS,
     aster_symbol_for,
 )
 from auth import now_ms
@@ -103,6 +104,11 @@ class Executor:
             return False
         # Clear warn flag once prices re-align (market opens)
         self._price_mismatch_warned.discard(symbol)
+
+        # Thin-book liquidity guard: skip names too thin/unstable to trade.
+        if not self._book_liquid_enough(symbol, aster_book, hl_book, mid):
+            self._entry_streak.pop(symbol, None)
+            return False
 
         # Entry signal = deviation of the book mid-spread from its own rolling
         # median. We trade the books, so we baseline against the books (not the
@@ -283,6 +289,37 @@ class Executor:
         )
         self._entry_streak.pop(symbol, None)
         log.info(f"{symbol}: convergence maker resting {alo.order_id} @ {hl_ref:.2f} — hedging on fill")
+        return True
+
+    def _book_liquid_enough(self, symbol, aster_book, hl_book, mid) -> bool:
+        """Reject entry when either venue's book is too thin or too wide — the
+        thin/unstable-book class (e.g. ZHIPU) that produces wild tick-to-tick
+        prices and big divergence losses. Checks top-of-book notional on the
+        thinner side and each venue's own spread. Only gates AUTO entries."""
+        if not LIQUIDITY_GUARD_ENABLED or mid <= 0:
+            return True
+        # Top-of-book notional on the thinner side of each venue.
+        if MIN_TOB_NOTIONAL_USD > 0:
+            a_depth = min(aster_book.bid_size, aster_book.ask_size) * aster_book.mid
+            h_depth = min(hl_book.bid_size, hl_book.ask_size) * hl_book.mid
+            # Only enforce where we actually have size data (>0); a zero could be
+            # a missing field rather than a genuinely empty level.
+            if 0 < a_depth < MIN_TOB_NOTIONAL_USD or 0 < h_depth < MIN_TOB_NOTIONAL_USD:
+                log.debug(
+                    f"{symbol}: thin book — top-of-book Aster ${a_depth:.0f} / HL ${h_depth:.0f} "
+                    f"< ${MIN_TOB_NOTIONAL_USD:.0f} floor, skipping"
+                )
+                return False
+        # Each venue's own bid-ask spread.
+        if MAX_VENUE_SPREAD_BPS > 0:
+            a_spread = (aster_book.ask - aster_book.bid) / mid * 10000
+            h_spread = (hl_book.ask - hl_book.bid) / mid * 10000
+            if a_spread > MAX_VENUE_SPREAD_BPS or h_spread > MAX_VENUE_SPREAD_BPS:
+                log.debug(
+                    f"{symbol}: wide book — Aster {a_spread:.0f}bps / HL {h_spread:.0f}bps "
+                    f"> {MAX_VENUE_SPREAD_BPS:.0f}bps cap, skipping"
+                )
+                return False
         return True
 
     def _entry_cost_floors(self, mid, aster_book, hl_book) -> tuple[float, float]:
