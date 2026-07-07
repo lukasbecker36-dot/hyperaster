@@ -314,6 +314,10 @@ BLOCKED_SYMBOLS: set = {
     # Thin/unstable book: wild tick-to-tick prices, big divergence losses,
     # extreme volatile funding (observed −$13.84 funding_drag). See liquidity guard.
     "ZHIPU",
+    # Phantom Aster book: IOCs return status=NEW / filled 0 every time (no real
+    # takeable depth), so the taker hedge/close can't fill — strands exits and
+    # leaves naked legs. Untradeable with the maker-first flow.
+    "SNDK",
 }
 
 # ── Backward-compat aliases (fetch_data.py / live_scan.py) ──
