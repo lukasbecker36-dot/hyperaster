@@ -111,7 +111,7 @@ EXECUTABLE_SIGNAL_ENABLED = True
 #   - each venue's own bid-ask spread must be under the cap
 # 0 disables a check. Manual /enter and /drip are NOT gated (deliberate).
 LIQUIDITY_GUARD_ENABLED = True
-MIN_TOB_NOTIONAL_USD = 150.0     # min top-of-book depth on the thinner side, each venue
+MIN_TOB_NOTIONAL_USD = 20.0      # min top-of-book depth on the thinner side, each venue
 MAX_VENUE_SPREAD_BPS = 150.0     # reject if either venue's own spread exceeds this
 
 # ── Convergence stop-loss ──
