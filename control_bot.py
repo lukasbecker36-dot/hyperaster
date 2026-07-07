@@ -304,7 +304,7 @@ def cmd_positions(chat_id: str, _arg: str):
     try:
         from config import (
             ROUND_TRIP_FEE, CARRY_ROUND_TRIP_FEE,
-            EXIT_TARGET_NET_USD, EXIT_TARGET_NET_USD_BY_SYMBOL,
+            EXIT_TARGET_NET_USD, EXIT_TARGET_NET_USD_BY_SYMBOL, NOTIONAL_PER_LEG,
         )
         from position_manager import estimate_funding_pnl
     except Exception:
@@ -353,7 +353,10 @@ def cmd_positions(chat_id: str, _arg: str):
             hl_fr or 0, ast_fr or 0,
         )
         short_dir = "HL↑ Ast↓" if "long_hl" in (direction or "") else "HL↓ Ast↑"
-        sym_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(sym, EXIT_TARGET_NET_USD)
+        # Profit target scales with the position's notional, matching the trader's
+        # exit logic — a fixed $3 on a $20 test position would be ~1500bps.
+        base_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(sym, EXIT_TARGET_NET_USD)
+        sym_target = base_target * ((notional / NOTIONAL_PER_LEG) if notional else 1.0)
 
         # Current MID excess vs the ENTRY baseline — an approximation of the
         # convergence proximity. The live exit also folds in the oracle
