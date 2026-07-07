@@ -964,14 +964,23 @@ class ExchangeClient:
                 filled_qty = float(data.get("executedQty", 0) or 0)
                 fill_price = float(data.get("avgPrice", 0) or 0)
                 order_status = data.get("status", "")
+                # Aster matches IOC orders asynchronously — the POST response
+                # usually returns status=NEW with executedQty=0 BEFORE the match
+                # runs, then the marketable order fills a moment later. Reading
+                # the immediate ack as "no fill" is the bug that stranded exits
+                # and left naked legs (SNDK). Poll the order once to capture the
+                # real fill; a genuine miss still comes back 0 (EXPIRED/CANCELED).
+                if filled_qty <= 0 and order_status not in (
+                        "FILLED", "EXPIRED", "CANCELED", "CANCELLED", "REJECTED"):
+                    await asyncio.sleep(0.5)
+                    q = await self.query_aster_order(symbol, oid)
+                    filled_qty = float(q.get("executedQty", filled_qty) or filled_qty)
+                    fill_price = float(q.get("avgPrice", 0) or 0) or fill_price
+                    order_status = q.get("status", order_status)
                 log.info(
                     f"Aster IOC: {side.upper()} {qty} {aster_sym} @ {limit_px} -> "
                     f"filled {filled_qty} @ {fill_price} (oid {oid}, status={order_status})"
                 )
-                # Aster matches IOC orders asynchronously — the POST response
-                # often returns status=NEW with executedQty=0, then the order
-                # fills as a taker microseconds later. Do NOT cancel here; the
-                # caller reconciles from the actual position delta.
                 return OrderResult(
                     success=filled_qty > 0, order_id=oid,
                     filled_qty=filled_qty, fill_price=fill_price or limit_px,
