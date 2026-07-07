@@ -93,37 +93,25 @@ async def run(symbol: str, levels: int) -> str:
     hl_mid_usdt = hl_mid * usdc
     ref = (hl_mid_usdt + ast_mid) / 2
 
-    def col(rows, n):
-        # pad/truncate to n rows of "px×size"
-        out = []
-        for i in range(n):
-            if i < len(rows):
-                px, sz = rows[i]
-                out.append(f"{float(px):>10.3f} × {float(sz):<7.3f}")
-            else:
-                out.append(" " * 20)
+    n = levels
+
+    def venue_block(title, asks, bids):
+        # Stacked (not side-by-side) so nothing wraps on a phone. asks high→low
+        # (best ask just above the mid line), bids high→low (best bid just below).
+        out = [title, "  asks ↑"]
+        for px, sz in reversed(asks[:n]):
+            out.append(f"   {float(px):>9.2f}  × {float(sz):.3f}")
+        out.append("  ── mid ──")
+        for px, sz in bids[:n]:
+            out.append(f"   {float(px):>9.2f}  × {float(sz):.3f}")
+        out.append("  bids ↓")
         return out
 
-    n = levels
-    # asks shown high→low (top of stack = best ask nearest mid at the bottom)
-    hl_ask_col = col(list(reversed(hl_a[:n])), n)
-    ast_ask_col = col(list(reversed(ast_a[:n])), n)
-    hl_bid_col = col(hl_b[:n], n)
-    ast_bid_col = col(ast_b[:n], n)
-
-    lines = [
-        f"📕 {canon} order book (top {n})",
-        f"{'HYPERLIQUID (USDC)':<24} | {'ASTER (USDT)':<24}",
-        "─" * 51,
-        "asks ↑",
-    ]
-    for h, a in zip(hl_ask_col, ast_ask_col):
-        lines.append(f"{h:<24} | {a:<24}")
-    lines.append("─" * 51)
-    for h, a in zip(hl_bid_col, ast_bid_col):
-        lines.append(f"{h:<24} | {a:<24}")
-    lines.append("bids ↓")
-    lines.append("─" * 51)
+    lines = [f"📕 {canon} order book (top {n})", ""]
+    lines += venue_block("HYPERLIQUID (USDC)", hl_a, hl_b)
+    lines.append("")
+    lines += venue_block("ASTER (USDT)", ast_a, ast_b)
+    lines.append("")
 
     # Two basis views: HL-maker/Aster-taker (passive, what you'd rest at) and
     # taker-taker (aggressive, both legs cross immediately).
@@ -137,13 +125,12 @@ async def run(symbol: str, levels: int) -> str:
     tk_buy_ast = (hl_bid_usdt - ast_ask) / ref * 10000
 
     lines += [
-        f"mid: HL {float(hl_mid):.3f} (≈{float(hl_mid_usdt):.3f} USDT)  "
-        f"Ast {float(ast_mid):.3f}",
-        f"spread: HL {float(_spread_bps(hl_bid, hl_ask)):.0f}bp  "
-        f"Ast {float(_spread_bps(ast_bid, ast_ask)):.0f}bp  "
+        f"mid    HL {float(hl_mid):.2f}   Ast {float(ast_mid):.2f}",
+        f"spread HL {float(_spread_bps(hl_bid, hl_ask)):.0f}bp  Ast {float(_spread_bps(ast_bid, ast_ask)):.0f}bp",
         f"USDC/USDT {float(usdc):.4f}",
-        f"maker-taker: L-HL {float(mk_buy_hl):+.0f}bp | L-AST {float(mk_buy_ast):+.0f}bp",
-        f"taker-taker: L-HL {float(tk_buy_hl):+.0f}bp | L-AST {float(tk_buy_ast):+.0f}bp",
+        "basis (L-HL / L-AST):",
+        f"  maker-taker  {float(mk_buy_hl):+.0f} / {float(mk_buy_ast):+.0f} bp",
+        f"  taker-taker  {float(tk_buy_hl):+.0f} / {float(tk_buy_ast):+.0f} bp",
     ]
     return "\n".join(lines)
 
