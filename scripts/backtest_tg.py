@@ -125,12 +125,26 @@ def _backtest_one(spreads: list[tuple[int, float]], symbol: str) -> dict | None:
     }
 
 
-async def _fetch_spreads(session, symbol, start_ms, end_ms) -> list[tuple[int, float]]:
+def _pick_interval(hours: int) -> str:
+    """Choose the finest candle interval whose count fits one API call (~1500
+    cap on Aster klines), so both venues return the SAME aligned recent window.
+    A 168h @ 1m request would blow the cap and misalign → no overlapping data."""
+    mins = hours * 60
+    if mins <= 1450:            # ~24h at 1m (Aster kline cap ~1500)
+        return "1m"
+    if mins // 5 <= 1450:       # ~120h at 5m
+        return "5m"
+    if mins // 15 <= 1450:      # ~360h at 15m
+        return "15m"
+    return "1h"
+
+
+async def _fetch_spreads(session, symbol, start_ms, end_ms, interval) -> list[tuple[int, float]]:
     hl_coin = f"xyz:{symbol}"
     ast_sym = aster_symbol_for(symbol)
     hl_d, ast_d = await asyncio.gather(
-        history.hl_candles(session, hl_coin, start_ms, end_ms, interval="1m"),
-        history.aster_candles(session, ast_sym, start_ms, end_ms, interval="1m"),
+        history.hl_candles(session, hl_coin, start_ms, end_ms, interval=interval),
+        history.aster_candles(session, ast_sym, start_ms, end_ms, interval=interval),
     )
     if not hl_d or not ast_d:
         return []
@@ -149,8 +163,10 @@ async def run(hours: int, symbol: str | None, top: int) -> str:
         return "📊 Backtest: no universe (run fetch_data.py) or symbol given."
     end_ms = int(__import__("time").time() * 1000)
     start_ms = end_ms - hours * 3_600_000
+    interval = _pick_interval(hours)
     timeout = aiohttp.ClientTimeout(total=120)
     results = []
+    with_data = 0
     async with aiohttp.ClientSession(timeout=timeout) as session:
         # small concurrency so we don't hammer the venues
         sem = asyncio.Semaphore(6)
@@ -158,21 +174,27 @@ async def run(hours: int, symbol: str | None, top: int) -> str:
         async def one(s):
             async with sem:
                 try:
-                    sp = await _fetch_spreads(session, s, start_ms, end_ms)
+                    sp = await _fetch_spreads(session, s, start_ms, end_ms, interval)
                 except Exception:
-                    return None
-                return _backtest_one(sp, s)
+                    return None, 0
+                return _backtest_one(sp, s), len(sp)
 
-        for r in await asyncio.gather(*[one(s) for s in syms]):
+        for r, nsp in await asyncio.gather(*[one(s) for s in syms]):
+            if nsp > 0:
+                with_data += 1
             if r:
                 results.append(r)
     if not results:
-        return f"📊 Backtest ({hours}h): no qualifying trades on any name."
+        if with_data == 0:
+            return (f"📊 Backtest ({hours}h, {interval}): no candle data returned for "
+                    f"{len(syms)} name(s). Try a shorter window.")
+        return (f"📊 Backtest ({hours}h, {interval}): {with_data}/{len(syms)} names had "
+                f"data but none produced a qualifying trade (spread never cleared threshold).")
 
     results.sort(key=lambda r: r["total_usd"], reverse=True)
     shown = results[:top]
     lines = [
-        f"📊 Backtest {hours}h · ${NOTIONAL_PER_LEG:.0f}/leg · fee {FEE_BPS:.1f}bp",
+        f"📊 Backtest {hours}h · {interval} · ${NOTIONAL_PER_LEG:.0f}/leg · fee {FEE_BPS:.1f}bp",
         f"{'SYM':<7}{'n':>3} {'win%':>4} {'net$':>7} {'bp/t':>6}",
     ]
     for r in shown:
