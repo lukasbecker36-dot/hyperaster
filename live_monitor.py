@@ -289,13 +289,16 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             log.error(f"Cannot start live: {e}")
             return
 
-    # Include symbols with open positions even if blocked (need specs for exit)
+    # Load specs for EVERY open position, even ones outside the startup universe
+    # (blocked names, or auto-discovered symbols not yet in overlap_symbols.csv).
+    # Without this, an open position on such a symbol can't be exited — the HL
+    # asset index is never loaded (observed: DKNG "HL asset index not found").
     pm_preload = PositionManager(paper_mode=paper_mode)
     open_pos_syms = set(pm_preload.positions.keys())
-    blocked_with_positions = open_pos_syms & exclude
-    if blocked_with_positions:
-        log.info(f"Blocked symbols with open positions (will scan for exit): {blocked_with_positions}")
-    all_load_syms = list(dict.fromkeys(symbols + list(blocked_with_positions)))
+    extra_pos_syms = open_pos_syms - set(symbols)
+    if extra_pos_syms:
+        log.info(f"Open positions outside startup universe (loading specs for exit): {extra_pos_syms}")
+    all_load_syms = list(dict.fromkeys(symbols + list(open_pos_syms)))
 
     client = ExchangeClient(api_keys)
     await client.start(all_load_syms)
@@ -988,6 +991,28 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             except Exception as e:
                 log.warning(f"Auto-discovery: failed to add {sym} ({e})")
         if added:
+            # Persist to overlap_symbols.csv so the names survive a restart —
+            # otherwise every restart re-discovers and RE-ANNOUNCES them (and an
+            # open position on one can't be exited, its specs unloaded). Append
+            # only genuinely-new rows.
+            try:
+                import csv as _csv
+                overlap_path = Path(OUTPUT_DIR) / "overlap_symbols.csv"
+                existing = set()
+                if overlap_path.exists():
+                    with open(overlap_path) as fh:
+                        existing = {r["coin"] for r in _csv.DictReader(fh)}
+                to_write = [s for s in added if s not in existing]
+                if to_write:
+                    new_file = not overlap_path.exists()
+                    with open(overlap_path, "a", newline="") as fh:
+                        w = _csv.writer(fh)
+                        if new_file:
+                            w.writerow(["coin", "hl_coin", "aster_symbol"])
+                        for s in to_write:
+                            w.writerow([s, f"xyz:{s}", aster_symbol_for(s)])
+            except Exception as e:
+                log.warning(f"Auto-discovery: failed to persist {added} to CSV ({e})")
             log.info(f"Auto-discovery: added {added} to live universe ({len(symbols)} total)")
             send_alert(
                 f"🆕 Auto-added {len(added)} new equity perp(s) now on both venues: "
