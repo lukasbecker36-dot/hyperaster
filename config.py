@@ -120,6 +120,14 @@ MAX_VENUE_SPREAD_BPS = 150.0     # reject if either venue's own spread exceeds t
 # row, held 0.0h each). 0 disables.
 STOP_COOLDOWN_MINUTES = 30
 
+# Only AUTO-enter names that have a calibrated per-symbol threshold (i.e. a key
+# in ENTRY_THRESHOLD_BPS_BY_SYMBOL). Auto-discovered names are still watched and
+# shown, but don't trade real money until you've vetted them (run /backtest, and
+# if it holds up under taker-taker cost, add the name to the threshold table).
+# This is why the auto-added names (QCOM 15% win, STRC 5%) were bleeding: they
+# traded at the default 30bps before anyone checked whether they mean-revert.
+AUTO_TRADE_ONLY_CALIBRATED = True
+
 # ── Convergence stop-loss ──
 # Basis (non-funding-hold) positions had no mark-to-market stop: the adverse
 # stop only fires if the excess INVERTS, so a position that just diverges or

@@ -34,6 +34,7 @@ from config import (
     MAKER_ENTRY_TIMEOUT_SEC, MAKER_REPRICE_TICK_FRAC,
     LIQUIDITY_GUARD_ENABLED, MIN_TOB_NOTIONAL_USD, MAX_VENUE_SPREAD_BPS,
     ENTRY_TAKER_ESCALATION_ENABLED, STOP_COOLDOWN_MINUTES,
+    AUTO_TRADE_ONLY_CALIBRATED,
     aster_symbol_for,
 )
 from auth import now_ms
@@ -82,6 +83,13 @@ class Executor:
         Returns True if entry orders were placed.
         """
         if symbol in BLOCKED_SYMBOLS:
+            return False
+
+        # Only auto-trade calibrated names. Auto-discovered names are watched but
+        # not traded until vetted (added to ENTRY_THRESHOLD_BPS_BY_SYMBOL) — the
+        # uncalibrated auto-adds (QCOM/STRC/…) were the money-losers.
+        if AUTO_TRADE_ONLY_CALIBRATED and symbol not in ENTRY_THRESHOLD_BPS_BY_SYMBOL:
+            self._entry_streak.pop(symbol, None)
             return False
 
         if self.pm.has_position(symbol):
