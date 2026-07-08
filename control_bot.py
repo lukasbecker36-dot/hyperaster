@@ -1140,6 +1140,32 @@ def cmd_funding(chat_id: str, arg: str):
     send(chat_id, out or f"(no output, exit {code})")
 
 
+def cmd_backtest(chat_id: str, arg: str):
+    """Backtest the convergence strategy on recent 1m candles.
+
+    Shells out to scripts/backtest_tg.py (venv + live API egress). Args are
+    order-independent: a number = hours (default 48), a word = one symbol.
+      /backtest            — whole universe, 48h
+      /backtest 72         — whole universe, 72h
+      /backtest SNDK       — just SNDK, 48h
+      /backtest 168 QCOM   — QCOM, last week
+    """
+    hours, symbol = "48", None
+    for tok in arg.split():
+        if tok.isdigit():
+            hours = tok
+        elif tok.isalpha():
+            symbol = tok.upper()
+    cmd = [PYTHON, str(BASE_DIR / "scripts" / "backtest_tg.py"), "--hours", hours]
+    if symbol:
+        cmd += ["--symbol", symbol]
+    send(chat_id, f"⏳ backtesting {'the universe' if not symbol else symbol} over {hours}h "
+                  "(fetching candles, ~30–90s)…")
+    code, out = run(cmd, timeout=200)
+    send(chat_id, f"<pre>{out}</pre>" if out else f"(no output, exit {code})",
+         parse_mode="HTML")
+
+
 def cmd_book(chat_id: str, arg: str):
     """Top-5 order-book snapshot for one name on both venues.
 
@@ -1164,6 +1190,7 @@ def cmd_help(chat_id: str, _arg: str):
          "/spreads — current spread vs threshold detail\n"
          "/book SYM — top-5 order book on both venues\n"
          "/funding [n] — top funding-carry opportunities\n"
+         "/backtest [hours] [SYM] — backtest convergence on recent candles\n"
          "/enter SYM DIR NOTIONAL [basis_bps] — open a funding hold; basis_bps waits for a fill level\n"
          "/close SYM [bps] [hl|aster] [USD] — close full or partial\n"
          "/cancel SYM — cancel a pending basis-gated /enter or /close or /drip\n"
@@ -1193,6 +1220,7 @@ HANDLERS = {
     "/pnl": cmd_pnl, "/trades": cmd_trades,
     "/balance": cmd_balance, "/balances": cmd_balance,
     "/book": cmd_book,
+    "/backtest": cmd_backtest, "/bt": cmd_backtest,
     "/funding": cmd_funding, "/carry": cmd_funding,
     "/enter": cmd_enter, "/close": cmd_close, "/cancel": cmd_cancel,
     "/drip": cmd_drip, "/drip_exit": cmd_drip_exit, "/import": cmd_import,
@@ -1267,6 +1295,7 @@ def main():
             {"command": "spreads", "description": "Current spread vs threshold"},
             {"command": "book", "description": "Top-5 order book on both venues: SYM"},
             {"command": "funding", "description": "Top funding-carry opportunities"},
+            {"command": "backtest", "description": "Backtest convergence: [hours] [SYM]"},
             {"command": "positions", "description": "Open positions + pending basis gates"},
             {"command": "enter", "description": "Open a funding hold: SYM DIR NOTIONAL [basis_bps]"},
             {"command": "close", "description": "Close position: SYM [bps] [hl|aster] [USD]"},
