@@ -1150,17 +1150,21 @@ def cmd_backtest(chat_id: str, arg: str):
       /backtest SNDK       — just SNDK, 48h
       /backtest 168 QCOM   — QCOM, last week
     """
-    hours, symbol = "48", None
+    hours, symbol, cost = "48", None, "taker"
     for tok in arg.split():
+        low = tok.lower()
         if tok.isdigit():
             hours = tok
+        elif low in ("taker", "maker", "none"):
+            cost = low
         elif tok.isalpha():
             symbol = tok.upper()
-    cmd = [PYTHON, str(BASE_DIR / "scripts" / "backtest_tg.py"), "--hours", hours]
+    cmd = [PYTHON, str(BASE_DIR / "scripts" / "backtest_tg.py"),
+           "--hours", hours, "--cost", cost]
     if symbol:
         cmd += ["--symbol", symbol]
     send(chat_id, f"⏳ backtesting {'the universe' if not symbol else symbol} over {hours}h "
-                  "(fetching candles, ~30–90s)…")
+                  f"({cost} cost, ~30–90s)…")
     code, out = run(cmd, timeout=200)
     send(chat_id, f"<pre>{out}</pre>" if out else f"(no output, exit {code})",
          parse_mode="HTML")

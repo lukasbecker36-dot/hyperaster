@@ -32,13 +32,15 @@ from src import history
 from config import (
     OUTPUT_DIR, ENTRY_THRESHOLD_BPS_BY_SYMBOL, ENTRY_THRESHOLD_BPS,
     BLOCKED_SYMBOLS, NON_EQUITY_SYMBOLS, NOTIONAL_PER_LEG, CARRY_ROUND_TRIP_FEE,
-    BASELINE_WINDOW_MINUTES, BASELINE_MIN_SAMPLES, ENTRY_CONFIRM_TICKS,
+    ROUND_TRIP_FEE, BASELINE_WINDOW_MINUTES, BASELINE_MIN_SAMPLES, ENTRY_CONFIRM_TICKS,
     EXIT_TARGET_NET_USD, EXIT_TARGET_NET_USD_BY_SYMBOL, BASIS_ADVERSE_STOP_USD,
     MAX_HOLD_HOURS, aster_symbol_for,
 )
 
 MIN_MS = 60_000
-FEE_BPS = CARRY_ROUND_TRIP_FEE * 10_000  # round-trip fee in bps
+ASTER_DEPTH_URL = "https://fapi.asterdex.com/fapi/v1/depth"
+HL_INFO_URL = "https://api.hyperliquid.xyz/info"
+_CANON_TO_ASTER = {"SMSN": "SAMSUNG", "SKHX": "SKHYNIX"}
 
 
 def _load_universe() -> list[str]:
@@ -51,8 +53,11 @@ def _load_universe() -> list[str]:
         return [r["coin"] for r in csv.DictReader(fh) if r["coin"] not in exclude]
 
 
-def _backtest_one(spreads: list[tuple[int, float]], symbol: str) -> dict | None:
-    """spreads: sorted [(ts_ms, spread_bps)] at 1m. Returns per-symbol stats."""
+def _backtest_one(spreads: list[tuple[int, float]], symbol: str,
+                  cost_bps: float) -> dict | None:
+    """spreads: sorted [(ts_ms, spread_bps)]. cost_bps: round-trip fee + the
+    bid-ask you cross (both legs for taker, Aster only for maker). Returns
+    per-symbol stats, net of that cost."""
     if len(spreads) < BASELINE_MIN_SAMPLES + 5:
         return None
     thr = ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(symbol, ENTRY_THRESHOLD_BPS)
@@ -76,7 +81,7 @@ def _backtest_one(spreads: list[tuple[int, float]], symbol: str) -> dict | None:
         if pos is not None:
             # Mark to market on close-to-close spread convergence.
             gross_bps = pos["sign"] * (pos["entry_spread"] - spread)
-            net_bps = gross_bps - FEE_BPS
+            net_bps = gross_bps - cost_bps
             net_usd = net_bps / 10_000 * NOTIONAL_PER_LEG
             hold_h = (ts - pos["entry_ts"]) / 3_600_000
             own_excess = pos["sign"] * (spread - pos["entry_base"])
@@ -139,6 +144,36 @@ def _pick_interval(hours: int) -> str:
     return "1h"
 
 
+async def _current_cross_bps(session, symbol, mode) -> float:
+    """Estimate the round-trip bid-ask you cross, from the CURRENT books.
+    taker: both legs cross (hl_spread + aster_spread). maker: only the Aster
+    taker leg (aster_spread). Approximation — current spreads stand in for
+    historical. Returns 0 on failure (falls back to fee-only)."""
+    ast_sym = _CANON_TO_ASTER.get(symbol, symbol) + "USDT"
+    try:
+        async def _hl():
+            async with session.post(HL_INFO_URL,
+                                    json={"type": "l2Book", "coin": f"xyz:{symbol}"}) as r:
+                lv = (await r.json()).get("levels") or [[], []]
+                return float(lv[0][0]["px"]), float(lv[1][0]["px"])  # bid, ask
+
+        async def _ast():
+            async with session.get(ASTER_DEPTH_URL,
+                                   params={"symbol": ast_sym, "limit": 5}) as r:
+                d = await r.json()
+                return float(d["bids"][0][0]), float(d["asks"][0][0])
+
+        (hb, ha), (ab, aa) = await asyncio.gather(_hl(), _ast())
+        mid = (hb + ha + ab + aa) / 4
+        if mid <= 0:
+            return 0.0
+        hl_sp = (ha - hb) / mid * 10_000
+        ast_sp = (aa - ab) / mid * 10_000
+        return (hl_sp + ast_sp) if mode == "taker" else ast_sp
+    except Exception:
+        return 0.0
+
+
 async def _fetch_spreads(session, symbol, start_ms, end_ms, interval) -> list[tuple[int, float]]:
     hl_coin = f"xyz:{symbol}"
     ast_sym = aster_symbol_for(symbol)
@@ -157,13 +192,14 @@ async def _fetch_spreads(session, symbol, start_ms, end_ms, interval) -> list[tu
     return out
 
 
-async def run(hours: int, symbol: str | None, top: int) -> str:
+async def run(hours: int, symbol: str | None, top: int, cost_mode: str) -> str:
     syms = [symbol.upper()] if symbol else _load_universe()
     if not syms:
         return "📊 Backtest: no universe (run fetch_data.py) or symbol given."
     end_ms = int(__import__("time").time() * 1000)
     start_ms = end_ms - hours * 3_600_000
     interval = _pick_interval(hours)
+    fee_bps = (ROUND_TRIP_FEE if cost_mode == "taker" else CARRY_ROUND_TRIP_FEE) * 10_000
     timeout = aiohttp.ClientTimeout(total=120)
     results = []
     with_data = 0
@@ -174,10 +210,15 @@ async def run(hours: int, symbol: str | None, top: int) -> str:
         async def one(s):
             async with sem:
                 try:
-                    sp = await _fetch_spreads(session, s, start_ms, end_ms, interval)
+                    sp, cross = await asyncio.gather(
+                        _fetch_spreads(session, s, start_ms, end_ms, interval),
+                        _current_cross_bps(session, s, cost_mode),
+                    )
                 except Exception:
                     return None, 0
-                return _backtest_one(sp, s), len(sp)
+                # cost = fee + the bid-ask crossed. 'none' mode leaves cross=0.
+                cost = fee_bps + (cross if cost_mode != "none" else 0.0)
+                return _backtest_one(sp, s, cost), len(sp)
 
         for r, nsp in await asyncio.gather(*[one(s) for s in syms]):
             if nsp > 0:
@@ -193,8 +234,12 @@ async def run(hours: int, symbol: str | None, top: int) -> str:
 
     results.sort(key=lambda r: r["total_usd"], reverse=True)
     shown = results[:top]
+    cost_desc = {"taker": "taker-taker (cross both)",
+                 "maker": "maker-first (cross Aster)",
+                 "none": "fee only (optimistic)"}[cost_mode]
     lines = [
-        f"📊 Backtest {hours}h · {interval} · ${NOTIONAL_PER_LEG:.0f}/leg · fee {FEE_BPS:.1f}bp",
+        f"📊 Backtest {hours}h · {interval} · ${NOTIONAL_PER_LEG:.0f}/leg",
+        f"cost: {cost_desc}",
         f"{'SYM':<7}{'n':>3} {'win%':>4} {'net$':>7} {'bp/t':>6}",
     ]
     for r in shown:
@@ -211,7 +256,8 @@ async def run(hours: int, symbol: str | None, top: int) -> str:
     ]
     if losers:
         lines.append("negative: " + ", ".join(losers[:12]))
-    lines.append("⚠️ close-to-close: excludes bid-ask crossing & funding — real is worse")
+    lines.append("⚠️ still optimistic: assumes maker fills, no slippage, "
+                 "current spreads applied to history. Live is the real test.")
     return "\n".join(lines)
 
 
@@ -220,8 +266,10 @@ def main():
     ap.add_argument("--hours", type=int, default=48)
     ap.add_argument("--symbol", default=None)
     ap.add_argument("--top", type=int, default=25)
+    ap.add_argument("--cost", choices=("taker", "maker", "none"), default="taker",
+                    help="round-trip cost model (default taker = conservative)")
     a = ap.parse_args()
-    print(asyncio.run(run(max(1, min(a.hours, 336)), a.symbol, a.top)))
+    print(asyncio.run(run(max(1, min(a.hours, 336)), a.symbol, a.top, a.cost)))
 
 
 if __name__ == "__main__":
