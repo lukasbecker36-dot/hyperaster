@@ -33,7 +33,7 @@ from config import (
     EXIT_TARGET_NET_USD, EXIT_TARGET_NET_USD_BY_SYMBOL,
     MAKER_ENTRY_TIMEOUT_SEC, MAKER_REPRICE_TICK_FRAC,
     LIQUIDITY_GUARD_ENABLED, MIN_TOB_NOTIONAL_USD, MAX_VENUE_SPREAD_BPS,
-    ENTRY_TAKER_ESCALATION_ENABLED,
+    ENTRY_TAKER_ESCALATION_ENABLED, STOP_COOLDOWN_MINUTES,
     aster_symbol_for,
 )
 from auth import now_ms
@@ -65,6 +65,8 @@ class Executor:
         self._drips: dict[str, dict] = {}
         self._drip_exits: dict[str, dict] = {}
         self._partial_closes: dict[str, float] = {}
+        # symbol -> ms until which auto re-entry is blocked after a stop exit.
+        self._stop_cooldown: dict[str, int] = {}
 
     # ── Entry ──
 
@@ -87,6 +89,15 @@ class Executor:
             # later re-entry must re-confirm from scratch.
             self._entry_streak.pop(symbol, None)
             return False
+
+        # Post-stop cooldown: don't immediately re-enter a symbol that just
+        # stopped out — the same non-reverting dislocation re-bet every scan
+        # bleeds fees (3× QCOM stop_loss in a row).
+        cd = self._stop_cooldown.get(symbol)
+        if cd:
+            if now_ms() < cd:
+                return False
+            self._stop_cooldown.pop(symbol, None)
 
         mid = (aster_book.mid + hl_book.mid) / 2
         if mid <= 0:
@@ -1955,6 +1966,11 @@ class Executor:
         pos = self.pm.get(symbol)
         if not pos or pos.status != "open":
             return False
+        # Arm the re-entry cooldown when this exit is a "not working" stop, so the
+        # auto-scanner doesn't immediately re-bet the same losing dislocation.
+        if STOP_COOLDOWN_MINUTES > 0 and reason in (
+                "stop_loss", "adverse", "timeout", "funding_drag", "funding_stop"):
+            self._stop_cooldown[symbol] = now_ms() + STOP_COOLDOWN_MINUTES * 60_000
         effective_maker = maker_venue or (pos.entry_maker_venue if pos else "")
         is_partial = close_qty > 0 and close_qty < pos.qty
 

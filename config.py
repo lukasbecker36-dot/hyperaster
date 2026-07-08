@@ -114,6 +114,12 @@ LIQUIDITY_GUARD_ENABLED = True
 MIN_TOB_NOTIONAL_USD = 20.0      # min top-of-book depth on the thinner side, each venue
 MAX_VENUE_SPREAD_BPS = 150.0     # reject if either venue's own spread exceeds this
 
+# After a symbol exits on a stop (stop_loss/adverse/timeout/funding_drag), block
+# re-entry on it for this long. Stops the fee-bleeding churn of re-entering the
+# same non-reverting dislocation over and over (observed: 3× QCOM stop_loss in a
+# row, held 0.0h each). 0 disables.
+STOP_COOLDOWN_MINUTES = 30
+
 # ── Convergence stop-loss ──
 # Basis (non-funding-hold) positions had no mark-to-market stop: the adverse
 # stop only fires if the excess INVERTS, so a position that just diverges or
