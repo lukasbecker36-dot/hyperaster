@@ -248,14 +248,13 @@ TRADE_ALERTS_ENABLED = True
 # Derived from p75 of historical cross-exchange spread, rounded to nearest 5bps.
 # Symbols not listed fall back to ENTRY_THRESHOLD_BPS.
 ENTRY_THRESHOLD_BPS_BY_SYMBOL: dict = {
-    "NBIS":    195,  # excess p75=193bps  oracle_delta=-58bps
+    "STRC":    120,  # backtest-calibrated 2026-07-09
     "ARM":     105,  # excess p75=103bps  oracle_delta=-23bps
     "RKLB":     95,  # excess p75=97bps   oracle_delta=-4bps
     "PLTR":     85,  # excess p75=87bps   oracle_delta=+3bps
     "SKHX":     85,  # excess p75=87bps   oracle_delta=-53bps  (Korean: SK Hynix)
     "SMSN":     85,  # excess p75=85bps   oracle_delta=-43bps  (Korean: Samsung)
     "DRAM":     80,  # excess p75=78bps   oracle_delta=-18bps
-    "DELL":     75,  # excess p75=77bps   oracle_delta=-8bps
     "AMD":      70,  # excess p75=69bps   oracle_delta=-4bps
     "ORCL":     70,  # excess p75=71bps   oracle_delta=+1bps
     "MRVL":     45,  # excess p75=47bps   oracle_delta=-5bps
@@ -263,6 +262,8 @@ ENTRY_THRESHOLD_BPS_BY_SYMBOL: dict = {
     "INTC":     40,  # excess p75=38bps   oracle_delta=-0bps
     "MSTR":     40,  # excess p75=40bps   oracle_delta=-4bps
     "SNDK":     35,  # excess p75=37bps   oracle_delta=+4bps
+    "ASML":     30,  # backtest-calibrated 2026-07-09
+    "DELL":     30,  # backtest-calibrated 2026-07-09 (lowered from 75)
     "AAPL":     30,  # (default)
     "AMZN":     30,  # (default)
     "CRCL":     30,  # (default)
@@ -328,6 +329,8 @@ BLOCKED_SYMBOLS: set = {
     # Thin/unstable book: wild tick-to-tick prices, big divergence losses,
     # extreme volatile funding (observed −$13.84 funding_drag). See liquidity guard.
     "ZHIPU",
+    # 2026-07-09 backtest-negative blocklist: net-negative under taker-taker cost
+    "NBIS", "AMAT", "ZM", "DKNG", "QCOM",
 }
 
 # ── Backward-compat aliases (fetch_data.py / live_scan.py) ──
