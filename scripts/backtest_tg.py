@@ -54,13 +54,15 @@ def _load_universe() -> list[str]:
 
 
 def _backtest_one(spreads: list[tuple[int, float]], symbol: str,
-                  cost_bps: float) -> dict | None:
+                  cost_bps: float, thr_override: float | None = None) -> dict | None:
     """spreads: sorted [(ts_ms, spread_bps)]. cost_bps: round-trip fee + the
-    bid-ask you cross (both legs for taker, Aster only for maker). Returns
-    per-symbol stats, net of that cost."""
+    bid-ask you cross (both legs for taker, Aster only for maker). thr_override:
+    force this entry threshold (for calibration sweeps) instead of the config
+    value. Returns per-symbol stats, net of that cost."""
     if len(spreads) < BASELINE_MIN_SAMPLES + 5:
         return None
-    thr = ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(symbol, ENTRY_THRESHOLD_BPS)
+    thr = thr_override if thr_override is not None else \
+        ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(symbol, ENTRY_THRESHOLD_BPS)
     target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(symbol, EXIT_TARGET_NET_USD)
     win_ms = BASELINE_WINDOW_MINUTES * MIN_MS
 
@@ -192,6 +194,52 @@ async def _fetch_spreads(session, symbol, start_ms, end_ms, interval) -> list[tu
     return out
 
 
+THR_GRID = [30, 45, 60, 80, 100, 130, 170, 220]
+
+
+async def run_sweep(symbol: str, hours: int, cost_mode: str) -> str:
+    """Threshold calibration for ONE name: fetch its spreads once, backtest at a
+    grid of entry thresholds, and show net/win%/n at each so you can pick a
+    value to add to ENTRY_THRESHOLD_BPS_BY_SYMBOL."""
+    symbol = symbol.upper()
+    end_ms = int(__import__("time").time() * 1000)
+    start_ms = end_ms - hours * 3_600_000
+    interval = _pick_interval(hours)
+    fee_bps = (ROUND_TRIP_FEE if cost_mode == "taker" else CARRY_ROUND_TRIP_FEE) * 10_000
+    timeout = aiohttp.ClientTimeout(total=90)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        sp, cross = await asyncio.gather(
+            _fetch_spreads(session, symbol, start_ms, end_ms, interval),
+            _current_cross_bps(session, symbol, cost_mode),
+        )
+    if not sp:
+        return f"📊 {symbol}: no candle data ({hours}h). Try a shorter window."
+    cost = fee_bps + (cross if cost_mode != "none" else 0.0)
+    lines = [
+        f"📊 {symbol} threshold sweep · {hours}h · {interval} · {cost_mode} cost {cost:.0f}bp",
+        f"{'thr':>4}{'n':>4} {'win%':>5} {'net$':>8} {'bp/t':>6}",
+    ]
+    best = None
+    for thr in THR_GRID:
+        r = _backtest_one(sp, symbol, cost, thr_override=float(thr))
+        if not r:
+            lines.append(f"{thr:>4}{0:>4} {'-':>5} {'-':>8} {'-':>6}")
+            continue
+        lines.append(f"{thr:>4}{r['n']:>4} {r['win_pct']:>4.0f}% "
+                     f"{r['total_usd']:>+8.2f} {r['avg_bps']:>+6.1f}")
+        # "best" = highest net among rows with a usable sample (n >= 5).
+        if r["n"] >= 5 and (best is None or r["total_usd"] > best[1]):
+            best = (thr, r["total_usd"], r["win_pct"], r["n"])
+    lines.append("─" * 30)
+    if best and best[1] > 0:
+        lines.append(f"→ best: {best[0]}bp  (${best[1]:+.0f}, {best[2]:.0f}% win, n={best[3]})")
+        lines.append(f"  if it holds on another window, add \"{symbol}\": {best[0]} to the table")
+    else:
+        lines.append("→ no threshold is net-positive with n≥5 — leave this name OFF")
+    lines.append("⚠️ one window overfits — re-run on a different --hours before trusting")
+    return "\n".join(lines)
+
+
 async def run(hours: int, symbol: str | None, top: int, cost_mode: str) -> str:
     syms = [symbol.upper()] if symbol else _load_universe()
     if not syms:
@@ -268,8 +316,17 @@ def main():
     ap.add_argument("--top", type=int, default=25)
     ap.add_argument("--cost", choices=("taker", "maker", "none"), default="taker",
                     help="round-trip cost model (default taker = conservative)")
+    ap.add_argument("--sweep", action="store_true",
+                    help="threshold calibration sweep for --symbol")
     a = ap.parse_args()
-    print(asyncio.run(run(max(1, min(a.hours, 336)), a.symbol, a.top, a.cost)))
+    hours = max(1, min(a.hours, 336))
+    if a.sweep:
+        if not a.symbol:
+            print("📊 --sweep needs --symbol")
+            return
+        print(asyncio.run(run_sweep(a.symbol, hours, a.cost)))
+    else:
+        print(asyncio.run(run(hours, a.symbol, a.top, a.cost)))
 
 
 if __name__ == "__main__":

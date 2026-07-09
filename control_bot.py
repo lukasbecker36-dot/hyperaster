@@ -1151,21 +1151,28 @@ def cmd_backtest(chat_id: str, arg: str):
       /backtest SNDK       — just SNDK, 48h
       /backtest 168 QCOM   — QCOM, last week
     """
-    hours, symbol, cost = "48", None, "taker"
+    hours, symbol, cost, sweep = "48", None, "taker", False
     for tok in arg.split():
         low = tok.lower()
         if tok.isdigit():
             hours = tok
         elif low in ("taker", "maker", "none"):
             cost = low
+        elif low == "sweep":
+            sweep = True
         elif tok.isalpha():
             symbol = tok.upper()
+    if sweep and not symbol:
+        send(chat_id, "Usage: /backtest SYM sweep [hours] — calibrate one name's threshold.")
+        return
     cmd = [PYTHON, str(BASE_DIR / "scripts" / "backtest_tg.py"),
            "--hours", hours, "--cost", cost]
     if symbol:
         cmd += ["--symbol", symbol]
-    send(chat_id, f"⏳ backtesting {'the universe' if not symbol else symbol} over {hours}h "
-                  f"({cost} cost, ~30–90s)…")
+    if sweep:
+        cmd += ["--sweep"]
+    what = f"{symbol} threshold sweep" if sweep else ("the universe" if not symbol else symbol)
+    send(chat_id, f"⏳ {what} over {hours}h ({cost} cost, ~30–90s)…")
     code, out = run(cmd, timeout=200)
     send(chat_id, f"<pre>{out}</pre>" if out else f"(no output, exit {code})",
          parse_mode="HTML")
