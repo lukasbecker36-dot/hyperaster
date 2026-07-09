@@ -667,30 +667,25 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     # Cancel any active drip or drip_exit
                     drip_ok, drip_msg = executor.cancel_drip(symbol)
                     dex_ok, dex_msg = executor.cancel_drip_exit(symbol)
-                    # Also abort any running maker entry (status="entering")
                     pos = pm.get(symbol)
+                    parts = []
+                    if had:
+                        parts.append("gate cleared")
+                    if drip_ok:
+                        parts.append(drip_msg)
+                    if dex_ok:
+                        parts.append(dex_msg)
+                    # Abort a running maker ENTRY (status="entering") …
                     if pos and pos.status == "entering":
                         executor._abort_entering.add(symbol)
-                        parts = []
-                        if had:
-                            parts.append("gate cleared")
-                        if drip_ok:
-                            parts.append(drip_msg)
-                        if dex_ok:
-                            parts.append(dex_msg)
-                        parts.append("aborting maker entry (will finalize on next tick)")
-                        send_alert(f"/cancel {symbol}: {' + '.join(parts)}")
-                    else:
-                        parts = []
-                        if had:
-                            parts.append("gate cleared")
-                        if drip_ok:
-                            parts.append(drip_msg)
-                        if dex_ok:
-                            parts.append(dex_msg)
-                        if not parts:
-                            parts.append("nothing pending")
-                        send_alert(f"/cancel {symbol}: {' + '.join(parts)}")
+                        parts.append("aborting maker entry (finalizes next tick)")
+                    # … or a stuck /close in progress (status="exiting").
+                    elif pos and pos.status == "exiting":
+                        ok, msg = await executor.abort_exit(symbol)
+                        parts.append(msg if ok else "exit abort failed")
+                    if not parts:
+                        parts.append("nothing pending")
+                    send_alert(f"/cancel {symbol}: {' + '.join(parts)}")
                 elif action == "drip":
                     direction = cmd.get("direction", "")
                     notional = float(cmd.get("notional", 0) or 0)

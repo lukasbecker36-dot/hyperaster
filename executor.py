@@ -2002,6 +2002,31 @@ class Executor:
             log.warning(f"{symbol}: maker exit unavailable — falling back to taker exit")
         return await self.try_exit(symbol, aster_book, hl_book, reason)
 
+    async def abort_exit(self, symbol: str) -> tuple[bool, str]:
+        """Abort an in-progress exit (a stuck /close): cancel the resting HL/Aster
+        exit orders and revert the position to 'open' so the poll stops trying,
+        handing control back to you. Best-effort — the position stays tracked at
+        its recorded qty; if it had partially closed, reconcile/flatten manually
+        (a following /forget verifies both venues before removing)."""
+        pos = self.pm.get(symbol)
+        if not pos or pos.status != "exiting":
+            return False, "not mid-exit"
+        self._partial_closes.pop(symbol, None)
+        if not self.paper_mode:
+            if pos.hl_exit_order_id and pos.hl_exit_order_id != "PAPER":
+                try:
+                    await self.client.cancel_hl_order(symbol, pos.hl_exit_order_id)
+                except Exception as e:
+                    log.warning(f"{symbol}: abort_exit HL cancel failed ({e})")
+            if pos.aster_exit_order_id and pos.aster_exit_order_id != "PAPER":
+                try:
+                    await self.client.cancel_aster_order(symbol, pos.aster_exit_order_id)
+                except Exception as e:
+                    log.warning(f"{symbol}: abort_exit Aster cancel failed ({e})")
+        self.pm.revert_partial_exit(symbol)  # exiting -> open, clears exit fields
+        log.warning(f"{symbol}: exit ABORTED by /cancel — resting orders cancelled, back to open")
+        return True, "exit aborted — resting orders cancelled, back to open"
+
     async def force_exit_maker(self, symbol: str, reason: str, close_qty: float = 0.0,
                                dec_aster_book: OrderBook = None,
                                dec_hl_book: OrderBook = None) -> bool:

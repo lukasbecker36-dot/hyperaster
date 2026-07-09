@@ -941,7 +941,8 @@ def cmd_close(chat_id: str, arg: str):
 
 
 def cmd_cancel(chat_id: str, arg: str):
-    """Cancel a pending basis-gated /enter or /close that hasn't fired yet."""
+    """Cancel a pending gate/drip, abort an in-progress maker entry, or abort a
+    stuck /close in progress (cancels resting exit orders, reverts to open)."""
     symbol = arg.strip().upper()
     if not symbol:
         send(chat_id, "Usage: /cancel SYMBOL")
@@ -1197,7 +1198,7 @@ def cmd_help(chat_id: str, _arg: str):
          "/backtest [hours] [SYM] — backtest convergence on recent candles\n"
          "/enter SYM DIR NOTIONAL [basis_bps] — open a funding hold; basis_bps waits for a fill level\n"
          "/close SYM [bps] [hl|aster] [USD] — close full or partial\n"
-         "/cancel SYM — cancel a pending basis-gated /enter or /close or /drip\n"
+         "/cancel SYM — cancel a pending gate/drip, or abort an in-progress entry/close\n"
          "/drip SYM DIR NOTIONAL MIN_BPS BITE_QTY — taker-taker drip entry\n"
          "/drip_exit SYM MAX_BPS BITE_QTY [NOTIONAL] — drip exit (partial or full)\n"
          "/import [SYM] — adopt existing venue positions into the bot for management\n"
