@@ -442,16 +442,22 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 # also calmed down — letting losses run (CBRS ran to -24.7bps).
                 mid = (aster_book.mid + hl_book.mid) / 2
                 # Estimate net P&L at current book prices (gross - fees + funding).
-                # Maker-first positions (carry + convergence) mark on HL-maker/
-                # Aster-taker exit prices; legacy taker positions use taker-taker
-                # (conservative, both legs cross).
+                # Maker-first positions close the HL leg as a resting maker and
+                # cross the Aster leg as a taker. The HL maker is marked at MID,
+                # NOT the favorable touch (ask for a sell / bid for a buy): a
+                # resting sell rarely gets lifted right at the ask on a converging
+                # book — it reprices down to fill — so marking it at the touch was
+                # optimistic and let the target/converge gates fire on P&L the exit
+                # never realized (DELL 'converge' gate said est_net>=0 but the fill
+                # booked -$0.61 gross). The Aster leg keeps its taker touch (a real
+                # cross). Legacy taker positions cross both legs (taker-taker).
                 maker_first = pos.entry_maker_venue == "hl"
                 if mid > 0 and pos.direction == "long_hl_short_aster":
-                    hl_exit = hl_book.ask if maker_first else hl_book.bid
+                    hl_exit = hl_book.mid if maker_first else hl_book.bid
                     est_gross = ((hl_exit - pos.hl_entry_price)
                                  + (pos.aster_entry_price - aster_book.ask)) * pos.qty
                 elif mid > 0:
-                    hl_exit = hl_book.bid if maker_first else hl_book.ask
+                    hl_exit = hl_book.mid if maker_first else hl_book.ask
                     est_gross = ((pos.hl_entry_price - hl_exit)
                                  + (aster_book.bid - pos.aster_entry_price)) * pos.qty
                 else:
