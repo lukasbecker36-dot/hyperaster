@@ -157,11 +157,13 @@ class Executor:
 
         # Fair-value correction: shift the book baseline by how far the oracle
         # delta has moved from its own norm, so a genuine fair-value move isn't
-        # misread as tradeable excess. entry_baseline_bps is stored RAW (the
-        # frozen book median) so the exit can re-apply the LIVE correction.
+        # misread as tradeable excess. PROTECTIVE ONLY: the correction can
+        # suppress the apparent excess (the oracle disagrees → be cautious) but
+        # never inflate it (the oracle agrees MORE than usual → don't get greedy).
+        # Without this clamp, a noisy oracle spike on e.g. Korean stocks created
+        # phantom 200+bp edges that couldn't be captured in fill prices.
         correction = self.client.get_oracle_correction(symbol)
         baseline_bps = book_base          # stored at entry (raw book median)
-        fair_spread = book_base + correction
 
         # Executable-basis refinement: the signal trades the HL-maker/Aster-taker
         # basis, not the mid. exec_dev is the deviation of the half-spread
@@ -169,13 +171,13 @@ class Executor:
         # equals the executable basis' deviation, not the mid's. 0 until warm.
         exec_dev = self.client.executable_deviation_bps(symbol, aster_book, hl_book, mid)
 
-        # raw_premium_bps removed — the cost floor (fees + book spreads) is the
-        # real protection. The old abs(spread) guard blocked legitimate baseline-
-        # deviation trades on names with negative baselines (e.g. AMZN at 69bps
-        # excess but only 10bps raw spread due to -59bps baseline).
-
-        aster_excess_bps = (spread_bps - fair_spread) + exec_dev   # long_hl_short_aster
-        hl_excess_bps = -(spread_bps - fair_spread) + exec_dev      # long_aster_short_hl
+        raw_dev = spread_bps - book_base
+        raw_aster = raw_dev + exec_dev
+        raw_hl = -raw_dev + exec_dev
+        corr_aster = (raw_dev - correction) + exec_dev
+        corr_hl = -(raw_dev - correction) + exec_dev
+        aster_excess_bps = min(raw_aster, corr_aster)   # long_hl_short_aster
+        hl_excess_bps = min(raw_hl, corr_hl)             # long_aster_short_hl
 
         base_threshold = ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(symbol, ENTRY_THRESHOLD_BPS)
         # Maker-first cost floor: we rest the HL leg as a maker (no HL crossing) and
@@ -1640,13 +1642,16 @@ class Executor:
         baseline = self.client.get_book_spread_baseline(symbol)
         if mid <= 0 or baseline is None:
             return False
-        # Same oracle-corrected fair spread + executable refinement the entry used.
+        # Same protective-only oracle correction + executable refinement as entry.
         self.client.record_oracle_delta(symbol)
-        fair_spread = baseline + self.client.get_oracle_correction(symbol)
+        correction = self.client.get_oracle_correction(symbol)
         exec_dev = self.client.executable_deviation_bps(symbol, aster_book, hl_book, mid)
         spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000
-        raw_excess = spread_bps - fair_spread
-        excess = (raw_excess if long_hl else -raw_excess) + exec_dev
+        raw_dev = spread_bps - baseline
+        raw_excess = (raw_dev if long_hl else -raw_dev) + exec_dev
+        corr_dev = raw_dev - correction
+        corr_excess = (corr_dev if long_hl else -corr_dev) + exec_dev
+        excess = min(raw_excess, corr_excess)
 
         base_threshold = ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(symbol, ENTRY_THRESHOLD_BPS)
         maker_floor, taker_floor = self._entry_cost_floors(mid, aster_book, hl_book)

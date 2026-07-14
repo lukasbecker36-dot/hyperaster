@@ -402,19 +402,24 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             # oracle history is insufficient → pure book baseline). exec_dev adds
             # the executable HL-maker/Aster-taker basis refinement (0 until warm),
             # matching try_entry so ranking/display track the actual decision.
-            fair_spread = book_base + client.get_oracle_correction(symbol)
+            # PROTECTIVE ONLY: the correction can only suppress the excess, never
+            # inflate it — a noisy oracle spike must not create phantom edges.
+            correction = client.get_oracle_correction(symbol)
             exec_dev = client.executable_deviation_bps(symbol, aster_book, hl_book, mid)
-            aster_excess = (spread_bps - fair_spread) + exec_dev    # long_hl_short_aster
-            hl_excess    = -(spread_bps - fair_spread) + exec_dev    # long_aster_short_hl
+            raw_dev = spread_bps - book_base
+            raw_aster = raw_dev + exec_dev
+            raw_hl = -raw_dev + exec_dev
+            corr_aster = (raw_dev - correction) + exec_dev
+            corr_hl = -(raw_dev - correction) + exec_dev
+            aster_excess = min(raw_aster, corr_aster)
+            hl_excess    = min(raw_hl, corr_hl)
             if aster_excess >= hl_excess:
                 executable_excess = aster_excess
                 direction = "L-HL/S-AST"
             else:
                 executable_excess = hl_excess
                 direction = "L-AST/S-HL"
-            # Return the EFFECTIVE reference (fair minus the executable dev) so
-            # the display invariant excess == spread − base still holds exactly.
-            effective_base = fair_spread - exec_dev
+            effective_base = book_base
             return symbol, executable_excess, direction, effective_base, aster_book, hl_book
         except Exception as e:
             log.debug(f"scan_symbol {symbol}: {e}")
@@ -532,13 +537,19 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                         log.warning(f"{symbol}: entry_baseline_bps=0 — skipping convergence check")
                     else:
                         client.record_oracle_delta(symbol)
-                        fair_spread = entry_base + client.get_oracle_correction(symbol)
+                        correction = client.get_oracle_correction(symbol)
                         exec_dev = client.executable_deviation_bps(symbol, aster_book, hl_book, mid)
                         spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000
-                        raw_excess = spread_bps - fair_spread
+                        raw_dev = spread_bps - entry_base
                         pos_dir = pos.direction or "long_hl_short_aster"
-                        own_excess = (raw_excess if pos_dir == "long_hl_short_aster"
-                                      else -raw_excess) + exec_dev
+                        # Protective-only: correction can only reduce own_excess
+                        # (make it look more converged / less edge), never inflate it.
+                        raw_own = (raw_dev if pos_dir == "long_hl_short_aster"
+                                   else -raw_dev) + exec_dev
+                        corr_dev = raw_dev - correction
+                        corr_own = (corr_dev if pos_dir == "long_hl_short_aster"
+                                    else -corr_dev) + exec_dev
+                        own_excess = min(raw_own, corr_own)
                         # Gate on est_net (executable bid/ask P&L), NOT just the
                         # trigger. A thin book can balloon at exit time: the signal
                         # says "converged, take profit" while the executable price
