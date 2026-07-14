@@ -466,6 +466,28 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 est_net = est_gross - est_fees + est_funding
                 latest_est_net[symbol] = est_net
 
+                # Mid-marked MTM for the STOP triggers only. est_net marks the
+                # exit at executable crossing prices, which is hypersensitive to
+                # transient one-tick book width on thin venues — a single Aster
+                # ask gap made est_net crater and trip the stop on book noise
+                # rather than genuine divergence (DELL stopped at a -$0.15
+                # realized loss because the executable mark spiked for one tick).
+                # Marking the exit at mids measures real price divergence and
+                # roughly cancels the entry crossing cost, so a freshly-opened,
+                # unmoved position sits near zero. est_net (executable) stays for
+                # the take-profit gate (don't bank profit you can't cross out to
+                # realize) and for display.
+                if mid > 0:
+                    hl_leg_mid = hl_book.mid - pos.hl_entry_price
+                    aster_leg_mid = pos.aster_entry_price - aster_book.mid
+                    if pos.direction != "long_hl_short_aster":
+                        hl_leg_mid = -hl_leg_mid
+                        aster_leg_mid = -aster_leg_mid
+                    est_gross_mid = (hl_leg_mid + aster_leg_mid) * pos.qty
+                else:
+                    est_gross_mid = 0.0
+                est_net_mid = est_gross_mid - est_fees + est_funding
+
                 should_exit, reason = False, ""
                 # Profit target scales with THIS position's notional, so a trade
                 # opened at reduced size still exits on the same bps-edge as a
@@ -487,24 +509,25 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     # so it does NOT apply here — a deliberately-entered funding hold
                     # on a "blocked" name (e.g. NOW, WDC) must persist. Only the hard
                     # safety exits apply.
-                    if est_net <= -FUNDING_ADVERSE_STOP_USD:
+                    if est_net_mid <= -FUNDING_ADVERSE_STOP_USD:
                         log.warning(
-                            f"FUNDING-STOP {symbol}: est_net=${est_net:.2f} <= "
+                            f"FUNDING-STOP {symbol}: est_net_mid=${est_net_mid:.2f} <= "
                             f"-${FUNDING_ADVERSE_STOP_USD} — bailing | held={elapsed_hours:.1f}h"
                         )
                         should_exit, reason = True, "funding_stop"
                     # No timeout — funding-carry trades are held indefinitely
                     # (only the adverse stop closes them automatically).
-                elif BASIS_ADVERSE_STOP_USD > 0 and est_net <= -(BASIS_ADVERSE_STOP_USD * size_frac):
-                    # Mark-to-market stop: the ADVERSE_STOP_BPS guard only fires
-                    # when the excess INVERTS, so a position that just diverges or
+                elif BASIS_ADVERSE_STOP_USD > 0 and est_net_mid <= -(BASIS_ADVERSE_STOP_USD * size_frac):
+                    # Mid-marked stop: the ADVERSE_STOP_BPS guard only fires when
+                    # the excess INVERTS, so a position that just diverges or
                     # never converges would otherwise bleed to the 12h timeout
                     # (RKLB −$15.68, STRC −$12.62). Cap that at a dollar loss,
-                    # scaled to the position's size.
+                    # scaled to the position's size. Marked at mids so transient
+                    # book width can't trip it (see est_net_mid).
                     log.warning(
-                        f"BASIS-STOP {symbol}: est_net=${est_net:.2f} <= "
+                        f"BASIS-STOP {symbol}: est_net_mid=${est_net_mid:.2f} <= "
                         f"-${BASIS_ADVERSE_STOP_USD * size_frac:.2f} — bailing | "
-                        f"held={elapsed_hours:.1f}h"
+                        f"held={elapsed_hours:.1f}h (executable est_net=${est_net:.2f})"
                     )
                     should_exit, reason = True, "stop_loss"
                 elif est_net >= sym_target:
