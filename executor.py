@@ -263,8 +263,7 @@ class Executor:
         log.info(
             f"ENTRY {symbol}: {direction} maker-first | excess={excess_bps:.1f}bps "
             f"spread={spread_bps:+.1f}bps base={baseline_bps:+.1f}bps "
-            f"orac_corr={correction:+.1f}bps exec_dev={exec_dev:+.1f}bps "
-            f"fair={fair_spread:+.1f}bps | "
+            f"orac_corr={correction:+.1f}bps exec_dev={exec_dev:+.1f}bps | "
             f"qty={qty} | HL {hl_maker_side} maker @ {hl_ref:.2f}"
         )
 

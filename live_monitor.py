@@ -560,7 +560,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                             log.info(
                                 f"CONVERGE {symbol}: own_excess={own_excess:.1f} "
                                 f"spread={spread_bps:.1f} entry_base={entry_base:.1f} "
-                                f"fair={fair_spread:.1f} exec_dev={exec_dev:+.1f} "
+                                f"corr={correction:+.1f} exec_dev={exec_dev:+.1f} "
                                 f"est_net=${est_net:.2f} dir={pos_dir} held={elapsed_hours:.1f}h "
                                 f"HL={hl_book.mid:.2f} Ast={aster_book.mid:.2f}"
                             )
