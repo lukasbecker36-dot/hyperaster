@@ -135,7 +135,13 @@ AUTO_TRADE_ONLY_CALIBRATED = True
 # −$12.62). Close a basis position when its executable mark-to-market loss
 # (est_net) reaches this. Scales with the position's notional (like the profit
 # target), so small test sizes stop proportionally. 0 disables.
-BASIS_ADVERSE_STOP_USD = 10.0
+#
+# This is effectively a bps stop: value / NOTIONAL_PER_LEG = the stop distance
+# (20/1000 = 200bps). est_net marks at EXECUTABLE exit prices, so on a thin book
+# a position opens already underwater by the bid-ask it must cross (~50-150bps on
+# equity perps) — a tight stop then trips on book width before convergence gets a
+# chance. 200bps gives room for the crossing cost plus real pre-convergence drift.
+BASIS_ADVERSE_STOP_USD = 20.0
 
 # ── Strategy parameters ──
 # Spread in bps above which we enter.  Round-trip cost ~9-14bps so 30bps = ~2x cushion.
