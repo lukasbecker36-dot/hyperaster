@@ -55,7 +55,7 @@ import aiohttp
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import (
-    HYPERLIQUID_API, ASTER_BASE, ASTER_EXCHANGE_INFO_URL, DATA_DIR,
+    HYPERLIQUID_API, ASTER_BASE, ASTER_EXCHANGE_INFO_URL, DATA_DIR, OUTPUT_DIR,
     NON_EQUITY_SYMBOLS, ASTER_BASE_TO_CANON, aster_symbol_for,
 )
 
@@ -64,6 +64,22 @@ ASTER_PREMIUM_URL = f"{ASTER_BASE}/fapi/v1/premiumIndex"
 ASTER_DEPTH_URL = f"{ASTER_BASE}/fapi/v1/depth"
 
 log = logging.getLogger("capture")
+
+
+def _load_universe_csv() -> list[str]:
+    """Fallback universe: the overlap_symbols.csv the live bot maintains.
+    Keeps BLOCKED names (we re-evaluate them); drops only NON_EQUITY."""
+    import csv
+    path = Path(OUTPUT_DIR) / "overlap_symbols.csv"
+    if not path.exists():
+        return []
+    try:
+        with open(path) as fh:
+            return sorted({r["coin"] for r in csv.DictReader(fh)
+                           if r.get("coin") and r["coin"] not in NON_EQUITY_SYMBOLS})
+    except Exception as e:
+        log.warning(f"overlap_symbols.csv read failed ({e})")
+        return []
 
 COLUMNS = [
     "ts", "symbol",
@@ -119,38 +135,69 @@ class Capturer:
 
     async def discover(self) -> list[str]:
         """HL XYZ ∩ Aster, equity only (NON_EQUITY excluded). BLOCKED names are
-        intentionally KEPT — the point is to re-evaluate them from data."""
-        hl_bases, aster_bases = set(), set()
-        try:
-            async with self.session.post(
-                HYPERLIQUID_API, json={"type": "metaAndAssetCtxs", "dex": "xyz"},
-                timeout=self.timeout,
-            ) as r:
-                data = await r.json()
-            for asset in data[0].get("universe", []):
-                name = asset.get("name", "")
-                if name:
-                    hl_bases.add(name.split(":")[-1])
-        except Exception as e:
-            log.warning(f"discover: HL universe fetch failed ({e})")
-            return self.symbols
-        try:
-            async with self.session.get(ASTER_EXCHANGE_INFO_URL, timeout=self.timeout) as r:
-                info = await r.json()
-            for si in info.get("symbols", []):
-                raw = si.get("symbol", "")
-                for suffix in ("USDT", "USDC", "USD"):
-                    if raw.endswith(suffix):
-                        base = raw[: -len(suffix)]
-                        # canonicalise Aster's tradeable long-name back to HL's short
-                        base = ASTER_BASE_TO_CANON.get(base, base)
-                        aster_bases.add(base)
-                        break
-        except Exception as e:
-            log.warning(f"discover: Aster exchangeInfo fetch failed ({e})")
-            return self.symbols
+        intentionally KEPT — the point is to re-evaluate them from data.
+
+        Live-queries both venues (retried — HL occasionally returns a null body
+        on a single request); if that yields nothing, falls back to the
+        overlap_symbols.csv the live bot maintains so a transient blip never
+        aborts a capture run."""
+        hl_bases = await self._hl_universe()
+        aster_bases = await self._aster_universe()
         overlap = sorted((hl_bases & aster_bases) - set(NON_EQUITY_SYMBOLS))
-        return overlap
+        if overlap:
+            return overlap
+        # Fallback: the persisted universe from the live bot.
+        csv_syms = _load_universe_csv()
+        if csv_syms:
+            log.warning(f"discover: live query empty (HL={len(hl_bases)} "
+                        f"Aster={len(aster_bases)}) — using overlap_symbols.csv "
+                        f"({len(csv_syms)} names)")
+            return csv_syms
+        return self.symbols
+
+    async def _hl_universe(self) -> set[str]:
+        for attempt in range(3):
+            try:
+                async with self.session.post(
+                    HYPERLIQUID_API, json={"type": "metaAndAssetCtxs", "dex": "xyz"},
+                    timeout=self.timeout,
+                ) as r:
+                    data = await r.json(content_type=None)
+                # HL returns [meta, ctxs]; a transient failure can be null/dict.
+                if isinstance(data, list) and data and isinstance(data[0], dict):
+                    out = {a.get("name", "").split(":")[-1]
+                           for a in data[0].get("universe", []) if a.get("name")}
+                    if out:
+                        return out
+                log.warning(f"discover: HL universe unexpected shape "
+                            f"({type(data).__name__}) attempt {attempt+1}/3")
+            except Exception as e:
+                log.warning(f"discover: HL universe fetch failed ({e}) "
+                            f"attempt {attempt+1}/3")
+            await asyncio.sleep(1.5)
+        return set()
+
+    async def _aster_universe(self) -> set[str]:
+        for attempt in range(3):
+            try:
+                async with self.session.get(ASTER_EXCHANGE_INFO_URL, timeout=self.timeout) as r:
+                    info = await r.json(content_type=None)
+                out = set()
+                for si in (info or {}).get("symbols", []):
+                    raw = si.get("symbol", "")
+                    for suffix in ("USDT", "USDC", "USD"):
+                        if raw.endswith(suffix):
+                            base = raw[: -len(suffix)]
+                            out.add(ASTER_BASE_TO_CANON.get(base, base))
+                            break
+                if out:
+                    return out
+                log.warning(f"discover: Aster universe empty attempt {attempt+1}/3")
+            except Exception as e:
+                log.warning(f"discover: Aster exchangeInfo fetch failed ({e}) "
+                            f"attempt {attempt+1}/3")
+            await asyncio.sleep(1.5)
+        return set()
 
     # ── Batch fetchers (one call each, all names) ──
 
@@ -162,7 +209,7 @@ class Capturer:
                 HYPERLIQUID_API, json={"type": "metaAndAssetCtxs", "dex": "xyz"},
                 timeout=self.timeout,
             ) as r:
-                data = await r.json()
+                data = await r.json(content_type=None)
             meta, ctxs = data[0], data[1]
             for i, asset in enumerate(meta.get("universe", [])):
                 base = asset.get("name", "").split(":")[-1]
@@ -183,7 +230,7 @@ class Capturer:
         out = {}
         try:
             async with self.session.get(ASTER_BOOKTICKER_URL, timeout=self.timeout) as r:
-                data = await r.json()
+                data = await r.json(content_type=None)
             rows = data if isinstance(data, list) else [data]
             for row in rows:
                 base = _aster_to_canon(row.get("symbol", ""))
@@ -201,7 +248,7 @@ class Capturer:
         out = {}
         try:
             async with self.session.get(ASTER_PREMIUM_URL, timeout=self.timeout) as r:
-                data = await r.json()
+                data = await r.json(content_type=None)
             rows = data if isinstance(data, list) else [data]
             for row in rows:
                 base = _aster_to_canon(row.get("symbol", ""))
@@ -224,7 +271,7 @@ class Capturer:
                     HYPERLIQUID_API, json={"type": "l2Book", "coin": hl_coin},
                     timeout=self.timeout,
                 ) as r:
-                    data = await r.json()
+                    data = await r.json(content_type=None)
             except Exception:
                 return None
         levels = data.get("levels", [[], []])
@@ -255,7 +302,7 @@ class Capturer:
                 ASTER_DEPTH_URL, params={"symbol": aster_symbol_for(base), "limit": 5},
                 timeout=self.timeout,
             ) as r:
-                d = await r.json()
+                d = await r.json(content_type=None)
             return json.dumps({
                 "b": [[_f(x[0]), _f(x[1])] for x in d.get("bids", [])[:5]],
                 "a": [[_f(x[0]), _f(x[1])] for x in d.get("asks", [])[:5]],
