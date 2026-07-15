@@ -69,6 +69,46 @@ async def _aster_book(session, symbol):
     return float(bids[0][0]), float(asks[0][0])
 
 
+def _percentile(xs, p):
+    if not xs:
+        return None
+    xs = sorted(xs)
+    k = (len(xs) - 1) * p / 100
+    lo, hi = int(k), min(int(k) + 1, len(xs) - 1)
+    return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
+
+
+async def _funding_avg_24h(session, symbol):
+    """24h average funding from the venues' own history endpoints:
+    (avg_hl_per_1h, avg_ast_per_8h) — actual settled rates, not predictions.
+    Either side None on failure."""
+    start = int(time.time() * 1000) - DAY_MS
+    hl_avg = ast_avg = None
+    try:
+        async with session.post(HYPERLIQUID_API,
+                                json={"type": "fundingHistory",
+                                      "coin": f"xyz:{symbol}",
+                                      "startTime": start}) as r:
+            rows = await r.json(content_type=None)
+        rates = [float(x.get("fundingRate") or 0) for x in (rows or [])]
+        if rates:
+            hl_avg = statistics.mean(rates)
+    except Exception:
+        pass
+    try:
+        async with session.get(f"{ASTER_BASE}/fapi/v1/fundingRate",
+                               params={"symbol": aster_symbol_for(symbol),
+                                       "startTime": start}) as r:
+            rows = await r.json(content_type=None)
+        rates = [float(x.get("fundingRate") or 0) for x in (rows or [])
+                 if isinstance(x, dict)]
+        if rates:
+            ast_avg = statistics.mean(rates)
+    except Exception:
+        pass
+    return hl_avg, ast_avg
+
+
 async def _funding(session, symbol):
     """(hl_rate_per_1h, aster_rate_per_8h) — positive = longs pay shorts."""
     hl_r = ast_r = None
@@ -126,7 +166,11 @@ def _avg_from_capture(symbol):
             buy_ast.append(legs[1])
     if not buy_hl:
         return None
-    return statistics.mean(buy_hl), statistics.mean(buy_ast), len(buy_hl), True
+    return {
+        "avg_hl": statistics.mean(buy_hl), "avg_ast": statistics.mean(buy_ast),
+        "p90_hl": _percentile(buy_hl, 90), "p90_ast": _percentile(buy_ast, 90),
+        "n": len(buy_hl), "exact": True,
+    }
 
 
 async def _avg_from_candles(session, symbol):
@@ -153,7 +197,13 @@ async def _avg_from_candles(session, symbol):
     if not sp:
         return None
     s = statistics.mean(sp)
-    return s, -s, len(sp), False
+    # buy_hl leg ≈ +spread, buy_ast leg ≈ −spread (book widths ignored), so the
+    # buy_ast p90 is the 90th pct of −spread = −(10th pct of spread).
+    return {
+        "avg_hl": s, "avg_ast": -s,
+        "p90_hl": _percentile(sp, 90), "p90_ast": -_percentile(sp, 10),
+        "n": len(sp), "exact": False,
+    }
 
 
 async def main():
@@ -163,9 +213,9 @@ async def main():
     symbol = sys.argv[1].upper()
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        hl, ast, (hl_fr, ast_fr) = await asyncio.gather(
+        hl, ast, (hl_fr, ast_fr), (hl_fr24, ast_fr24) = await asyncio.gather(
             _hl_book(session, symbol), _aster_book(session, symbol),
-            _funding(session, symbol),
+            _funding(session, symbol), _funding_avg_24h(session, symbol),
         )
         if not hl or not ast:
             print(f"📐 {symbol}: book unavailable "
@@ -183,18 +233,23 @@ async def main():
 
     lines = [f"📐 {symbol} executable basis (maker-HL/taker-Ast, bps)"]
     if avg:
-        a_hl, a_ast, n, exact = avg
-        src = f"24h avg ({n} snaps)" if exact else f"~24h avg (candle mids, {n})"
+        src = (f"24h from {avg['n']} capture snaps" if avg["exact"]
+               else f"~24h from {avg['n']} candle mids (book width ignored)")
+        lines.append(f"{'':11}{'now':>8}{'24h avg':>9}{'24h p90':>9}   ({src})")
+        lines.append(f"{'buy-HL leg':<11}{buy_hl_now:>+8.1f}"
+                     f"{avg['avg_hl']:>+9.1f}{avg['p90_hl']:>+9.1f}")
+        lines.append("  = ENTER L-HL/S-AST · EXIT L-AST/S-HL")
+        lines.append(f"{'buy-AST leg':<11}{buy_ast_now:>+8.1f}"
+                     f"{avg['avg_ast']:>+9.1f}{avg['p90_ast']:>+9.1f}")
+        lines.append("  = ENTER L-AST/S-HL · EXIT L-HL/S-AST")
+        lines.append("p90 = level reached only ~10% of the last 24h — a gate "
+                     "there fills on spikes, not the sit-level")
     else:
-        a_hl = a_ast = None
-        src = "24h avg: no data"
-    lines.append(f"{'':14}{'now':>8}  {src}")
-    lines.append(f"{'buy-HL leg':<14}{buy_hl_now:>+8.1f}"
-                 + (f"  {a_hl:>+8.1f}" if a_hl is not None else ""))
-    lines.append("  = ENTER L-HL/S-AST · EXIT L-AST/S-HL")
-    lines.append(f"{'buy-AST leg':<14}{buy_ast_now:>+8.1f}"
-                 + (f"  {a_ast:>+8.1f}" if a_ast is not None else ""))
-    lines.append("  = ENTER L-AST/S-HL · EXIT L-HL/S-AST")
+        lines.append(f"{'':11}{'now':>8}   (no 24h history yet)")
+        lines.append(f"{'buy-HL leg':<11}{buy_hl_now:>+8.1f}")
+        lines.append("  = ENTER L-HL/S-AST · EXIT L-AST/S-HL")
+        lines.append(f"{'buy-AST leg':<11}{buy_ast_now:>+8.1f}")
+        lines.append("  = ENTER L-AST/S-HL · EXIT L-HL/S-AST")
     lines.append(f"round trip now (enter+exit): {buy_hl_now + buy_ast_now:+.1f}bps")
     lines.append(f"books  HL {hl_bid:.2f}/{hl_ask:.2f}  Ast {ast_bid:.2f}/{ast_ask:.2f}")
 
@@ -202,14 +257,23 @@ async def main():
         # Net carry per day (bps) for L-AST/S-HL: short HL earns hl_rate (if +),
         # long Aster pays ast_rate (if +). Other direction is the negative.
         carry_last = (hl_fr * 24 - ast_fr * 3) * 10000
-        lines.append(f"funding  HL {hl_fr*100:+.4f}%/1h  Ast {ast_fr*100:+.4f}%/8h")
-        lines.append(f"net carry ≈ {carry_last:+.1f}bps/day L-AST/S-HL "
+        lines.append(f"funding now  HL {hl_fr*100:+.4f}%/1h  Ast {ast_fr*100:+.4f}%/8h")
+        lines.append(f"  net carry ≈ {carry_last:+.1f}bps/day L-AST/S-HL "
                      f"({-carry_last:+.1f} L-HL/S-AST)")
+    if hl_fr24 is not None and ast_fr24 is not None:
+        carry_24h = (hl_fr24 * 24 - ast_fr24 * 3) * 10000
+        lines.append(f"funding 24h avg (settled)  HL {hl_fr24*100:+.4f}%/1h  "
+                     f"Ast {ast_fr24*100:+.4f}%/8h")
+        lines.append(f"  net carry ≈ {carry_24h:+.1f}bps/day L-AST/S-HL "
+                     f"({-carry_24h:+.1f} L-HL/S-AST)")
 
     lines.append("")
     lines.append("gates: /enter waits for basis ≥ target, /close likewise.")
-    lines.append(f"e.g. /enter {symbol} buy_aster 1000 {round(buy_ast_now) + 5}")
-    lines.append(f"     /close {symbol} {round(buy_hl_now) + 5}")
+    # Suggest the 24h p90 as the gate (fill on spikes); fall back to now+5.
+    ast_gate = round(avg["p90_ast"]) if avg else round(buy_ast_now) + 5
+    hl_gate = round(avg["p90_hl"]) if avg else round(buy_hl_now) + 5
+    lines.append(f"e.g. /enter {symbol} buy_aster 1000 {ast_gate}")
+    lines.append(f"     /close {symbol} {hl_gate}")
     print("\n".join(lines))
 
 
