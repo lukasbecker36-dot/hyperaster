@@ -833,8 +833,9 @@ def cmd_enter(chat_id: str, arg: str):
       BASIS_TARGET_BPS (optional): only fill once the executable entry basis is
                  at or better than this (bps, in your favour). Omit = enter now.
 
-    Held for funding carry — the bot won't close it on basis convergence, only
-    on safety stops (mark-to-market loss / 1-week timeout) or manual /close.
+    Held for funding carry — the bot NEVER auto-closes it: no basis-convergence
+    exit, no mark-to-market safety stop, no timeout. It closes ONLY on a manual
+    /close, so you own the exit (and the risk) entirely.
     Leverage 5x + isolated margin are applied automatically on entry.
     In live mode this places REAL orders and requires a typed YES.
     """
@@ -882,7 +883,8 @@ def cmd_enter(chat_id: str, arg: str):
         _PENDING_ENTER[chat_id] = (req, time.time() + _CONFIRM_TTL)
         send(chat_id,
              f"⚠️ LIVE order: enter {symbol} {short} ${notional:.0f}/leg as a funding hold{gate}.\n"
-             "5x isolated. This places REAL orders. Reply YES within 60s to confirm.")
+             "5x isolated. Held indefinitely — NO auto-stop or timeout, closes only on /close.\n"
+             "This places REAL orders. Reply YES within 60s to confirm.")
         return
     _enqueue_manual(req)
     send(chat_id, f"📩 queued [PAPER] entry: {symbol} {short} ${notional:.0f}{gate}. "

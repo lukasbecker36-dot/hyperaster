@@ -190,10 +190,12 @@ MAX_FUNDING_DRAG_USD = 2.0
 # ── Manual funding-carry holds ──
 # Positions opened via the manual /enter command (hold_for_funding=1) are held
 # for funding carry, NOT basis convergence: the target/converge exits are
-# disabled so they don't close the moment the basis reverts. Only safety exits
-# apply — a longer max-hold timeout and a hard mark-to-market stop.
-FUNDING_MAX_HOLD_HOURS = 168          # 1 week safety timeout for a funding hold
-FUNDING_ADVERSE_STOP_USD = 25.0       # bail a funding hold if executable loss exceeds this
+# disabled so they don't close the moment the basis reverts. There are NO
+# automatic exits at all — no timeout and no mark-to-market safety stop. The
+# operator opened it deliberately and owns the exit; it closes only on a manual
+# /close. The two values below are retained for reference but are NOT enforced.
+FUNDING_MAX_HOLD_HOURS = 0            # disabled (no timeout on a funding hold)
+FUNDING_ADVERSE_STOP_USD = 0.0       # disabled (no mark-to-market safety stop)
 
 # Carry trades execute maker-first: the HL leg rests as a post-only maker and
 # the Aster leg crosses (IOC) to hedge each HL fill. If the HL maker hasn't

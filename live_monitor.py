@@ -39,7 +39,7 @@ from config import (
     BLOCKED_SYMBOLS, NON_EQUITY_SYMBOLS, ENTRY_CONFIRM_TICKS, ADVERSE_STOP_BPS,
     ROUND_TRIP_FEE, CARRY_ROUND_TRIP_FEE, NOTIONAL_PER_LEG, EXIT_TARGET_NET_USD,
     EXIT_TARGET_NET_USD_BY_SYMBOL, MAX_FUNDING_DRAG_USD,
-    FUNDING_ADVERSE_STOP_USD, BASIS_ADVERSE_STOP_USD,
+    BASIS_ADVERSE_STOP_USD,
     MANUAL_ENTRY_GATE_TIMEOUT_MIN, aster_symbol_for, ASTER_BASE_TO_CANON,
 )
 
@@ -509,20 +509,13 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                         or symbol in executor._drips):
                     pass
                 elif pos.hold_for_funding:
-                    # Manual funding-carry hold: held for carry, never the basis
-                    # target/convergence exits (those would close it the moment the
-                    # basis reverts). The blocklist is a convergence-strategy concern,
-                    # so it does NOT apply here — a deliberately-entered funding hold
-                    # on a "blocked" name (e.g. NOW, WDC) must persist. Only the hard
-                    # safety exits apply.
-                    if est_net_mid <= -FUNDING_ADVERSE_STOP_USD:
-                        log.warning(
-                            f"FUNDING-STOP {symbol}: est_net_mid=${est_net_mid:.2f} <= "
-                            f"-${FUNDING_ADVERSE_STOP_USD} — bailing | held={elapsed_hours:.1f}h"
-                        )
-                        should_exit, reason = True, "funding_stop"
-                    # No timeout — funding-carry trades are held indefinitely
-                    # (only the adverse stop closes them automatically).
+                    # Manual funding-carry hold: held for carry, NEVER auto-closed.
+                    # No basis/convergence exit (those would close it the moment the
+                    # basis reverts), no mark-to-market safety stop, and no timeout.
+                    # The operator opened it deliberately via /enter and owns the
+                    # exit — it closes ONLY on a manual /close. The blocklist is a
+                    # convergence concern and does not apply here either.
+                    pass
                 elif BASIS_ADVERSE_STOP_USD > 0 and est_net_mid <= -(BASIS_ADVERSE_STOP_USD * size_frac):
                     # Mid-marked stop: the ADVERSE_STOP_BPS guard only fires when
                     # the excess INVERTS, so a position that just diverges or
