@@ -45,6 +45,18 @@ from src import history
 log = logging.getLogger(__name__)
 
 
+def _hl_sigfig_tick(price: float) -> float:
+    """HL's price grid allows up to 5 significant figures, so the tick for a
+    price is 10^(floor(log10(price)) - 4): e.g. ~1212 → 0.1, ~200 → 0.01,
+    ~45 → 0.001. Used as a deterministic fallback when the tick can't be read
+    off a thin orderbook. Coarser-than-real is safe (still divisible); this rule
+    matches HL for the equity-perp price ranges we trade."""
+    if price <= 0:
+        return 0.01
+    exp = math.floor(math.log10(price)) - 4
+    return 10.0 ** exp
+
+
 @dataclass
 class OrderBook:
     bid: float = 0.0
@@ -138,6 +150,11 @@ class ExchangeClient:
         # HL oracle price cache: symbol -> (oracle_px, fetched_at_ms)
         self._hl_oracle_cache: dict[str, tuple[float, int]] = {}
 
+        # Symbols whose real HL tick has been inferred from the live book (the
+        # metadata tick is often wrong for builder-dex perps). Prevents a
+        # dynamically-loaded name keeping the default 0.01 tick.
+        self._hl_tick_inferred: set[str] = set()
+
         # Funding rate caches.
         #   HL:    hourly rate, refreshed alongside oracles via metaAndAssetCtxs.
         #   Aster: 8h rate, refreshed alongside mark price via premiumIndex.
@@ -196,19 +213,27 @@ class ExchangeClient:
 
         Returns True if the symbol is ready (specs + asset index populated)."""
         hl_coin = f"xyz:{symbol}"
-        if hl_coin in self._hl_xyz_indices and symbol in self.hl_specs and symbol in self.aster_specs:
-            return True
-        log.info(f"Dynamically loading specs for {symbol}…")
-        await asyncio.gather(
-            self._load_aster_specs([symbol]),
-            self._load_hl_xyz_specs([symbol]),
-        )
-        if hl_coin not in self._hl_xyz_indices:
-            log.error(f"{symbol}: not found in HL XYZ universe after dynamic load")
-            return False
-        if symbol not in self.aster_specs:
-            log.error(f"{symbol}: not found on Aster after dynamic load")
-            return False
+        loaded = (hl_coin in self._hl_xyz_indices and symbol in self.hl_specs
+                  and symbol in self.aster_specs)
+        if not loaded:
+            log.info(f"Dynamically loading specs for {symbol}…")
+            await asyncio.gather(
+                self._load_aster_specs([symbol]),
+                self._load_hl_xyz_specs([symbol]),
+            )
+            if hl_coin not in self._hl_xyz_indices:
+                log.error(f"{symbol}: not found in HL XYZ universe after dynamic load")
+                return False
+            if symbol not in self.aster_specs:
+                log.error(f"{symbol}: not found on Aster after dynamic load")
+                return False
+        # The metadata HL tick is often wrong for builder-dex perps; startup
+        # infers the real tick from the book for the universe, but a dynamically
+        # -loaded name (manual /enter on a non-universe symbol) would otherwise
+        # keep the default 0.01 and get its maker rejected ("Price must be
+        # divisible by tick size"). Infer once here too.
+        if symbol not in self._hl_tick_inferred:
+            await self._infer_hl_tick_sizes([symbol])
         return True
 
     async def discover_overlap_bases(self) -> set[str]:
@@ -423,6 +448,11 @@ class ExchangeClient:
                     if diff > 1e-12:
                         if min_diff is None or diff < min_diff:
                             min_diff = diff
+                # Thin book (no two adjacent-tick levels) → fall back to HL's
+                # 5-significant-figure price grid from the current level, so we
+                # never keep the default 0.01 and get the maker tick-rejected.
+                if min_diff is None and prices:
+                    min_diff = _hl_sigfig_tick(prices[len(prices) // 2])
                 if min_diff and symbol in self.hl_specs:
                     spec = self.hl_specs[symbol]
                     # Determine price_precision from the tick
@@ -434,6 +464,7 @@ class ExchangeClient:
                     old_tick = spec.tick_size
                     spec.tick_size = min_diff
                     spec.price_precision = px_prec
+                    self._hl_tick_inferred.add(symbol)
                     if abs(old_tick - min_diff) > 1e-12:
                         log.info(
                             f"HL tick {symbol}: inferred {min_diff} "
