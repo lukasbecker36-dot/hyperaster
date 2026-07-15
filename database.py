@@ -99,6 +99,9 @@ def init_db():
         # Makes banking idempotent: the same dead order seen twice (repost
         # failure, restart) must not be counted twice.
         ("aster_gtx_banked_oid", "TEXT DEFAULT ''"),
+        # Aster funding settlement window (hours) detected at entry — varies by
+        # name (most 8h, some 4h e.g. SKHX). Funding P&L normalises by this.
+        ("aster_funding_window_h", "REAL DEFAULT 8"),
     ):
         try:
             conn.execute(f"ALTER TABLE positions ADD COLUMN {_col} {_type}")

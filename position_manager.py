@@ -36,14 +36,16 @@ def _dir_short(direction: str) -> str:
 def estimate_funding_pnl(
     direction: str, hours_held: float, notional: float,
     hl_funding_rate: float, aster_funding_rate: float,
+    aster_window_h: float = 8.0,
 ) -> float:
     """
     Estimate net funding carry (USD) over a hold from entry-snapshot rates.
 
     Convention: a positive funding rate means longs pay shorts. So a leg we are
     LONG accrues -rate (we pay when positive); a leg we are SHORT accrues +rate.
-    HL settles hourly (rate is per-1h); Aster every 8h (rate is per-8h), so we
-    normalise each to the actual hours held.
+    HL settles hourly (rate is per-1h); Aster's rate is per its settlement
+    WINDOW, which varies by name (most 8h, some 4h e.g. SKHX) — detected at
+    entry and stored on the position. Each is normalised to the hours held.
 
     This is a continuous-accrual approximation — funding really settles at
     discrete times, but for paper P&L (and a first live estimate) rate × elapsed
@@ -53,8 +55,10 @@ def estimate_funding_pnl(
         hl_sign, aster_sign = -1.0, +1.0   # long HL, short Aster
     else:
         hl_sign, aster_sign = +1.0, -1.0   # short HL, long Aster
+    if not aster_window_h or aster_window_h <= 0:
+        aster_window_h = 8.0
     hl_carry = hl_sign * hl_funding_rate * hours_held * notional
-    aster_carry = aster_sign * aster_funding_rate * (hours_held / 8.0) * notional
+    aster_carry = aster_sign * aster_funding_rate * (hours_held / aster_window_h) * notional
     return hl_carry + aster_carry
 
 
@@ -89,10 +93,13 @@ class Position:
     net_pnl: float = 0.0
     exit_reason: str = ""
 
-    # Funding: rates snapshotted at entry (HL hourly, Aster 8h),
+    # Funding: rates snapshotted at entry (HL hourly, Aster per-window),
     # funding_pnl = estimated net carry over the hold (folded into net_pnl).
+    # aster_funding_window_h = the name's Aster settlement window (hours),
+    # detected from settlement timestamps at entry (most 8h, some 4h e.g. SKHX).
     hl_funding_rate: float = 0.0
     aster_funding_rate: float = 0.0
+    aster_funding_window_h: float = 8.0
     funding_pnl: float = 0.0
 
     # True for manual funding-carry holds — the monitor holds these for carry
@@ -147,7 +154,8 @@ class PositionManager:
             "COALESCE(aster_hedged_qty, 0), COALESCE(aster_baseline_amt, 0), "
             "COALESCE(scale_pre_qty, 0), COALESCE(scale_pre_hl_px, 0), "
             "COALESCE(scale_pre_aster_px, 0), COALESCE(scale_pre_notional, 0), "
-            "COALESCE(aster_gtx_filled, 0), COALESCE(aster_gtx_banked_oid, '') "
+            "COALESCE(aster_gtx_filled, 0), COALESCE(aster_gtx_banked_oid, ''), "
+            "COALESCE(aster_funding_window_h, 8) "
             "FROM positions WHERE status NOT IN ('closed', 'error') AND paper=?",
             (paper_val,)
         ).fetchall()
@@ -175,6 +183,7 @@ class PositionManager:
                 scale_pre_notional=r[28] or 0.0,
                 aster_gtx_filled=r[29] or 0.0,
                 aster_gtx_banked_oid=r[30] or "",
+                aster_funding_window_h=r[31] or 8.0,
             )
             self.positions[p.symbol] = p
             log.warning(
@@ -206,6 +215,7 @@ class PositionManager:
         hl_funding_rate: float = 0.0, aster_funding_rate: float = 0.0,
         entry_baseline_bps: float = 0.0,
         hold_for_funding: bool = False,
+        aster_funding_window_h: float = 8.0,
     ) -> Position:
         entry_time = now_ms()
         conn = get_connection()
@@ -214,14 +224,15 @@ class PositionManager:
             "(symbol, hl_coin, aster_symbol, direction, status, entry_time, "
             "entry_spread_bps, hl_entry_price, hl_entry_order_id, "
             "aster_entry_order_id, qty, notional_usd, paper, "
-            "hl_funding_rate, aster_funding_rate, entry_baseline_bps, hold_for_funding) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "hl_funding_rate, aster_funding_rate, entry_baseline_bps, hold_for_funding, "
+            "aster_funding_window_h) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (symbol, hl_coin, aster_symbol, direction, "entering", entry_time,
              entry_spread_bps, hl_entry_price, hl_order_id,
              aster_entry_order_id, qty, notional_usd,
              1 if self.paper_mode else 0,
              hl_funding_rate, aster_funding_rate, entry_baseline_bps,
-             1 if hold_for_funding else 0),
+             1 if hold_for_funding else 0, aster_funding_window_h),
         )
         conn.commit()
         pid = cur.lastrowid
@@ -237,6 +248,7 @@ class PositionManager:
             qty=qty, notional_usd=notional_usd,
             hl_funding_rate=hl_funding_rate, aster_funding_rate=aster_funding_rate,
             hold_for_funding=hold_for_funding,
+            aster_funding_window_h=aster_funding_window_h,
         )
         self.positions[symbol] = pos
         log.info(
@@ -253,6 +265,7 @@ class PositionManager:
         hl_funding_rate: float = 0.0, aster_funding_rate: float = 0.0,
         hold_for_funding: bool = True, entry_baseline_bps: float = 0.0,
         aster_baseline_amt: float = 0.0,
+        aster_funding_window_h: float = 8.0,
     ) -> Position:
         """Record a maker-first entry: HL post-only order resting, nothing filled
         yet. poll_hl_maker advances it as the HL leg fills and the Aster taker
@@ -267,13 +280,15 @@ class PositionManager:
             "entry_spread_bps, hl_entry_price, hl_entry_order_id, "
             "aster_entry_order_id, qty, notional_usd, paper, "
             "hl_funding_rate, aster_funding_rate, hold_for_funding, entry_baseline_bps, "
-            "entry_maker_venue, hl_baseline_szi, aster_hedged_qty, aster_baseline_amt) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "entry_maker_venue, hl_baseline_szi, aster_hedged_qty, aster_baseline_amt, "
+            "aster_funding_window_h) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (symbol, f"xyz:{symbol}", aster_symbol, direction, "entering", entry_time,
              entry_spread_bps, hl_ref_price, hl_maker_order_id,
              "", qty, notional_usd, 1 if self.paper_mode else 0,
              hl_funding_rate, aster_funding_rate, 1 if hold_for_funding else 0,
-             entry_baseline_bps, "hl", hl_baseline_szi, 0.0, aster_baseline_amt),
+             entry_baseline_bps, "hl", hl_baseline_szi, 0.0, aster_baseline_amt,
+             aster_funding_window_h),
         )
         conn.commit()
         pid = cur.lastrowid
@@ -288,6 +303,7 @@ class PositionManager:
             hold_for_funding=hold_for_funding, entry_maker_venue="hl",
             hl_baseline_szi=hl_baseline_szi, aster_hedged_qty=0.0,
             aster_baseline_amt=aster_baseline_amt,
+            aster_funding_window_h=aster_funding_window_h,
         )
         self.positions[symbol] = pos
         log.info(
@@ -793,6 +809,7 @@ class PositionManager:
         funding = estimate_funding_pnl(
             pos.direction, hours_held, notional,
             pos.hl_funding_rate, pos.aster_funding_rate,
+            pos.aster_funding_window_h,
         )
 
         net = gross - fees + funding
@@ -862,6 +879,7 @@ class PositionManager:
         self, *, symbol: str, hl_coin: str, aster_symbol: str,
         direction: str, qty: float, hl_price: float, aster_price: float,
         hl_funding_rate: float = 0.0, aster_funding_rate: float = 0.0,
+        aster_funding_window_h: float = 8.0,
     ) -> Position:
         """Import an existing venue position pair into the DB as 'open'.
 
@@ -877,12 +895,12 @@ class PositionManager:
             "entry_spread_bps, hl_entry_price, aster_entry_price, "
             "qty, notional_usd, paper, "
             "hl_funding_rate, aster_funding_rate, hold_for_funding, "
-            "entry_maker_venue) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "entry_maker_venue, aster_funding_window_h) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (symbol, hl_coin, aster_symbol, direction, "open", entry_time,
              0.0, hl_price, aster_price,
              qty, notional, 1 if self.paper_mode else 0,
-             hl_funding_rate, aster_funding_rate, 1, "hl"),
+             hl_funding_rate, aster_funding_rate, 1, "hl", aster_funding_window_h),
         )
         conn.commit()
         pid = cur.lastrowid
@@ -894,6 +912,7 @@ class PositionManager:
             qty=qty, notional_usd=notional,
             hl_funding_rate=hl_funding_rate, aster_funding_rate=aster_funding_rate,
             hold_for_funding=True, entry_maker_venue="hl",
+            aster_funding_window_h=aster_funding_window_h,
         )
         self.positions[symbol] = pos
         log.warning(

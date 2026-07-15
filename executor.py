@@ -269,7 +269,7 @@ class Executor:
 
         # Snapshot funding rates at entry (HL hourly, Aster 8h) for carry accounting.
         # Actively fetched: a cold cache would silently snapshot 0.0 forever.
-        hl_fr, aster_fr = await self.client.get_funding_rates_fresh(symbol)
+        hl_fr, aster_fr, aster_win_h = await self.client.get_funding_rates_fresh(symbol)
 
         if self.paper_mode:
             aster_fill = aster_book.bid if direction == "long_hl_short_aster" else aster_book.ask
@@ -280,6 +280,7 @@ class Executor:
                 entry_spread_bps=excess_bps, hl_ref_price=hl_ref,
                 hl_funding_rate=hl_fr, aster_funding_rate=aster_fr,
                 hold_for_funding=False, entry_baseline_bps=baseline_bps,
+                aster_funding_window_h=aster_win_h,
             )
             self.pm.confirm_hl_maker_open(symbol, qty, hl_ref, aster_fill)
             self._entry_streak.pop(symbol, None)
@@ -307,6 +308,7 @@ class Executor:
             entry_spread_bps=excess_bps, hl_ref_price=hl_ref,
             hl_funding_rate=hl_fr, aster_funding_rate=aster_fr,
             hold_for_funding=False, entry_baseline_bps=baseline_bps,
+            aster_funding_window_h=aster_win_h,
         )
         self._entry_streak.pop(symbol, None)
         log.info(f"{symbol}: convergence maker resting {alo.order_id} @ {hl_ref:.2f} — hedging on fill")
@@ -420,7 +422,7 @@ class Executor:
         baseline = self.client.get_book_spread_baseline(symbol)
         baseline_bps = baseline if baseline is not None else 0.0
         spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000
-        hl_fr, aster_fr = await self.client.get_funding_rates_fresh(symbol)
+        hl_fr, aster_fr, aster_win_h = await self.client.get_funding_rates_fresh(symbol)
 
         log.warning(
             f"MANUAL ENTRY {symbol}: {direction} | notional≈${actual_notional:.0f} "
@@ -446,6 +448,7 @@ class Executor:
                 aster_entry_order_id="PAPER", qty=qty, notional_usd=actual_notional,
                 hl_funding_rate=hl_fr, aster_funding_rate=aster_fr,
                 entry_baseline_bps=baseline_bps, hold_for_funding=hold_for_funding,
+                aster_funding_window_h=aster_win_h,
             )
             self.pm.confirm_aster_entry(symbol, aster_ref_price)
             return True, (
@@ -602,6 +605,7 @@ class Executor:
             notional_usd=actual_notional, hl_funding_rate=hl_fr,
             aster_funding_rate=aster_fr, entry_baseline_bps=baseline_bps,
             hold_for_funding=hold_for_funding,
+            aster_funding_window_h=aster_win_h,
         )
         self.pm.log_trade(
             pos.id, "hl", hl_side, "ioc_limit",
@@ -1057,7 +1061,7 @@ class Executor:
         if self.paper_mode:
             fill_notional = bite_qty * mid
             existing = self.pm.get(symbol)
-            hl_fr, ast_fr = await self.client.get_funding_rates_fresh(symbol)
+            hl_fr, ast_fr, aster_win_h = await self.client.get_funding_rates_fresh(symbol)
             if existing and existing.status == "open":
                 self.pm.scale_in(symbol, bite_qty, fill_notional, hl_ref, aster_ref,
                                  hl_funding_rate=hl_fr, aster_funding_rate=ast_fr)
@@ -1068,6 +1072,7 @@ class Executor:
                     direction=direction, qty=bite_qty,
                     hl_price=hl_ref, aster_price=aster_ref,
                     hl_funding_rate=hl_fr, aster_funding_rate=ast_fr,
+                    aster_funding_window_h=aster_win_h,
                 )
             drip["filled_notional"] += fill_notional
             drip["fills"] += 1
@@ -1115,7 +1120,7 @@ class Executor:
                                     notes=f"qty={hl_res.filled_qty} px={hl_res.fill_price}")
                     drip["unhedged_qty"] = 0.0
                     fill_notional = hedge_qty * mid
-                    hl_fr, ast_fr = await self.client.get_funding_rates_fresh(symbol)
+                    hl_fr, ast_fr, aster_win_h = await self.client.get_funding_rates_fresh(symbol)
                     existing = self.pm.get(symbol)
                     if existing and existing.status == "open":
                         self.pm.scale_in(symbol, hedge_qty, fill_notional,
@@ -1128,6 +1133,7 @@ class Executor:
                             direction=direction, qty=hedge_qty,
                             hl_price=hl_res.fill_price, aster_price=hl_ref,
                             hl_funding_rate=hl_fr, aster_funding_rate=ast_fr,
+                            aster_funding_window_h=aster_win_h,
                         )
                     drip["filled_notional"] += fill_notional
                     drip["fills"] += 1
@@ -1237,7 +1243,7 @@ class Executor:
         # Buffer hedged successfully — clear it.
         drip["unhedged_qty"] = 0.0
         fill_notional = hedge_qty * mid
-        hl_fr, ast_fr = await self.client.get_funding_rates_fresh(symbol)
+        hl_fr, ast_fr, aster_win_h = await self.client.get_funding_rates_fresh(symbol)
         existing = self.pm.get(symbol)
         if existing and existing.status == "open":
             self.pm.scale_in(symbol, hedge_qty, fill_notional,
@@ -1254,6 +1260,7 @@ class Executor:
                 direction=direction, qty=hedge_qty,
                 hl_price=hl_res.fill_price, aster_price=ast_res.fill_price,
                 hl_funding_rate=hl_fr, aster_funding_rate=ast_fr,
+                aster_funding_window_h=aster_win_h,
             )
             self.pm.log_trade(pos.id, "hl", hl_side, "drip_ioc",
                               hl_res.order_id, hedge_qty, hl_res.fill_price)
@@ -1344,7 +1351,7 @@ class Executor:
         if qty <= 0:
             return False, f"{symbol}: qty snapped to 0 (lot too large for ${notional:.0f})"
         spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000
-        hl_fr, aster_fr = await self.client.get_funding_rates_fresh(symbol)
+        hl_fr, aster_fr, aster_win_h = await self.client.get_funding_rates_fresh(symbol)
 
         log.warning(
             f"MAKER ENTRY {symbol}: {direction} | notional≈${qty*mid:.0f} qty={qty} | "
@@ -1370,6 +1377,7 @@ class Executor:
                 hl_baseline_szi=0.0, qty=qty, notional_usd=qty * mid,
                 entry_spread_bps=spread_bps, hl_ref_price=hl_ref_price,
                 hl_funding_rate=hl_fr, aster_funding_rate=aster_fr,
+                aster_funding_window_h=aster_win_h,
             )
             self.pm.confirm_hl_maker_open(symbol, qty, hl_ref_price, aster_fill)
             return True, f"[PAPER] entered {symbol} {direction} ${qty*mid:.0f} (maker-first)"
@@ -1417,6 +1425,7 @@ class Executor:
             entry_spread_bps=spread_bps, hl_ref_price=hl_ref_price,
             hl_funding_rate=hl_fr, aster_funding_rate=aster_fr,
             aster_baseline_amt=aster_baseline_amt,
+            aster_funding_window_h=aster_win_h,
         )
         return True, (
             f"resting HL maker for {symbol} {direction} ${qty*mid:.0f} @ {hl_ref_price:.2f} "
@@ -2321,6 +2330,7 @@ class Executor:
         taker_funding = estimate_funding_pnl(
             pos.direction, elapsed_hours, pos.notional_usd or pos.qty * mid,
             pos.hl_funding_rate, pos.aster_funding_rate,
+            pos.aster_funding_window_h,
         )
         taker_est_net = taker_gross - taker_fees + taker_funding
         if taker_est_net >= 0:

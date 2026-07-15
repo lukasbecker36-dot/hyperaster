@@ -468,6 +468,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     pos.direction, elapsed_hours,
                     pos.notional_usd or NOTIONAL_PER_LEG,
                     pos.hl_funding_rate, pos.aster_funding_rate,
+                    pos.aster_funding_window_h,
                 )
                 est_net = est_gross - est_fees + est_funding
                 latest_est_net[symbol] = est_net
@@ -898,6 +899,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
         for base, direction, qty, hl_px, ast_px, hl_szi, ast_amt in pairs:
             hl_fr = client.get_hl_funding_rate(base)
             ast_fr = client.get_aster_funding_rate(base)
+            ast_win = await client.get_aster_funding_window(base)
             pos = pm.import_position(
                 symbol=base,
                 hl_coin=f"xyz:{base}",
@@ -908,6 +910,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 aster_price=ast_px,
                 hl_funding_rate=hl_fr,
                 aster_funding_rate=ast_fr,
+                aster_funding_window_h=ast_win,
             )
             short_dir = "HL↑ Ast↓" if "long_hl" in direction else "HL↓ Ast↑"
             imported.append(

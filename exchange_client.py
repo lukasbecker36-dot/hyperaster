@@ -32,7 +32,7 @@ from config import (
     HYPERLIQUID_API, HL_EXCHANGE_URL,
     ASTER_ORDER_URL, ASTER_OPEN_ORDERS_URL, ASTER_POSITION_URL, ASTER_EXCHANGE_INFO_URL,
     ASTER_BALANCE_URL,
-    ORDER_TIMEOUT_SECONDS, HL_IOC_BUFFER_BPS, ASTER_IOC_BUFFER_BPS,
+    ORDER_TIMEOUT_SECONDS, HL_IOC_BUFFER_BPS, ASTER_IOC_BUFFER_BPS, ASTER_BASE,
     aster_symbol_for, ASTER_BASE_ALIAS, ASTER_BASE_TO_CANON,
     BASELINE_WINDOW_MINUTES, BASELINE_MIN_SAMPLES, BASELINE_SAMPLE_INTERVAL_SECONDS,
     ASTER_LEVERAGE_URL, ASTER_MARGIN_TYPE_URL, LEVERAGE, ASTER_MARGIN_TYPE,
@@ -144,6 +144,8 @@ class ExchangeClient:
         # symbol -> (rate, fetched_at_ms)
         self._hl_funding_cache: dict[str, tuple[float, int]] = {}
         self._aster_funding_cache: dict[str, tuple[float, int]] = {}
+        # Aster funding settlement window per symbol: (hours, detected_at_ms)
+        self._aster_window_cache: dict[str, tuple[float, int]] = {}
 
         # Rolling oracle-delta history per symbol: deque of (ts_ms, delta_bps),
         # delta_bps = (aster_index - hl_oracle) / mid * 10000. Its 8h median is
@@ -540,13 +542,15 @@ class ExchangeClient:
         cached = self._aster_funding_cache.get(symbol)
         return cached[0] if cached else 0.0
 
-    async def get_funding_rates_fresh(self, symbol: str) -> tuple[float, float]:
-        """Funding rates (hl_per_1h, aster_per_8h) for an entry snapshot,
-        refreshing the source feeds if the caches are cold. A silently-zero
-        snapshot poisons the position's funding P&L for its whole life, so
-        this actively fetches instead of trusting the scan-loop caches (which
-        only cover the scanned universe and may be cold right after restart
-        or for blocked/manual symbols)."""
+    async def get_funding_rates_fresh(self, symbol: str) -> tuple[float, float, float]:
+        """Funding snapshot for an entry: (hl_per_1h, aster_per_window,
+        aster_window_hours), refreshing the source feeds if the caches are cold.
+        A silently-zero snapshot poisons the position's funding P&L for its
+        whole life, so this actively fetches instead of trusting the scan-loop
+        caches (which only cover the scanned universe and may be cold right
+        after restart or for blocked/manual symbols). The window is detected
+        from settlement timestamps (most 8h, some 4h e.g. SKHX) and stored on
+        the position so funding accrual normalises correctly."""
         if symbol not in self._hl_funding_cache:
             await self.refresh_hl_oracles([symbol])
         # premiumIndex populates the Aster funding cache as a side effect;
@@ -555,12 +559,44 @@ class ExchangeClient:
             await self._get_aster_mark(symbol)
         hl_fr = self.get_hl_funding_rate(symbol)
         aster_fr = self.get_aster_funding_rate(symbol)
+        aster_win = await self.get_aster_funding_window(symbol)
         if hl_fr == 0.0 and aster_fr == 0.0:
             log.warning(
                 f"{symbol}: funding rates both 0.0 at entry snapshot — "
                 f"funding P&L will read $0 for this position"
             )
-        return hl_fr, aster_fr
+        return hl_fr, aster_fr, aster_win
+
+    async def get_aster_funding_window(self, symbol: str) -> float:
+        """Aster funding settlement window (hours) for a name, detected from the
+        gaps between actual settlement timestamps in the funding history. Most
+        names settle every 8h but some use 4h (e.g. SKHX); assuming 8h halves
+        their real funding accrual. Cached ~12h per symbol; falls back to 8.0
+        on failure or sparse history (fresh listings)."""
+        cached = self._aster_window_cache.get(symbol)
+        now = now_ms()
+        if cached and now - cached[1] < 12 * 3_600_000:
+            return cached[0]
+        window = 8.0
+        try:
+            async with self.session.get(
+                f"{ASTER_BASE}/fapi/v1/fundingRate",
+                params={"symbol": aster_symbol_for(symbol),
+                        "startTime": now - 48 * 3_600_000},
+                timeout=self.timeout,
+            ) as r:
+                rows = await r.json(content_type=None)
+            times = sorted(int(x.get("fundingTime") or 0)
+                           for x in (rows or []) if isinstance(x, dict))
+            gaps = [(t2 - t1) / 3_600_000 for t1, t2 in zip(times, times[1:]) if t2 > t1]
+            if gaps:
+                window = statistics.median(gaps)
+        except Exception as e:
+            log.debug(f"{symbol}: Aster funding window detect failed ({e}) — using 8h")
+        self._aster_window_cache[symbol] = (window, now)
+        if abs(window - 8.0) > 0.5:
+            log.info(f"{symbol}: Aster funding window detected as {window:.0f}h (not 8h)")
+        return window
 
     def record_oracle_delta(self, symbol: str):
         """Sample the live oracle/index delta (~1/min) into the rolling window
