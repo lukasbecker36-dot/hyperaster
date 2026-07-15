@@ -80,10 +80,14 @@ def _percentile(xs, p):
 
 async def _funding_avg_24h(session, symbol):
     """24h average funding from the venues' own history endpoints:
-    (avg_hl_per_1h, avg_ast_per_8h) — actual settled rates, not predictions.
-    Either side None on failure."""
+    (avg_hl_per_1h, avg_ast_per_window, ast_window_h) — actual settled rates,
+    not predictions. The Aster funding WINDOW is detected from the gaps between
+    settlement timestamps rather than assumed 8h — some names settle every 4h
+    (e.g. SKHX). Falls back to 8h when fewer than 2 settlements are visible.
+    Rate sides are None on failure."""
     start = int(time.time() * 1000) - DAY_MS
     hl_avg = ast_avg = None
+    ast_window_h = 8.0
     try:
         async with session.post(HYPERLIQUID_API,
                                 json={"type": "fundingHistory",
@@ -100,17 +104,23 @@ async def _funding_avg_24h(session, symbol):
                                params={"symbol": aster_symbol_for(symbol),
                                        "startTime": start}) as r:
             rows = await r.json(content_type=None)
-        rates = [float(x.get("fundingRate") or 0) for x in (rows or [])
-                 if isinstance(x, dict)]
+        rows = [x for x in (rows or []) if isinstance(x, dict)]
+        rates = [float(x.get("fundingRate") or 0) for x in rows]
         if rates:
             ast_avg = statistics.mean(rates)
+        times = sorted(int(x.get("fundingTime") or 0) for x in rows)
+        gaps = [(t2 - t1) / 3_600_000 for t1, t2 in zip(times, times[1:])
+                if t2 > t1]
+        if gaps:
+            ast_window_h = statistics.median(gaps)
     except Exception:
         pass
-    return hl_avg, ast_avg
+    return hl_avg, ast_avg, ast_window_h
 
 
 async def _funding(session, symbol):
-    """(hl_rate_per_1h, aster_rate_per_8h) — positive = longs pay shorts."""
+    """(hl_rate_per_1h, aster_rate_per_WINDOW) — positive = longs pay shorts.
+    The Aster window varies by name; _funding_avg_24h detects it."""
     hl_r = ast_r = None
     try:
         async with session.post(HYPERLIQUID_API,
@@ -213,7 +223,7 @@ async def main():
     symbol = sys.argv[1].upper()
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        hl, ast, (hl_fr, ast_fr), (hl_fr24, ast_fr24) = await asyncio.gather(
+        hl, ast, (hl_fr, ast_fr), (hl_fr24, ast_fr24, ast_win_h) = await asyncio.gather(
             _hl_book(session, symbol), _aster_book(session, symbol),
             _funding(session, symbol), _funding_avg_24h(session, symbol),
         )
@@ -253,17 +263,25 @@ async def main():
     lines.append(f"round trip now (enter+exit): {buy_hl_now + buy_ast_now:+.1f}bps")
     lines.append(f"books  HL {hl_bid:.2f}/{hl_ask:.2f}  Ast {ast_bid:.2f}/{ast_ask:.2f}")
 
+    # Funding: Aster rates are PER WINDOW and the window varies by name (SKHX
+    # settles every 4h, most 8h) — detected above from settlement timestamps.
+    # Both venues shown normalised to per-1h so they compare at a glance.
+    settles_day = 24.0 / ast_win_h if ast_win_h > 0 else 3.0
+    win_str = f"{ast_win_h:.0f}h window" if ast_win_h else "8h window"
     if hl_fr is not None and ast_fr is not None:
+        ast_1h = ast_fr / ast_win_h if ast_win_h > 0 else ast_fr / 8
         # Net carry per day (bps) for L-AST/S-HL: short HL earns hl_rate (if +),
         # long Aster pays ast_rate (if +). Other direction is the negative.
-        carry_last = (hl_fr * 24 - ast_fr * 3) * 10000
-        lines.append(f"funding now  HL {hl_fr*100:+.4f}%/1h  Ast {ast_fr*100:+.4f}%/8h")
+        carry_last = (hl_fr * 24 - ast_fr * settles_day) * 10000
+        lines.append(f"funding now (per 1h)  HL {hl_fr*100:+.4f}%  "
+                     f"Ast {ast_1h*100:+.4f}% ({win_str})")
         lines.append(f"  net carry ≈ {carry_last:+.1f}bps/day L-AST/S-HL "
                      f"({-carry_last:+.1f} L-HL/S-AST)")
     if hl_fr24 is not None and ast_fr24 is not None:
-        carry_24h = (hl_fr24 * 24 - ast_fr24 * 3) * 10000
-        lines.append(f"funding 24h avg (settled)  HL {hl_fr24*100:+.4f}%/1h  "
-                     f"Ast {ast_fr24*100:+.4f}%/8h")
+        ast24_1h = ast_fr24 / ast_win_h if ast_win_h > 0 else ast_fr24 / 8
+        carry_24h = (hl_fr24 * 24 - ast_fr24 * settles_day) * 10000
+        lines.append(f"funding 24h avg, settled (per 1h)  HL {hl_fr24*100:+.4f}%  "
+                     f"Ast {ast24_1h*100:+.4f}%")
         lines.append(f"  net carry ≈ {carry_24h:+.1f}bps/day L-AST/S-HL "
                      f"({-carry_24h:+.1f} L-HL/S-AST)")
 

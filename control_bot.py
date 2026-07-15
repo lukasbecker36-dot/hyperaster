@@ -393,9 +393,28 @@ def cmd_positions(chat_id: str, _arg: str):
         if hold_for_funding and notional:
             qty_str += f" (${notional:.0f})"
 
+        # Entry basis from the ACTUAL fills (matches /basis leg convention:
+        # in-your-favour, maker-HL/taker-Aster). Gross round trip = entry_basis
+        # + exit_basis, so you profit when
+        #   exit_basis > fees_bps − entry_basis − funding_accrued_bps.
+        # Funding keeps accruing, so the breakeven drifts down (carry trades)
+        # or up (paying) over time — it's live, not fixed at entry.
+        basis_str = ""
+        if hl_px and ast_px and hl_px > 0 and ast_px > 0:
+            entry_mid = (hl_px + ast_px) / 2
+            pos_dir = direction or "long_hl_short_aster"
+            entry_basis = ((ast_px - hl_px) if "long_hl" in pos_dir
+                           else (hl_px - ast_px)) / entry_mid * 10000
+            fees_bps = fees / notional * 10000 if notional else 0.0
+            funding_bps = funding / notional * 10000 if notional else 0.0
+            be_exit = fees_bps - entry_basis - funding_bps
+            basis_str = (f"    basis: entry={entry_basis:+.1f}bps  "
+                         f"breakeven exit≥{be_exit:+.1f}bps (fees+funding incl)\n")
+
         if hold_for_funding:
             lines.append(
                 f"• {sym}{tag} [{status}] {short_dir}\n"
+                f"{basis_str}"
                 f"    HL:{hl_px:.2f}  Ast:{ast_px:.2f}  qty={qty_str}\n"
                 f"    funding=${funding:+.2f}  fees=${fees:.2f}  held={held_h:.1f}h{est_net_str}"
             )
@@ -403,6 +422,7 @@ def cmd_positions(chat_id: str, _arg: str):
             lines.append(
                 f"• {sym}{tag} [{status}] {short_dir}\n"
                 f"    excess: entry={spread:+.0f}bps  {excess_str}  exit≤0bps\n"
+                f"{basis_str}"
                 f"    HL:{hl_px:.2f}  Ast:{ast_px:.2f}  qty={qty_str}\n"
                 f"    funding=${funding:+.2f}  fees=${fees:.2f}  held={held_h:.1f}h{est_net_str}\n"
                 f"    target=${sym_target:.2f} net | need gross≥${sym_target - funding + fees:.2f}"
