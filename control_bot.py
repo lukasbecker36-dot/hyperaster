@@ -845,7 +845,8 @@ def cmd_enter(chat_id: str, arg: str):
              "Usage: /enter SYMBOL DIRECTION NOTIONAL [BASIS_TARGET_BPS]\n"
              "e.g. /enter SMSN long_hl_short_aster 1000\n"
              "     /enter SMSN buy_hl 1000 -10   (wait until entry basis ≥ -10bps)\n"
-             "DIRECTION aliases: buy_hl / buy_aster / L-HL/S-AST / L-AST/S-HL")
+             "DIRECTION aliases: buy_hl / buy_aster / L-HL/S-AST / L-AST/S-HL\n"
+             "Check /basis SYM first — it shows the live level each gate compares against.")
         return
     symbol = toks[0].upper()
     direction = _DIR_ALIASES.get(toks[1].lower())
@@ -914,11 +915,15 @@ def cmd_close(chat_id: str, arg: str):
     gate = ""
     if len(toks) >= 2:
         try:
-            req["target_bps"] = float(toks[1])
-            gate = f" once exit basis ≥ {req['target_bps']:.0f}bps"
+            bps = float(toks[1])
         except ValueError:
             send(chat_id, f"Bad basis target {toks[1]!r} — must be a number (bps).")
             return
+        # 0 = close now (documented above); a 0 gate would wait for basis ≥ 0,
+        # which is NOT "now" on a name whose exit basis sits negative.
+        if bps != 0:
+            req["target_bps"] = bps
+            gate = f" once exit basis ≥ {bps:.0f}bps"
     maker_venue = ""
     close_notional = 0.0
     for t in toks[2:]:
@@ -1197,12 +1202,32 @@ def cmd_book(chat_id: str, arg: str):
          parse_mode="HTML")
 
 
+def cmd_basis(chat_id: str, arg: str):
+    """Live executable basis for one name — the exact numbers the /enter and
+    /close basis gates check (maker-HL/taker-Aster, from live bid/ask), plus a
+    24h average (exact from the capture DB when available, else ~candle mids).
+
+    Shells out to scripts/basis_snapshot.py (venv + live API egress).
+    Usage: /basis SYMBOL
+    """
+    symbol = arg.strip().split()[0].upper() if arg.strip() else ""
+    if not symbol:
+        send(chat_id, "Usage: /basis SYMBOL  (e.g. /basis SKHX)")
+        return
+    script = BASE_DIR / "scripts" / "basis_snapshot.py"
+    send(chat_id, f"⏳ fetching {symbol} basis…")
+    code, out = run([PYTHON, str(script), symbol], timeout=45)
+    send(chat_id, f"<pre>{out}</pre>" if out else f"(no output, exit {code})",
+         parse_mode="HTML")
+
+
 def cmd_help(chat_id: str, _arg: str):
     send(chat_id,
          "Commands:\n"
          "/status — service state + spreads + positions\n"
          "/spreads — current spread vs threshold detail\n"
          "/book SYM — top-5 order book on both venues\n"
+         "/basis SYM — live entry/exit basis + 24h avg (gate reference)\n"
          "/funding [n] — top funding-carry opportunities\n"
          "/backtest [hours] [SYM] — backtest convergence on recent candles\n"
          "/enter SYM DIR NOTIONAL [basis_bps] — open a funding hold; basis_bps waits for a fill level\n"
@@ -1233,7 +1258,7 @@ HANDLERS = {
     "/status": cmd_status, "/positions": cmd_positions, "/pos": cmd_positions,
     "/pnl": cmd_pnl, "/trades": cmd_trades,
     "/balance": cmd_balance, "/balances": cmd_balance,
-    "/book": cmd_book,
+    "/book": cmd_book, "/basis": cmd_basis,
     "/backtest": cmd_backtest, "/bt": cmd_backtest,
     "/funding": cmd_funding, "/carry": cmd_funding,
     "/enter": cmd_enter, "/close": cmd_close, "/cancel": cmd_cancel,
@@ -1308,6 +1333,7 @@ def main():
             {"command": "status", "description": "Service state + spreads + positions"},
             {"command": "spreads", "description": "Current spread vs threshold"},
             {"command": "book", "description": "Top-5 order book on both venues: SYM"},
+            {"command": "basis", "description": "Live entry/exit basis + 24h avg: SYM"},
             {"command": "funding", "description": "Top funding-carry opportunities"},
             {"command": "backtest", "description": "Backtest convergence: [hours] [SYM]"},
             {"command": "positions", "description": "Open positions + pending basis gates"},
