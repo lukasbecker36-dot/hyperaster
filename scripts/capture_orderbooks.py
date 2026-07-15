@@ -27,7 +27,9 @@ Storage: SQLite (WAL) at DATA_DIR/orderbook_capture.db, ~80 bytes/row →
 hundred MB for two days. Use --depth to also store the top-5 levels JSON (larger).
 
 Usage:
-    python scripts/capture_orderbooks.py                 # 3s cadence, top-of-book
+    python scripts/capture_orderbooks.py                 # 3s cadence, auto-stops after 24h
+    python scripts/capture_orderbooks.py --max-hours 48  # run for two days
+    python scripts/capture_orderbooks.py --max-hours 0   # run until killed
     python scripts/capture_orderbooks.py --interval 2    # faster
     python scripts/capture_orderbooks.py --depth         # also store 5-level depth
     python scripts/capture_orderbooks.py --once          # single cycle (smoke test)
@@ -101,11 +103,12 @@ def _init_db(path: str) -> sqlite3.Connection:
 
 
 class Capturer:
-    def __init__(self, session, interval, depth, aster_depth):
+    def __init__(self, session, interval, depth, aster_depth, max_hours=0.0):
         self.session = session
         self.interval = interval
         self.depth = depth              # store HL top-5 levels JSON
         self.aster_depth = aster_depth  # also fetch + store Aster 5-level depth
+        self.max_hours = max_hours      # auto-stop after this long (0 = run forever)
         self.timeout = aiohttp.ClientTimeout(total=8)
         self.symbols: list[str] = []    # canonical bases
         self._sem = asyncio.Semaphore(10)   # cap concurrent HL l2Book calls
@@ -300,8 +303,10 @@ class Capturer:
         if not self.symbols:
             log.error("No overlap universe discovered — aborting")
             return
-        log.info(f"Capturing {len(self.symbols)} names @ {self.interval}s: "
-                 f"{', '.join(self.symbols)}")
+        deadline = (time.time() + self.max_hours * 3600) if self.max_hours > 0 else None
+        log.info(f"Capturing {len(self.symbols)} names @ {self.interval}s"
+                 + (f" — auto-stop in {self.max_hours}h" if deadline else "")
+                 + f": {', '.join(self.symbols)}")
 
         stop = {"flag": False}
 
@@ -317,6 +322,9 @@ class Capturer:
         last_report = time.time()
         last_discover = time.time()
         while not stop["flag"]:
+            if deadline and time.time() >= deadline:
+                log.info(f"Reached {self.max_hours}h capture limit — stopping")
+                break
             t0 = time.time()
             try:
                 n = await self.cycle(conn)
@@ -385,6 +393,8 @@ def main():
     ap.add_argument("--depth", action="store_true", help="also store HL top-5 levels JSON")
     ap.add_argument("--aster-depth", action="store_true", help="also fetch+store Aster 5-level depth")
     ap.add_argument("--once", action="store_true", help="single cycle then exit (smoke test)")
+    ap.add_argument("--max-hours", type=float, default=24.0,
+                    help="auto-stop after this many hours (0 = run until killed)")
     a = ap.parse_args()
 
     logging.basicConfig(
@@ -397,7 +407,7 @@ def main():
 
     async def _run():
         async with aiohttp.ClientSession() as session:
-            cap = Capturer(session, a.interval, a.depth, a.aster_depth)
+            cap = Capturer(session, a.interval, a.depth, a.aster_depth, a.max_hours)
             await cap.run(conn, run_once=a.once)
 
     try:
