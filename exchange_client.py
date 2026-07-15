@@ -1293,13 +1293,22 @@ class ExchangeClient:
                     return OrderResult(success=False, error=f"HTTP {r.status}: {text}", ambiguous=True)
                 data = await r.json()
 
-            if data.get("status") != "ok":
-                err = str(data.get("response", data))
+            if not isinstance(data, dict) or data.get("status") != "ok":
+                err = str((data or {}).get("response", data) if isinstance(data, dict) else data)
                 log.error(f"HL ALO failed: {err}")
-                return OrderResult(success=False, error=err, raw=data)
+                return OrderResult(success=False, error=err, raw=data if isinstance(data, dict) else {})
 
-            statuses = data.get("response", {}).get("data", {}).get("statuses", [{}])
-            s = statuses[0] if statuses else {}
+            # Null-safe navigation: HL can return {"status":"ok","response":null}
+            # (or a null data/statuses) — chained .get with a {} default still
+            # throws when a present key holds None, so coerce each level.
+            resp = data.get("response") or {}
+            inner = resp.get("data") or {} if isinstance(resp, dict) else {}
+            statuses = inner.get("statuses") if isinstance(inner, dict) else None
+            if not statuses:
+                log.error(f"HL ALO ok but no statuses in response: {data}")
+                return OrderResult(success=False, error=f"empty status: {resp}",
+                                   ambiguous=True, raw=data)
+            s = statuses[0] or {}
             if "resting" in s:
                 oid = str(s["resting"].get("oid", ""))
                 log.info(f"HL ALO resting: {side.upper()} {qty} {hl_coin} @ {price} -> {oid}")

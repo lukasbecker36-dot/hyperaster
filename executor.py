@@ -391,8 +391,13 @@ class Executor:
             aster_book, hl_book = await self.client.get_both_books(symbol)
         except Exception as e:
             return False, f"{symbol}: book fetch failed ({e})"
-        if aster_book.bid <= 0 or hl_book.bid <= 0:
-            return False, f"{symbol}: empty book"
+        # Both sides of both books must be populated — a half-empty book (e.g. a
+        # missing HL bid/ask from a transient fetch miss) yields a garbage price
+        # and an unplaceable maker order.
+        if (aster_book.bid <= 0 or aster_book.ask <= 0
+                or hl_book.bid <= 0 or hl_book.ask <= 0):
+            return False, f"{symbol}: incomplete book (Ast {aster_book.bid}/{aster_book.ask} " \
+                          f"HL {hl_book.bid}/{hl_book.ask}) — try again"
         mid = (aster_book.mid + hl_book.mid) / 2
         if mid <= 0:
             return False, f"{symbol}: bad mid"
@@ -1324,8 +1329,13 @@ class Executor:
             aster_book, hl_book = await self.client.get_both_books(symbol)
         except Exception as e:
             return False, f"{symbol}: book fetch failed ({e})"
-        if aster_book.bid <= 0 or hl_book.bid <= 0:
-            return False, f"{symbol}: empty book"
+        # Both sides of both books must be populated — a half-empty book (e.g. a
+        # missing HL bid/ask from a transient fetch miss) yields a garbage price
+        # and an unplaceable maker order.
+        if (aster_book.bid <= 0 or aster_book.ask <= 0
+                or hl_book.bid <= 0 or hl_book.ask <= 0):
+            return False, f"{symbol}: incomplete book (Ast {aster_book.bid}/{aster_book.ask} " \
+                          f"HL {hl_book.bid}/{hl_book.ask}) — try again"
         mid = (aster_book.mid + hl_book.mid) / 2
         if mid <= 0:
             return False, f"{symbol}: bad mid"

@@ -219,6 +219,14 @@ def _carry_basis_bps(direction: str, action: str, aster_book, hl_book):
           sell HL @ ask (maker), buy Aster @ ask (taker)
           = (hl_ask - aster_ask) / mid
     """
+    # BOTH books must be fully populated. If one venue's book is empty (bid or
+    # ask 0 — a transient fetch miss), the combined mid is still positive from
+    # the other side and the basis math produces garbage (a missing HL bid made
+    # (aster_bid-0)/mid ≈ 2 → ~20000bps, which cleared a gate and fired a bogus
+    # order into an unplaceable price). No valid basis without both books.
+    if (aster_book.bid <= 0 or aster_book.ask <= 0
+            or hl_book.bid <= 0 or hl_book.ask <= 0):
+        return None
     mid = (aster_book.mid + hl_book.mid) / 2
     if mid <= 0:
         return None
