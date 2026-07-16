@@ -123,6 +123,10 @@ _BALANCES_FILE = os.path.join(DATA_DIR, "balances.json")
 # Session health (cycle counts, auto-entry state) for /status — the control bot
 # is a separate process and can't read the trader's in-memory counters.
 _HEALTH_FILE = os.path.join(DATA_DIR, "bot_health.json")
+# Actual accrued funding/fees per open position, reconciled from the venues
+# periodically by the trader so /positions can show real funding (not the
+# entry-rate estimate, which extrapolates a single snapshot and drifts badly).
+_COSTS_FILE = os.path.join(DATA_DIR, "position_costs.json")
 
 
 def _write_pending_gates(pending_entries: dict, pending_exits: dict,
@@ -367,6 +371,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     last_heartbeat = start_time
     last_aster_poll = 0
     last_slow_scan = 0
+    last_cost_reconcile = 0  # actual funding/fees for open positions → position_costs.json
     last_discovery = start_time  # first auto-discovery runs DISCOVERY_INTERVAL after start
     tick_count = 0
     consecutive_errors = 0
@@ -374,6 +379,10 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     latest_spreads: dict[str, tuple[float, str, float]] = {}
     # symbol -> est_net USD (executable bid/ask P&L) for open positions
     latest_est_net: dict[str, float] = {}
+    # symbol -> ACTUAL accrued funding (USD) reconciled from the venues every
+    # ~5min. Used in place of the entry-rate estimate for est_net so the stop/
+    # display P&L reflects real settled funding, not an extrapolated snapshot.
+    actual_funding_by_sym: dict[str, float] = {}
     # Runtime flags refreshed once per tick from their control files.
     runtime_flags = {"auto_entry": True, "auto_exit": True,
                      "auto_notional": float(NOTIONAL_PER_LEG)}
@@ -475,12 +484,18 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     est_gross = 0.0
                 rt_fee = CARRY_ROUND_TRIP_FEE if maker_first else ROUND_TRIP_FEE
                 est_fees = (pos.notional_usd or NOTIONAL_PER_LEG) * rt_fee
-                est_funding = estimate_funding_pnl(
-                    pos.direction, elapsed_hours,
-                    pos.notional_usd or NOTIONAL_PER_LEG,
-                    pos.hl_funding_rate, pos.aster_funding_rate,
-                    pos.aster_funding_window_h,
-                )
+                # Prefer the ACTUAL settled funding reconciled from the venues
+                # (refreshed ~5min); the entry-rate estimate extrapolates one
+                # snapshot linearly and drifts far (SKHX est -$4.43 vs ~flat).
+                if symbol in actual_funding_by_sym:
+                    est_funding = actual_funding_by_sym[symbol]
+                else:
+                    est_funding = estimate_funding_pnl(
+                        pos.direction, elapsed_hours,
+                        pos.notional_usd or NOTIONAL_PER_LEG,
+                        pos.hl_funding_rate, pos.aster_funding_rate,
+                        pos.aster_funding_window_h,
+                    )
                 est_net = est_gross - est_fees + est_funding
                 latest_est_net[symbol] = est_net
 
@@ -1246,6 +1261,40 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     f"Watching: {cand_str}"
                 )
                 consecutive_errors = 0
+
+            # ── 4b. Reconcile actual funding/fees for open positions ──
+            # /positions otherwise shows the entry-rate funding ESTIMATE, which
+            # extrapolates a single snapshot linearly and drifts far from reality
+            # (SKHX showed -$4.43 when actual was ~flat). Every 5 min, pull the
+            # real settled funding + commission from the venues per open position
+            # and write it for the control bot to display. Live only.
+            if (not paper_mode
+                    and now - last_cost_reconcile >= 300_000
+                    and pm.positions):
+                last_cost_reconcile = now
+                costs = {}
+                # Rebuild fresh so a closed position's funding can't leak into a
+                # later position on the same symbol.
+                actual_funding_by_sym.clear()
+                for sym, p in list(pm.positions.items()):
+                    try:
+                        r = await client.reconcile_position_costs(
+                            sym, p.entry_time, now_ms())
+                        if r.get("ok"):
+                            costs[sym] = {"funding": round(r["funding"], 4),
+                                          "fees": round(r["fees"], 4),
+                                          "ts": time.time()}
+                            actual_funding_by_sym[sym] = r["funding"]
+                    except Exception as e:
+                        log.debug(f"cost reconcile {sym} failed: {e}")
+                if costs:
+                    try:
+                        tmp = _COSTS_FILE + ".tmp"
+                        with open(tmp, "w") as fh:
+                            json.dump(costs, fh)
+                        os.replace(tmp, _COSTS_FILE)
+                    except Exception as e:
+                        log.debug(f"position_costs write failed: {e}")
 
             # ── 5. Heartbeat ──
             elapsed_hb = (now_ms() - last_heartbeat) / 60_000

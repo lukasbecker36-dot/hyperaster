@@ -271,6 +271,17 @@ def _load_pending_gates() -> dict:
         return {}
 
 
+def _load_position_costs() -> dict:
+    """Load position_costs.json — actual accrued funding/fees per open position,
+    reconciled from the venues by the trader (vs the entry-rate estimate)."""
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "position_costs.json")
+        with open(p) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def _pending_gate_lines() -> list[str]:
     """Render the 'waiting for basis target' section for /positions."""
     g = _load_pending_gates()
@@ -344,6 +355,7 @@ def cmd_positions(chat_id: str, _arg: str):
         return
     now = time.time() * 1000
     live = _load_live_spreads()
+    costs = _load_position_costs()   # actual funding/fees from the venues, per symbol
     stale = ""
     if live.get("_ts") and time.time() - live["_ts"] > 30:
         stale = " ⚠️stale"
@@ -384,10 +396,24 @@ def cmd_positions(chat_id: str, _arg: str):
         # Maker-first (carry + convergence) pay HL-maker/Aster-taker; legacy
         # taker convergence pays HL-taker/Aster-maker.
         fees = notional * (CARRY_ROUND_TRIP_FEE if entry_maker_venue == "hl" else ROUND_TRIP_FEE)
-        funding = estimate_funding_pnl(
-            direction or "long_hl_short_aster", held_h, notional,
-            hl_fr or 0, ast_fr or 0, ast_win_h or 8.0,
-        )
+        # Funding: prefer the ACTUAL settled figure the trader reconciled from the
+        # venues (position_costs.json, refreshed ~5min). The estimate extrapolates
+        # a single entry-snapshot rate linearly and drifts badly on names whose
+        # funding swings (SKHX: est -$4.43 vs actual ~flat). Fall back to the
+        # estimate if there's no fresh actual yet.
+        c = costs.get(sym) if isinstance(costs, dict) else None
+        fund_src = ""
+        if c and isinstance(c, dict) and time.time() - c.get("ts", 0) < 900:
+            funding = c.get("funding", 0.0)
+            fund_src = " (actual)"
+            # entry commission so far is real too; keep round-trip fee estimate for
+            # the target math but show the actual accrued fee if larger info wanted.
+        else:
+            funding = estimate_funding_pnl(
+                direction or "long_hl_short_aster", held_h, notional,
+                hl_fr or 0, ast_fr or 0, ast_win_h or 8.0,
+            )
+            fund_src = " (est)"
         # Profit target scales with the position's notional, matching the trader's
         # exit logic — a fixed $3 on a $20 test position would be ~1500bps.
         base_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(sym, EXIT_TARGET_NET_USD)
@@ -439,7 +465,8 @@ def cmd_positions(chat_id: str, _arg: str):
                 f"• {sym}{tag} [{status}] {short_dir}\n"
                 f"{basis_str}"
                 f"    HL:{hl_px:.2f}  Ast:{ast_px:.2f}  qty={qty_str}\n"
-                f"    funding=${funding:+.2f}  fees=${fees:.2f}  held={held_h:.1f}h{est_net_str}"
+                f"    funding=${funding:+.2f}{fund_src}  fees=${fees:.2f}  "
+                f"held={held_h:.1f}h{est_net_str}"
             )
         else:
             lines.append(
@@ -447,7 +474,8 @@ def cmd_positions(chat_id: str, _arg: str):
                 f"    excess: entry={spread:+.0f}bps  {excess_str}  exit≤0bps\n"
                 f"{basis_str}"
                 f"    HL:{hl_px:.2f}  Ast:{ast_px:.2f}  qty={qty_str}\n"
-                f"    funding=${funding:+.2f}  fees=${fees:.2f}  held={held_h:.1f}h{est_net_str}\n"
+                f"    funding=${funding:+.2f}{fund_src}  fees=${fees:.2f}  "
+                f"held={held_h:.1f}h{est_net_str}\n"
                 f"    target=${sym_target:.2f} net | need gross≥${sym_target - funding + fees:.2f}"
             )
     if gate_lines:
