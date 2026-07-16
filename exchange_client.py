@@ -31,7 +31,7 @@ from auth import sign_aster_request, now_ms
 from config import (
     HYPERLIQUID_API, HL_EXCHANGE_URL,
     ASTER_ORDER_URL, ASTER_OPEN_ORDERS_URL, ASTER_POSITION_URL, ASTER_EXCHANGE_INFO_URL,
-    ASTER_BALANCE_URL,
+    ASTER_BALANCE_URL, ASTER_INCOME_URL,
     ORDER_TIMEOUT_SECONDS, HL_IOC_BUFFER_BPS, ASTER_IOC_BUFFER_BPS, ASTER_BASE,
     aster_symbol_for, ASTER_BASE_ALIAS, ASTER_BASE_TO_CANON,
     BASELINE_WINDOW_MINUTES, BASELINE_MIN_SAMPLES, BASELINE_SAMPLE_INTERVAL_SECONDS,
@@ -1103,6 +1103,106 @@ class ExchangeClient:
         except Exception as e:
             log.warning(f"Aster open orders error: {e}")
             return []
+
+    async def reconcile_position_costs(self, symbol: str, start_ms: int,
+                                       end_ms: int) -> dict:
+        """Sum the ACTUAL funding and commission paid on both legs of a position
+        over [start_ms, end_ms], from the venues' own records (not the entry-rate
+        estimate). Returns a dict:
+            {"funding": signed USD (+received/-paid), "fees": USD cost (>=0),
+             "ok": bool, "detail": str}
+        Best-effort: if either venue query fails, ok=False and the caller keeps
+        the estimate. Aster income (FUNDING_FEE/COMMISSION) + HL userFunding +
+        HL fill fees. HL is USDC, Aster USDT — summed 1:1 (a stablecoin basis
+        move over the hold is unpriced, same assumption as the estimate)."""
+        pad = 90_000  # catch settlement/commission indexing just past the close
+        ast, hl_fund, hl_fee = await asyncio.gather(
+            self._aster_income_sum(symbol, start_ms - pad, end_ms + pad),
+            self._hl_user_funding_sum(symbol, start_ms - pad, end_ms + pad),
+            self._hl_fill_fee_sum(symbol, start_ms - pad, end_ms + pad),
+            return_exceptions=True,
+        )
+        if (isinstance(ast, Exception) or isinstance(hl_fund, Exception)
+                or isinstance(hl_fee, Exception) or ast is None
+                or hl_fund is None or hl_fee is None):
+            return {"funding": 0.0, "fees": 0.0, "ok": False,
+                    "detail": f"query failed (ast={ast} hl_fund={hl_fund} hl_fee={hl_fee})"}
+        funding = hl_fund + ast["funding"]          # both signed
+        fees = hl_fee + (-ast["commission"])        # commission is negative → positive cost
+        return {
+            "funding": funding, "fees": fees, "ok": True,
+            "detail": (f"HL fund {hl_fund:+.4f} fee {hl_fee:.4f} | "
+                       f"Ast fund {ast['funding']:+.4f} comm {ast['commission']:.4f}"),
+        }
+
+    async def _aster_income_sum(self, symbol: str, start_ms: int, end_ms: int) -> dict:
+        """Signed GET /fapi/v1/income for one symbol → {"funding": sum
+        FUNDING_FEE, "commission": sum COMMISSION} (both signed as account
+        deltas: funding +received/-paid, commission negative = cost)."""
+        aster_sym = aster_symbol_for(symbol)
+        params = {"symbol": aster_sym, "startTime": int(start_ms),
+                  "endTime": int(end_ms), "limit": 1000}
+        signed = self._sign_aster(params)
+        async with self.session.get(
+            ASTER_INCOME_URL, params=signed, timeout=self.timeout
+        ) as r:
+            data = await r.json(content_type=None)
+        if not isinstance(data, list):
+            raise ValueError(f"income not a list: {str(data)[:150]}")
+        funding = commission = 0.0
+        for row in data:
+            if not isinstance(row, dict) or row.get("symbol") != aster_sym:
+                continue
+            t = row.get("incomeType")
+            amt = float(row.get("income") or 0)
+            if t == "FUNDING_FEE":
+                funding += amt
+            elif t == "COMMISSION":
+                commission += amt
+        return {"funding": funding, "commission": commission}
+
+    @staticmethod
+    def _hl_coin_matches(reported: str, base: str) -> bool:
+        """HL may report the builder-dex coin as 'xyz:SKHX' or bare 'SKHX' in
+        userFunding/userFills — match on the last path segment either way."""
+        if not reported:
+            return False
+        return reported.split(":")[-1] == base
+
+    async def _hl_user_funding_sum(self, base: str, start_ms: int, end_ms: int) -> float:
+        """POST /info userFunding → summed USDC funding delta for the coin
+        (signed: +received / -paid)."""
+        async with self.session.post(
+            HYPERLIQUID_API,
+            json={"type": "userFunding",
+                  "user": self.api_keys["hl_account_address"],
+                  "startTime": int(start_ms), "endTime": int(end_ms)},
+            timeout=self.timeout,
+        ) as r:
+            data = await r.json(content_type=None)
+        if not isinstance(data, list):
+            raise ValueError(f"userFunding not a list: {str(data)[:150]}")
+        total = 0.0
+        for row in data:
+            delta = (row or {}).get("delta") or {}
+            if self._hl_coin_matches(delta.get("coin", ""), base):
+                total += float(delta.get("usdc") or 0)
+        return total
+
+    async def _hl_fill_fee_sum(self, base: str, start_ms: int, end_ms: int) -> float:
+        """POST /info userFillsByTime → summed fee for the coin (USDC cost, >=0)."""
+        async with self.session.post(
+            HYPERLIQUID_API,
+            json={"type": "userFillsByTime",
+                  "user": self.api_keys["hl_account_address"],
+                  "startTime": int(start_ms), "endTime": int(end_ms)},
+            timeout=self.timeout,
+        ) as r:
+            data = await r.json(content_type=None)
+        if not isinstance(data, list):
+            raise ValueError(f"userFillsByTime not a list: {str(data)[:150]}")
+        return sum(float((f or {}).get("fee") or 0)
+                   for f in data if self._hl_coin_matches((f or {}).get("coin", ""), base))
 
     async def get_aster_position(self, symbol: str) -> dict:
         aster_sym = aster_symbol_for(symbol)

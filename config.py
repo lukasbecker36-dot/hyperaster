@@ -18,6 +18,7 @@ ASTER_BALANCE_URL = f"{ASTER_BASE}/fapi/v3/balance"
 ASTER_EXCHANGE_INFO_URL = f"{ASTER_BASE}/fapi/v3/exchangeInfo"
 ASTER_LEVERAGE_URL = f"{ASTER_BASE}/fapi/v1/leverage"
 ASTER_MARGIN_TYPE_URL = f"{ASTER_BASE}/fapi/v1/marginType"
+ASTER_INCOME_URL = f"{ASTER_BASE}/fapi/v1/income"
 
 # ── Leverage & margin ──
 # Applied per symbol on the first live entry (HL via updateLeverage isolated,

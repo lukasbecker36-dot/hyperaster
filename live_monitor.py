@@ -326,6 +326,9 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     await client.warmup_book_spread(all_load_syms)
 
     pm = pm_preload
+    # Give the PM the client so a live close can reconcile actual funding +
+    # commission from the venues before it sends the CLOSED alert.
+    pm.client = client
     executor = Executor(client, pm, paper_mode=paper_mode)
 
     # Crash recovery: reconcile any uncompleted intents against venue state.

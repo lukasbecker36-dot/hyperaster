@@ -9,6 +9,7 @@ State machine per position:
   error     → needs manual intervention
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Optional
@@ -137,6 +138,9 @@ class PositionManager:
         # Session cycle health (for the heartbeat): clean closes vs errors.
         self.session_cycles_ok = 0
         self.session_cycles_error = 0
+        # Set by the monitor after construction. When present (live), a close
+        # reconciles actual funding/commission from the venues before alerting.
+        self.client = None
         self._load_open_positions()
 
     def _load_open_positions(self):
@@ -835,14 +839,86 @@ class PositionManager:
             f"gross=${gross:.2f} fees=${fees:.2f} funding=${funding:.2f} net=${net:.2f}"
         )
         self.session_cycles_ok += 1
-        emoji = "🔴" if net < 0 else "✅"
         held_h = max(0.0, (pos.exit_time - pos.entry_time) / 3_600_000)
-        self._trade_alert(
-            f"{emoji} CLOSED {symbol} {_dir_short(pos.direction)} ({exit_reason}) | "
-            f"net=${net:+.2f} (gross ${gross:+.2f}, fees ${fees:.2f}, funding ${funding:+.2f}) | "
-            f"held {held_h:.1f}h"
-        )
+
+        # Estimate-based figures are what we have synchronously. For a LIVE close
+        # try to reconcile actual funding + commission from the venues (they
+        # settle at/just after close, so a short deferred task queries them and
+        # replaces the alert). Falls back to the estimate if unavailable.
+        if (not self.paper_mode and self.client is not None
+                and self._spawn_reconcile(pos, gross, fees, funding, exit_reason, held_h)):
+            pass  # reconcile task will send the CLOSED alert
+        else:
+            self._send_close_alert(symbol, pos.direction, exit_reason, gross,
+                                   fees, funding, held_h, actual=False)
         del self.positions[symbol]
+
+    def _send_close_alert(self, symbol, direction, exit_reason, gross, fees,
+                          funding, held_h, actual: bool):
+        net = gross - fees + funding
+        emoji = "🔴" if net < 0 else "✅"
+        src = "actual" if actual else "est"
+        self._trade_alert(
+            f"{emoji} CLOSED {symbol} {_dir_short(direction)} ({exit_reason}) | "
+            f"net=${net:+.2f} (gross ${gross:+.2f}, fees ${fees:.2f}, "
+            f"funding ${funding:+.2f}) [{src} fund/fees] | held {held_h:.1f}h"
+        )
+
+    def _spawn_reconcile(self, pos, gross, est_fees, est_funding,
+                         exit_reason, held_h) -> bool:
+        """Schedule a deferred task to replace est fees/funding with the venues'
+        actual settled figures in the CLOSED alert (and DB). Returns True if the
+        task was scheduled (caller then skips the immediate alert). False if
+        there's no running loop (tests) → caller alerts with the estimate."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        snap = {
+            "id": pos.id, "symbol": pos.symbol, "direction": pos.direction,
+            "entry_time": pos.entry_time, "exit_time": pos.exit_time or now_ms(),
+            "gross": gross, "est_fees": est_fees, "est_funding": est_funding,
+            "exit_reason": exit_reason, "held_h": held_h,
+        }
+        loop.create_task(self._reconcile_and_alert(snap))
+        return True
+
+    async def _reconcile_and_alert(self, s: dict):
+        """Query actual funding + commission for the closed position and send the
+        single CLOSED alert. Any failure → alert with the estimate (labelled)."""
+        gross, fees, funding = s["gross"], s["est_fees"], s["est_funding"]
+        actual = False
+        try:
+            # Give the venues a moment to index the closing commission + final
+            # funding tick before querying.
+            await asyncio.sleep(6)
+            r = await self.client.reconcile_position_costs(
+                s["symbol"], s["entry_time"], s["exit_time"])
+            if r.get("ok"):
+                fees, funding, actual = r["fees"], r["funding"], True
+                net = gross - fees + funding
+                log.info(f"Position #{s['id']} RECONCILED {s['symbol']}: "
+                         f"fees ${s['est_fees']:.2f}→${fees:.2f} "
+                         f"funding ${s['est_funding']:+.2f}→${funding:+.2f} "
+                         f"net ${net:+.2f} | {r.get('detail','')}")
+                try:
+                    conn = get_connection()
+                    conn.execute(
+                        "UPDATE positions SET fee_cost=?, funding_pnl=?, net_pnl=? "
+                        "WHERE id=?",
+                        (round(fees, 4), round(funding, 4), round(net, 4), s["id"]))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    log.warning(f"reconcile DB update failed ({e})")
+            else:
+                log.warning(f"Position #{s['id']} {s['symbol']}: cost reconcile "
+                            f"unavailable ({r.get('detail')}) — using estimate")
+        except Exception as e:
+            log.warning(f"Position #{s['id']} {s['symbol']}: reconcile errored "
+                        f"({e}) — using estimate")
+        self._send_close_alert(s["symbol"], s["direction"], s["exit_reason"],
+                               gross, fees, funding, s["held_h"], actual=actual)
 
     def mark_error(self, symbol: str, reason: str):
         pos = self.positions.get(symbol)
