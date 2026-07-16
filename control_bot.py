@@ -328,7 +328,8 @@ def cmd_positions(chat_id: str, _arg: str):
             "paper, notional_usd, hl_entry_price, aster_entry_price, "
             "hl_funding_rate, aster_funding_rate, "
             "COALESCE(entry_baseline_bps, 0), COALESCE(hold_for_funding, 0), "
-            "COALESCE(entry_maker_venue, ''), COALESCE(aster_funding_window_h, 8) "
+            "COALESCE(entry_maker_venue, ''), COALESCE(aster_funding_window_h, 8), "
+            "COALESCE(aster_hedged_qty, 0) "
             "FROM positions WHERE status NOT IN ('closed','error') ORDER BY entry_time"
         )
     except Exception as e:
@@ -349,7 +350,7 @@ def cmd_positions(chat_id: str, _arg: str):
     lines = ["📊 Open positions:"]
     for (sym, status, direction, spread, qty, etime, paper, notional,
          hl_px, ast_px, hl_fr, ast_fr, entry_base, hold_for_funding,
-         entry_maker_venue, ast_win_h) in rows:
+         entry_maker_venue, ast_win_h, hedged_qty) in rows:
         held_h = (now - (etime or now)) / 3_600_000
         tag = " [paper]" if paper else ""
         if hold_for_funding:
@@ -357,6 +358,29 @@ def cmd_positions(chat_id: str, _arg: str):
         elif entry_maker_venue == "hl":
             tag += " 🅼maker"
         notional = notional or 1000
+        short_dir = "HL↑ Ast↓" if "long_hl" in (direction or "") else "HL↓ Ast↑"
+
+        # In-progress states (maker resting / hedging on fill / closing) get a
+        # compact "being worked" line — so you can see a trade is live and how
+        # far along it is BEFORE it's fully on, the same way exits are visible.
+        if status != "open":
+            verb = {"entering": "🛠 ENTERING", "scaling": "🛠 SCALING",
+                    "exiting": "🛠 EXITING"}.get(status, f"[{status}]")
+            tgt = qty or 0
+            prog = f"{hedged_qty:.3f}/{tgt:.3f}sh" if tgt else f"{hedged_qty:.3f}sh"
+            pct = f" ({hedged_qty / tgt * 100:.0f}%)" if tgt else ""
+            if status in ("entering", "scaling"):
+                px = f" @ {hl_px:.2f}" if hl_px else ""
+                detail = f"HL maker resting{px}, hedged {prog}{pct}"
+            elif status == "exiting":
+                detail = f"closing {tgt:.3f}sh — HL maker resting, hedged {prog}{pct}"
+            else:
+                detail = f"qty={tgt}"
+            lines.append(
+                f"• {sym}{tag} {verb} {short_dir} ${notional:.0f}\n"
+                f"    {detail} · held {held_h:.1f}h"
+            )
+            continue
         # Maker-first (carry + convergence) pay HL-maker/Aster-taker; legacy
         # taker convergence pays HL-taker/Aster-maker.
         fees = notional * (CARRY_ROUND_TRIP_FEE if entry_maker_venue == "hl" else ROUND_TRIP_FEE)
@@ -364,7 +388,6 @@ def cmd_positions(chat_id: str, _arg: str):
             direction or "long_hl_short_aster", held_h, notional,
             hl_fr or 0, ast_fr or 0, ast_win_h or 8.0,
         )
-        short_dir = "HL↑ Ast↓" if "long_hl" in (direction or "") else "HL↓ Ast↑"
         # Profit target scales with the position's notional, matching the trader's
         # exit logic — a fixed $3 on a $20 test position would be ~1500bps.
         base_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(sym, EXIT_TARGET_NET_USD)
