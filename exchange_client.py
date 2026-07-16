@@ -32,7 +32,8 @@ from config import (
     HYPERLIQUID_API, HL_EXCHANGE_URL,
     ASTER_ORDER_URL, ASTER_OPEN_ORDERS_URL, ASTER_POSITION_URL, ASTER_EXCHANGE_INFO_URL,
     ASTER_BALANCE_URL, ASTER_INCOME_URL,
-    ORDER_TIMEOUT_SECONDS, HL_IOC_BUFFER_BPS, ASTER_IOC_BUFFER_BPS, ASTER_BASE,
+    ORDER_TIMEOUT_SECONDS, HL_IOC_BUFFER_BPS, HL_EXIT_IOC_BUFFER_BPS,
+    ASTER_IOC_BUFFER_BPS, ASTER_BASE,
     aster_symbol_for, ASTER_BASE_ALIAS, ASTER_BASE_TO_CANON,
     BASELINE_WINDOW_MINUTES, BASELINE_MIN_SAMPLES, BASELINE_SAMPLE_INTERVAL_SECONDS,
     ASTER_LEVERAGE_URL, ASTER_MARGIN_TYPE_URL, LEVERAGE, ASTER_MARGIN_TYPE,
@@ -1312,11 +1313,16 @@ class ExchangeClient:
         }
 
     async def place_hl_ioc(
-        self, symbol: str, side: str, qty: float, price: float
+        self, symbol: str, side: str, qty: float, price: float,
+        buffer_bps: float | None = None,
     ) -> OrderResult:
         """
         Place an IOC limit order on Hyperliquid XYZ DEX.
-        Price includes a buffer (HL_IOC_BUFFER_BPS) to maximise fill probability.
+        The limit is offset from `price` by buffer_bps (default HL_IOC_BUFFER_BPS)
+        to maximise fill probability. The buffer is only a CAP — the order still
+        fills at the resting book price — so a wider buffer never worsens the
+        fill, it just makes the order marketable if the book moved. Exits pass a
+        wider buffer (HL_EXIT_IOC_BUFFER_BPS) so a jumpy book can't dodge the cross.
         """
         hl_coin = f"xyz:{symbol}"
         asset_idx = self._hl_xyz_indices.get(hl_coin)
@@ -1324,7 +1330,8 @@ class ExchangeClient:
             return OrderResult(success=False, error=f"HL asset index not found for {hl_coin}")
 
         is_buy = side.lower() == "buy"
-        buffer = price * HL_IOC_BUFFER_BPS / 10000
+        buf_bps = HL_IOC_BUFFER_BPS if buffer_bps is None else buffer_bps
+        buffer = price * buf_bps / 10000
         limit_px = price + buffer if is_buy else price - buffer
 
         order = {

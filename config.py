@@ -235,6 +235,13 @@ POLL_INTERVAL_SECONDS = 1        # main loop interval
 ASTER_FILL_POLL_SECONDS = 10     # how often to poll pending Aster maker orders for fills
 HL_IOC_BUFFER_BPS = 5            # bps above/below current price for HL IOC limit
 ASTER_IOC_BUFFER_BPS = 5         # bps past best for Aster IOC (force-close) limit
+# Wider buffer for EXIT / emergency HL crosses (getting OUT dominates price). An
+# IOC limit is only a CAP — it still fills at the resting book price, so a wide
+# buffer never worsens the fill; it just guarantees the order is marketable even
+# if the book moved between the snapshot and order arrival. A 5bps buffer let a
+# liquid-but-jumpy name (SKHX) move past the limit → "could not immediately
+# match" → the whole exit aborted. 40bps reliably crosses without changing fills.
+HL_EXIT_IOC_BUFFER_BPS = 40
 ORDER_TIMEOUT_SECONDS = 8        # HTTP request timeout
 
 # ── Paper mode ──

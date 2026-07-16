@@ -936,6 +936,27 @@ class PositionManager:
         self._trade_alert(f"⚠️ {symbol} → ERROR ({reason}) — removed from tracking, CHECK VENUE")
         del self.positions[symbol]
 
+    def revert_to_open(self, symbol: str):
+        """Reset a position to 'open' after an exit attempt that executed NOTHING
+        (e.g. the HL close IOC filled 0). The legs are unchanged and still hedged,
+        so keep it tracked as open — do NOT drop it to ERROR/off-book, which would
+        strand a fully-intact position. Clears any exit order ids."""
+        pos = self.positions.get(symbol)
+        if not pos:
+            return
+        pos.status = "open"
+        pos.hl_exit_order_id = ""
+        pos.aster_exit_order_id = ""
+        pos.exit_time = 0
+        conn = get_connection()
+        conn.execute(
+            "UPDATE positions SET status='open', hl_exit_order_id='', "
+            "aster_exit_order_id='', exit_time=0 WHERE id=?", (pos.id,),
+        )
+        conn.commit()
+        conn.close()
+        log.warning(f"Position #{pos.id} kept OPEN (exit executed nothing): {symbol}")
+
     def drop_entering(self, symbol: str, reason: str = "maker_entry_unfilled"):
         """Close out a never-filled entry record (no exposure was ever taken)."""
         pos = self.positions.get(symbol)

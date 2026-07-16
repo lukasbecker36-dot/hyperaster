@@ -34,7 +34,7 @@ from config import (
     MAKER_ENTRY_TIMEOUT_SEC, MAKER_REPRICE_TICK_FRAC,
     LIQUIDITY_GUARD_ENABLED, MIN_TOB_NOTIONAL_USD, MAX_VENUE_SPREAD_BPS,
     ENTRY_TAKER_ESCALATION_ENABLED, STOP_COOLDOWN_MINUTES,
-    AUTO_TRADE_ONLY_CALIBRATED,
+    AUTO_TRADE_ONLY_CALIBRATED, HL_EXIT_IOC_BUFFER_BPS,
     aster_symbol_for,
 )
 from auth import now_ms
@@ -536,7 +536,8 @@ class Executor:
                 )
                 close_side = "sell" if hl_side == "buy" else "buy"
                 unwind = await self.client.place_hl_ioc(
-                    symbol, close_side, unmatched, hl_result.fill_price)
+                    symbol, close_side, unmatched, hl_result.fill_price,
+                    buffer_bps=HL_EXIT_IOC_BUFFER_BPS)
                 if not unwind.success:
                     log.critical(f"{symbol}: scale-in HL unwind FAILED — {unmatched} NAKED HL. "
                                  f"Manual intervention!")
@@ -593,7 +594,8 @@ class Executor:
             log.error(f"{symbol}: Aster GTX failed after HL fill — emergency closing HL")
             close_side = "sell" if hl_side == "buy" else "buy"
             close_result = await self.client.place_hl_ioc(
-                symbol, close_side, actual_qty, hl_result.fill_price
+                symbol, close_side, actual_qty, hl_result.fill_price,
+                buffer_bps=HL_EXIT_IOC_BUFFER_BPS
             )
             if not close_result.success:
                 log.critical(f"{symbol}: HL emergency close also FAILED — manual intervention!")
@@ -2374,7 +2376,8 @@ class Executor:
             try:
                 hl_book = await self.client._get_hl_book(symbol)
                 ref = hl_book.bid if hl_side == "sell" else hl_book.ask
-                res = await self.client.place_hl_ioc(symbol, hl_side, remaining_hl, ref)
+                res = await self.client.place_hl_ioc(symbol, hl_side, remaining_hl, ref,
+                                                     buffer_bps=HL_EXIT_IOC_BUFFER_BPS)
                 if res.success and res.filled_qty > 0:
                     tot = hl_closed + res.filled_qty
                     hl_exit_px = ((pos.hl_exit_price * hl_closed + res.fill_price * res.filled_qty)
@@ -2608,7 +2611,8 @@ class Executor:
                 hl_book = await self.client._get_hl_book(symbol)
                 ref_price = hl_book.bid if close_side == "sell" else hl_book.ask
                 if ref_price > 0:
-                    res = await self.client.place_hl_ioc(symbol, close_side, unmatched, ref_price)
+                    res = await self.client.place_hl_ioc(symbol, close_side, unmatched,
+                                                         ref_price, buffer_bps=HL_EXIT_IOC_BUFFER_BPS)
                     if not res.success:
                         log.critical(
                             f"{symbol}: HL partial-close FAILED ({res.error}) — "
@@ -2883,7 +2887,8 @@ class Executor:
             remaining = qty - hl_filled
             if remaining <= 0:
                 break
-            res = await self.client.place_hl_ioc(symbol, hl_close_side, remaining, hl_ref_price)
+            res = await self.client.place_hl_ioc(symbol, hl_close_side, remaining,
+                                                 hl_ref_price, buffer_bps=HL_EXIT_IOC_BUFFER_BPS)
             if res.success and res.filled_qty > 0:
                 # Weighted-average the fill price across attempts
                 new_total = hl_filled + res.filled_qty
@@ -2915,9 +2920,20 @@ class Executor:
                     log.warning(f"{symbol}: HL exit attempt 1 returned 0 fill ({res.error}), retrying")
 
         if hl_filled <= 0:
-            log.critical(f"{symbol}: HL exit FAILED — manual intervention needed ({last_err})")
+            # Nothing executed on HL, and Aster is only touched AFTER this point —
+            # so BOTH legs are still open and hedged. Do NOT mark ERROR / drop
+            # tracking (that stranded a fully-intact position off-book). Keep it
+            # OPEN so the user can just retry /close.
+            log.error(
+                f"{symbol}: HL exit IOC did not fill ({last_err}) — nothing executed, "
+                f"both legs still open & hedged; kept OPEN for retry"
+            )
             complete_intent(exit_intent_id, "rejected", notes=last_err[:200], position_id=pos.id)
-            self.pm.mark_error(symbol, f"HL exit failed: {last_err}")
+            self.pm.revert_to_open(symbol)
+            self.pm._trade_alert(
+                f"⚠️ {symbol}: /close didn't fill on HL ({last_err}) — position still "
+                f"OPEN & hedged (nothing executed). Retry /close."
+            )
             return False
 
         # HL leg closed (fully or partially) — close intent before any downstream work
@@ -3021,7 +3037,8 @@ class Executor:
         hl_book = await self.client._get_hl_book(symbol)
         ref_price = hl_book.bid if close_side == "sell" else hl_book.ask
         log.warning(f"{symbol}: emergency closing HL leg ({close_side} @ {ref_price:.2f})")
-        result = await self.client.place_hl_ioc(symbol, close_side, pos.qty, ref_price)
+        result = await self.client.place_hl_ioc(symbol, close_side, pos.qty, ref_price,
+                                                buffer_bps=HL_EXIT_IOC_BUFFER_BPS)
         if result.success:
             log.info(f"{symbol}: HL emergency close filled @ {result.fill_price:.2f}")
             self.pm.mark_error(symbol, "entry_timeout_hl_closed")
