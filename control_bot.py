@@ -1264,6 +1264,23 @@ def cmd_basis(chat_id: str, arg: str):
          parse_mode="HTML")
 
 
+def cmd_opps(chat_id: str, arg: str):
+    """Rank the top basis-trade opportunities by 24h p90 round-trip.
+
+    For each name: p90(buy-HL leg) + p90(buy-AST leg) — the round trip you'd
+    capture catching each leg at its 10%-best spike. Reads the capture DB, no
+    network. Usage: /opps [N]  (default 5)
+    """
+    n = arg.strip().split()[0] if arg.strip() else "5"
+    if not n.isdigit():
+        n = "5"
+    script = BASE_DIR / "scripts" / "basis_opportunities.py"
+    send(chat_id, "⏳ ranking basis opportunities…")
+    code, out = run([PYTHON, str(script), n], timeout=45)
+    send(chat_id, f"<pre>{out}</pre>" if out else f"(no output, exit {code})",
+         parse_mode="HTML")
+
+
 def cmd_help(chat_id: str, _arg: str):
     send(chat_id,
          "Commands:\n"
@@ -1271,6 +1288,7 @@ def cmd_help(chat_id: str, _arg: str):
          "/spreads — current spread vs threshold detail\n"
          "/book SYM — top-5 order book on both venues\n"
          "/basis SYM — live entry/exit basis + 24h avg (gate reference)\n"
+         "/opps [N] — top basis opportunities by 24h p90 round-trip\n"
          "/funding [n] — top funding-carry opportunities\n"
          "/backtest [hours] [SYM] — backtest convergence on recent candles\n"
          "/enter SYM DIR NOTIONAL [basis_bps] — open a funding hold; basis_bps waits for a fill level\n"
@@ -1301,7 +1319,7 @@ HANDLERS = {
     "/status": cmd_status, "/positions": cmd_positions, "/pos": cmd_positions,
     "/pnl": cmd_pnl, "/trades": cmd_trades,
     "/balance": cmd_balance, "/balances": cmd_balance,
-    "/book": cmd_book, "/basis": cmd_basis,
+    "/book": cmd_book, "/basis": cmd_basis, "/opps": cmd_opps,
     "/backtest": cmd_backtest, "/bt": cmd_backtest,
     "/funding": cmd_funding, "/carry": cmd_funding,
     "/enter": cmd_enter, "/close": cmd_close, "/cancel": cmd_cancel,
@@ -1377,6 +1395,7 @@ def main():
             {"command": "spreads", "description": "Current spread vs threshold"},
             {"command": "book", "description": "Top-5 order book on both venues: SYM"},
             {"command": "basis", "description": "Live entry/exit basis + 24h avg: SYM"},
+            {"command": "opps", "description": "Top basis opportunities (24h p90): [N]"},
             {"command": "funding", "description": "Top funding-carry opportunities"},
             {"command": "backtest", "description": "Backtest convergence: [hours] [SYM]"},
             {"command": "positions", "description": "Open positions + pending basis gates"},
