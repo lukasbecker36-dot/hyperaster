@@ -46,6 +46,12 @@ from config import (
 SLOW_SCAN_INTERVAL_SECONDS = 300   # re-rank all symbols every 5 min
 FAST_CANDIDATES = 3                # symbols to poll every tick between slow scans
 DISCOVERY_INTERVAL_SECONDS = 3600  # re-query both venues for newly-listed overlaps hourly
+# Basis-gated manual orders: the target must hold for this many consecutive
+# evaluations before firing (a one-tick book spike used to fire the gate and
+# fill well through the level), and the executor re-validates the basis on
+# fresh books just before placing, with this much tolerance for book noise.
+GATE_CONFIRM_TICKS = 3
+GATE_REVALIDATE_TOL_BPS = 5.0
 from database import init_db
 from exchange_client import ExchangeClient
 from position_manager import PositionManager, estimate_funding_pnl
@@ -391,6 +397,8 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     #   pending_exits:   symbol -> {target_bps}
     pending_entries: dict[str, dict] = {}
     pending_exits: dict[str, dict] = {}
+    # ("enter"|"exit", symbol) -> consecutive evaluations the basis held ≥ target
+    gate_streaks: dict[tuple[str, str], int] = {}
     # top N candidates polled every fast tick
     candidates: list[str] = []
 
@@ -978,12 +986,21 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 f"gate {symbol}: basis={basis:.1f}bps target={req['target_bps']:.0f}bps "
                 f"HL={hl_book.bid:.2f}/{hl_book.ask:.2f} AST={aster_book.bid:.2f}/{aster_book.ask:.2f}"
             )
+            # Persistence: the basis must clear the target on GATE_CONFIRM_TICKS
+            # consecutive evaluations. A single-tick spike (one wild print on
+            # either book) used to fire the gate and fill well through the level.
             if basis >= req["target_bps"]:
+                gate_streaks[("enter", symbol)] = gate_streaks.get(("enter", symbol), 0) + 1
+            else:
+                gate_streaks.pop(("enter", symbol), None)
+            if gate_streaks.get(("enter", symbol), 0) >= GATE_CONFIRM_TICKS:
+                gate_streaks.pop(("enter", symbol), None)
                 ok, msg = await executor.force_entry_maker(
                     symbol, req["direction"], req["notional"]
                 )
                 pending_entries.pop(symbol, None)
-                send_alert(f"/enter {symbol}: basis {basis:.0f}bps ≥ target — "
+                send_alert(f"/enter {symbol}: basis {basis:.0f}bps ≥ target "
+                           f"({GATE_CONFIRM_TICKS} ticks) — "
                            f"{'OK' if ok else 'FAILED'} — {msg}")
 
         # Exits: close when the executable exit basis clears the target. No expiry —
@@ -1001,10 +1018,22 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             basis = _carry_basis_bps(pos.direction, "exit", aster_book, hl_book)
             if basis is None:
                 continue
-            if basis >= pending_exits[symbol]["target_bps"]:
+            target = pending_exits[symbol]["target_bps"]
+            if basis >= target:
+                gate_streaks[("exit", symbol)] = gate_streaks.get(("exit", symbol), 0) + 1
+            else:
+                gate_streaks.pop(("exit", symbol), None)
+            if gate_streaks.get(("exit", symbol), 0) >= GATE_CONFIRM_TICKS:
+                gate_streaks.pop(("exit", symbol), None)
                 mv = pending_exits[symbol].get("maker_venue", "")
                 cn = float(pending_exits[symbol].get("close_notional", 0) or 0)
-                pending_exits.pop(symbol, None)
+                # The executor RE-VALIDATES the basis on its own fresh books just
+                # before placing (min_exit_basis, small tolerance for book
+                # noise). On failure the gate stays armed and re-fires later —
+                # observed SKHX: fired at -30, filled at -44.7 without this.
+                min_basis = target - GATE_REVALIDATE_TOL_BPS
+                log.warning(f"gate {symbol}: EXIT firing at basis={basis:.1f}bps "
+                            f"(target {target:.0f}, {GATE_CONFIRM_TICKS} ticks)")
                 if cn and pos.qty > 0:
                     avg_price = (pos.hl_entry_price + pos.aster_entry_price) / 2
                     if avg_price <= 0:
@@ -1012,12 +1041,19 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     close_qty = min(cn / avg_price, pos.qty) if avg_price > 0 else pos.qty
                     ok = await executor.exit_position(
                         symbol, aster_book, hl_book, "manual_target_partial",
-                        mv, close_qty)
-                    send_alert(f"/close {symbol}: basis {basis:.0f}bps ≥ target — "
-                               f"partial close {'submitted' if ok else 'FAILED'}")
+                        mv, close_qty, min_exit_basis=min_basis)
                 else:
-                    await executor.exit_position(symbol, aster_book, hl_book, "manual_target", mv)
-                    send_alert(f"/close {symbol}: exit basis {basis:.0f}bps ≥ target — submitted")
+                    ok = await executor.exit_position(
+                        symbol, aster_book, hl_book, "manual_target", mv,
+                        min_exit_basis=min_basis)
+                if ok:
+                    pending_exits.pop(symbol, None)
+                    send_alert(f"/close {symbol}: exit basis {basis:.0f}bps ≥ "
+                               f"{target:.0f}bps target — submitted")
+                else:
+                    # Re-validation (or placement) failed — keep the gate armed.
+                    log.warning(f"gate {symbol}: exit submission failed after fire "
+                                f"— gate stays armed")
 
     async def discover_new_symbols():
         """Re-query both venues for the current overlap and add any newly-listed

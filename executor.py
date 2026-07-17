@@ -44,6 +44,23 @@ log = logging.getLogger(__name__)
 ASTER_TERMINAL_STATUSES = {"FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}
 
 
+def _exit_basis_bps(direction: str, aster_book, hl_book):
+    """Executable EXIT basis (bps, in the position's favour) — same maker-HL/
+    taker-Aster convention as live_monitor._carry_basis_bps(action='exit').
+      exit L-HL/S-AST → buy-AST leg: (hl_ask − aster_ask)/mid
+      exit L-AST/S-HL → buy-HL leg:  (aster_bid − hl_bid)/mid
+    None when either book is incomplete (no valid basis on a half-empty book)."""
+    if (aster_book.bid <= 0 or aster_book.ask <= 0
+            or hl_book.bid <= 0 or hl_book.ask <= 0):
+        return None
+    mid = (aster_book.mid + hl_book.mid) / 2
+    if mid <= 0:
+        return None
+    if direction == "long_hl_short_aster":
+        return (hl_book.ask - aster_book.ask) / mid * 10000
+    return (aster_book.bid - hl_book.bid) / mid * 10000
+
+
 class Executor:
     def __init__(
         self,
@@ -68,6 +85,9 @@ class Executor:
         self._partial_closes: dict[str, float] = {}
         # symbol -> ms until which auto re-entry is blocked after a stop exit.
         self._stop_cooldown: dict[str, int] = {}
+        # Symbols whose HL exit-maker repost failed after its cancel (nothing
+        # resting) — retried next tick regardless of price drift.
+        self._exit_repost_pending: set[str] = set()
 
     # ── Entry ──
 
@@ -1789,7 +1809,10 @@ class Executor:
         touch = (hl_book.bid - tick) if hl_side == "buy" else (hl_book.ask + tick)
         if touch <= 0:
             return
-        if abs(touch - pos.hl_entry_price) < tick * MAKER_REPRICE_TICK_FRAC:
+        have_order = bool(pos.hl_entry_order_id)
+        # With NO resting order (a prior repost failed after its cancel), always
+        # try to re-establish one — the drift check only applies while one rests.
+        if have_order and abs(touch - pos.hl_entry_price) < tick * MAKER_REPRICE_TICK_FRAC:
             return
         remainder = self.client.snap_aster_qty(symbol, pos.qty - hl_filled)
         if remainder <= 0:
@@ -1798,17 +1821,29 @@ class Executor:
         # Verify the current order is still resting before cancel+replace.
         # If it already filled (stale position API made hl_filled look like 0),
         # placing a new Alo would overshoot the target qty.
-        if pos.hl_entry_order_id:
+        if have_order:
             try:
-                resp = await self.client.query_hl_order(pos.hl_entry_order_id)
+                resp = await self.client.query_hl_order(pos.hl_entry_order_id) or {}
                 # HL returns {"status": "order", "order": {"status": "open"|"filled"|...}}
                 # or {"status": "unknownOid"}
                 if resp.get("status") == "unknownOid":
                     log.warning(f"{symbol}: HL order {pos.hl_entry_order_id} unknown — skipping reprice")
                     return
-                order_info = resp.get("order", {})
+                order_info = resp.get("order") or {}
                 order_status = order_info.get("status", "")
-                if order_status != "open":
+                if order_status in ("canceled", "marginCanceled", "rejected", "expired"):
+                    # The order is DEAD (e.g. a prior cancel+repost where the
+                    # post-only repost was rejected) — nothing rests. Clear the
+                    # stale id and fall through to post a fresh maker, instead
+                    # of "skipping reprice" every 10s forever (observed: 2h of
+                    # spam on a stuck scale-in with a canceled order).
+                    log.warning(
+                        f"{symbol}: HL order {pos.hl_entry_order_id} is {order_status} — "
+                        f"clearing stale id and re-posting maker for remainder {remainder}"
+                    )
+                    self._set_entry_order_id(pos, "")
+                elif order_status != "open":
+                    # filled/unknown-but-alive: let the position poll reconcile.
                     log.warning(
                         f"{symbol}: HL order {pos.hl_entry_order_id} already "
                         f"{order_status} — skipping reprice (position API may be stale)"
@@ -1817,21 +1852,35 @@ class Executor:
             except Exception as e:
                 log.warning(f"{symbol}: HL order status check failed ({e}) — skipping reprice for safety")
                 return
-            await self.client.cancel_hl_order(symbol, pos.hl_entry_order_id)
+            if pos.hl_entry_order_id:
+                await self.client.cancel_hl_order(symbol, pos.hl_entry_order_id)
 
         alo = await self.client.place_hl_alo(symbol, hl_side, remainder, touch)
         if alo.success:
-            pos.hl_entry_order_id = alo.order_id
             pos.hl_entry_price = touch
-            from database import get_connection
-            conn = get_connection()
-            conn.execute("UPDATE positions SET hl_entry_order_id=?, hl_entry_price=? WHERE id=?",
-                         (alo.order_id, touch, pos.id))
-            conn.commit()
-            conn.close()
+            self._set_entry_order_id(pos, alo.order_id, price=touch)
             log.info(f"{symbol}: repriced HL maker -> {alo.order_id} @ {touch:.2f} (rem {remainder})")
         else:
-            log.warning(f"{symbol}: HL maker reprice failed ({alo.error})")
+            # Cancel+place is NOT atomic: the old order is already cancelled, so
+            # nothing rests now. Record that (clear the id) so the next tick
+            # re-posts instead of believing a dead order is still working.
+            log.warning(f"{symbol}: HL maker reprice failed ({alo.error}) — "
+                        f"no order resting, will re-post next tick")
+            self._set_entry_order_id(pos, "")
+
+    def _set_entry_order_id(self, pos, order_id: str, price: float | None = None):
+        """Persist the resting HL entry-maker order id (and optionally price)."""
+        pos.hl_entry_order_id = order_id
+        from database import get_connection
+        conn = get_connection()
+        if price is not None:
+            conn.execute("UPDATE positions SET hl_entry_order_id=?, hl_entry_price=? WHERE id=?",
+                         (order_id, price, pos.id))
+        else:
+            conn.execute("UPDATE positions SET hl_entry_order_id=? WHERE id=?",
+                         (order_id, pos.id))
+        conn.commit()
+        conn.close()
 
     # ── Maker-first exit (HL post-only maker, Aster IOC taker hedge) ──
 
@@ -1985,6 +2034,7 @@ class Executor:
     async def exit_position(
         self, symbol: str, aster_book: OrderBook, hl_book: OrderBook, reason: str,
         maker_venue: str = "", close_qty: float = 0.0,
+        min_exit_basis: float | None = None,
     ) -> bool:
         """Dispatch an exit.
         maker_venue override: 'hl' = rest maker on HL, 'aster' = rest maker on Aster.
@@ -2011,19 +2061,27 @@ class Executor:
             if effective_maker == "hl" and reason not in self.URGENT_EXIT_REASONS:
                 self._partial_closes[symbol] = close_qty
                 ok = await self.force_exit_maker(symbol, reason, close_qty,
-                                                 dec_aster_book=aster_book, dec_hl_book=hl_book)
+                                                 dec_aster_book=aster_book, dec_hl_book=hl_book,
+                                                 min_exit_basis=min_exit_basis)
                 if ok:
                     return True
                 self._partial_closes.pop(symbol, None)
+                if min_exit_basis is not None:
+                    return False   # basis-gated: don't taker-cross a failed re-validation
                 log.warning(f"{symbol}: HL maker partial unavailable — taker-taker partial")
             return await self.partial_close(symbol, close_qty, reason)
 
         # Full close
         if pos and effective_maker == "hl" and reason not in self.URGENT_EXIT_REASONS:
             ok = await self.force_exit_maker(symbol, reason,
-                                             dec_aster_book=aster_book, dec_hl_book=hl_book)
+                                             dec_aster_book=aster_book, dec_hl_book=hl_book,
+                                             min_exit_basis=min_exit_basis)
             if ok:
                 return True
+            if min_exit_basis is not None:
+                # A basis-gated close must NOT fall through to a taker-taker
+                # cross — that would fill straight through the target level.
+                return False
             log.warning(f"{symbol}: maker exit unavailable — falling back to taker exit")
         return await self.try_exit(symbol, aster_book, hl_book, reason)
 
@@ -2054,7 +2112,8 @@ class Executor:
 
     async def force_exit_maker(self, symbol: str, reason: str, close_qty: float = 0.0,
                                dec_aster_book: OrderBook = None,
-                               dec_hl_book: OrderBook = None) -> bool:
+                               dec_hl_book: OrderBook = None,
+                               min_exit_basis: float | None = None) -> bool:
         """Close via HL maker: rest a post-only HL order on the close side
         (sell@ask for a long-HL leg, buy@bid for a short-HL leg) and let
         poll_hl_maker_exit cross Aster (IOC taker) to close each HL fill. Returns
@@ -2065,7 +2124,13 @@ class Executor:
         mode the fill is fabricated from the book, so it MUST reuse the decision
         snapshot — re-fetching gives a different (thin-book) reading than the one
         est_net was judged on, which is how a 'target' (profit) exit can book a
-        loss. Live mode always re-fetches (real orders fill at the live book)."""
+        loss. Live mode always re-fetches (real orders fill at the live book).
+
+        min_exit_basis: when set (basis-gated /close), the exit basis is
+        RE-VALIDATED on the freshly-fetched books right before placing — if the
+        gate fired on a transient spike that's already gone, abort (return
+        False) so the caller keeps the gate armed instead of filling ~15bps
+        through the target (observed on SKHX: fired at -30, filled at -44.7)."""
         pos = self.pm.get(symbol)
         if not pos or pos.status != "open":
             return False
@@ -2083,6 +2148,17 @@ class Executor:
             return False
         mid = (aster_book.mid + hl_book.mid) / 2
         exit_spread_bps = (aster_book.mid - hl_book.mid) / mid * 10000 if mid > 0 else 0.0
+
+        if min_exit_basis is not None:
+            live_basis = _exit_basis_bps(pos.direction, aster_book, hl_book)
+            if live_basis is None or live_basis < min_exit_basis:
+                log.warning(
+                    f"{symbol}: exit basis re-validation FAILED — live "
+                    f"{live_basis if live_basis is not None else float('nan'):.1f}bps < "
+                    f"required {min_exit_basis:.1f}bps (gate fired on a transient) — "
+                    f"holding, gate stays armed"
+                )
+                return False
 
         closing_long = pos.direction == "long_hl_short_aster"  # long HL leg
         hl_tick = self.client.hl_specs.get(symbol, ContractSpec()).tick_size
@@ -2468,12 +2544,16 @@ class Executor:
         touch = (hl_book.ask + tick) if hl_side == "sell" else (hl_book.bid - tick)
         if touch <= 0:
             return
-        if abs(touch - pos.hl_exit_price) < tick * MAKER_REPRICE_TICK_FRAC:
+        # A prior reprice whose repost FAILED after its cancel means nothing is
+        # resting — retry regardless of drift (cancel+place isn't atomic).
+        force_repost = symbol in self._exit_repost_pending
+        if not force_repost and abs(touch - pos.hl_exit_price) < tick * MAKER_REPRICE_TICK_FRAC:
             return
-        if pos.hl_exit_order_id:
+        if pos.hl_exit_order_id and not force_repost:
             await self.client.cancel_hl_order(symbol, pos.hl_exit_order_id)
         alo = await self.client.place_hl_alo(symbol, hl_side, pos.qty, touch)
         if alo.success:
+            self._exit_repost_pending.discard(symbol)
             pos.hl_exit_order_id = alo.order_id
             pos.hl_exit_price = touch
             from database import get_connection
@@ -2484,6 +2564,7 @@ class Executor:
             conn.close()
             log.info(f"{symbol}: repriced HL exit maker -> {alo.order_id} @ {touch:.2f}")
         else:
+            self._exit_repost_pending.add(symbol)
             log.warning(f"{symbol}: HL exit maker reprice failed ({alo.error})")
 
     # ── Poll Aster maker fill (entering / exiting states) ──

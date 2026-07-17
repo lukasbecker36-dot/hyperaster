@@ -845,27 +845,47 @@ class PositionManager:
         # try to reconcile actual funding + commission from the venues (they
         # settle at/just after close, so a short deferred task queries them and
         # replaces the alert). Falls back to the estimate if unavailable.
+        # Realized entry/exit basis from the ACTUAL fills (same in-your-favour
+        # convention as /basis and the gates) — makes gate slippage visible:
+        # compare "gate fired at X" in the log with the realized exit basis here.
+        basis_str = ""
+        if (pos.hl_entry_price > 0 and pos.aster_entry_price > 0
+                and pos.hl_exit_price > 0 and aster_exit_price > 0):
+            in_mid = (pos.hl_entry_price + pos.aster_entry_price) / 2
+            out_mid = (pos.hl_exit_price + aster_exit_price) / 2
+            if pos.direction == "long_hl_short_aster":
+                b_in = (pos.aster_entry_price - pos.hl_entry_price) / in_mid * 10000
+                b_out = (pos.hl_exit_price - aster_exit_price) / out_mid * 10000
+            else:
+                b_in = (pos.hl_entry_price - pos.aster_entry_price) / in_mid * 10000
+                b_out = (aster_exit_price - pos.hl_exit_price) / out_mid * 10000
+            basis_str = f"basis in={b_in:+.1f} out={b_out:+.1f} rt={b_in + b_out:+.1f}bps"
+            log.info(f"Position #{pos.id} {symbol} realized {basis_str}")
+
         if (not self.paper_mode and self.client is not None
-                and self._spawn_reconcile(pos, gross, fees, funding, exit_reason, held_h)):
+                and self._spawn_reconcile(pos, gross, fees, funding, exit_reason,
+                                          held_h, basis_str)):
             pass  # reconcile task will send the CLOSED alert
         else:
             self._send_close_alert(symbol, pos.direction, exit_reason, gross,
-                                   fees, funding, held_h, actual=False)
+                                   fees, funding, held_h, actual=False,
+                                   basis_str=basis_str)
         del self.positions[symbol]
 
     def _send_close_alert(self, symbol, direction, exit_reason, gross, fees,
-                          funding, held_h, actual: bool):
+                          funding, held_h, actual: bool, basis_str: str = ""):
         net = gross - fees + funding
         emoji = "🔴" if net < 0 else "✅"
         src = "actual" if actual else "est"
+        extra = f" | {basis_str}" if basis_str else ""
         self._trade_alert(
             f"{emoji} CLOSED {symbol} {_dir_short(direction)} ({exit_reason}) | "
             f"net=${net:+.2f} (gross ${gross:+.2f}, fees ${fees:.2f}, "
-            f"funding ${funding:+.2f}) [{src} fund/fees] | held {held_h:.1f}h"
+            f"funding ${funding:+.2f}) [{src} fund/fees]{extra} | held {held_h:.1f}h"
         )
 
     def _spawn_reconcile(self, pos, gross, est_fees, est_funding,
-                         exit_reason, held_h) -> bool:
+                         exit_reason, held_h, basis_str: str = "") -> bool:
         """Schedule a deferred task to replace est fees/funding with the venues'
         actual settled figures in the CLOSED alert (and DB). Returns True if the
         task was scheduled (caller then skips the immediate alert). False if
@@ -878,7 +898,7 @@ class PositionManager:
             "id": pos.id, "symbol": pos.symbol, "direction": pos.direction,
             "entry_time": pos.entry_time, "exit_time": pos.exit_time or now_ms(),
             "gross": gross, "est_fees": est_fees, "est_funding": est_funding,
-            "exit_reason": exit_reason, "held_h": held_h,
+            "exit_reason": exit_reason, "held_h": held_h, "basis_str": basis_str,
         }
         loop.create_task(self._reconcile_and_alert(snap))
         return True
@@ -918,7 +938,8 @@ class PositionManager:
             log.warning(f"Position #{s['id']} {s['symbol']}: reconcile errored "
                         f"({e}) — using estimate")
         self._send_close_alert(s["symbol"], s["direction"], s["exit_reason"],
-                               gross, fees, funding, s["held_h"], actual=actual)
+                               gross, fees, funding, s["held_h"], actual=actual,
+                               basis_str=s.get("basis_str", ""))
 
     def mark_error(self, symbol: str, reason: str):
         pos = self.positions.get(symbol)
