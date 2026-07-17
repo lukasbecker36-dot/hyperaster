@@ -290,8 +290,31 @@ async def main():
     # Suggest the 24h p90 as the gate (fill on spikes); fall back to now+5.
     ast_gate = round(avg["p90_ast"]) if avg else round(buy_ast_now) + 5
     hl_gate = round(avg["p90_hl"]) if avg else round(buy_hl_now) + 5
-    lines.append(f"e.g. /enter {symbol} buy_aster 1000 {ast_gate}")
-    lines.append(f"     /close {symbol} {hl_gate}")
+    # CARRY-AWARE suggestion: while you sit between entry and exit you HOLD a
+    # direction, and its funding carry can pay you or bleed you. Suggest the
+    # positive-carry direction (settled 24h rates preferred over the live tick).
+    carry_ashl = None   # net bps/day for holding L-AST/S-HL
+    if hl_fr24 is not None and ast_fr24 is not None:
+        carry_ashl = (hl_fr24 * 24 - ast_fr24 * settles_day) * 10000
+    elif hl_fr is not None and ast_fr is not None:
+        carry_ashl = (hl_fr * 24 - ast_fr * settles_day) * 10000
+    if carry_ashl is None:
+        lines.append(f"e.g. /enter {symbol} buy_aster 1000 {ast_gate}")
+        lines.append(f"     /close {symbol} {hl_gate}")
+        lines.append("(no funding data — carry direction unknown)")
+    elif carry_ashl >= 0:
+        # Hold L-AST/S-HL: enter on the buy-AST leg, exit on the buy-HL leg.
+        lines.append(f"e.g. /enter {symbol} buy_aster 1000 {ast_gate}")
+        lines.append(f"     /close {symbol} {hl_gate}")
+        lines.append(f"→ holds L-AST/S-HL earning {carry_ashl:+.1f}bp/day while you wait")
+        if carry_ashl > 0:
+            lines.append(f"  (the other direction PAYS {-carry_ashl:+.1f}bp/day — avoid)")
+    else:
+        # Hold L-HL/S-AST: enter on the buy-HL leg, exit on the buy-AST leg.
+        lines.append(f"e.g. /enter {symbol} buy_hl 1000 {hl_gate}")
+        lines.append(f"     /close {symbol} {ast_gate}")
+        lines.append(f"→ holds L-HL/S-AST earning {-carry_ashl:+.1f}bp/day while you wait")
+        lines.append(f"  (the other direction PAYS {carry_ashl:+.1f}bp/day — avoid)")
     print("\n".join(lines))
 
 
