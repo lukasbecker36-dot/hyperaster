@@ -676,15 +676,21 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     if target is not None:
                         # Basis-gated: hold until the executable entry basis clears
                         # the target instead of crossing now.
+                        # 0 (or less) disables expiry — the gate waits
+                        # indefinitely (e.g. to catch an overnight spike).
+                        expires_ms = (now_ms() + MANUAL_ENTRY_GATE_TIMEOUT_MIN * 60_000
+                                      if MANUAL_ENTRY_GATE_TIMEOUT_MIN > 0 else 0)
                         pending_entries[symbol] = {
                             "direction": direction, "notional": notional,
                             "orig_notional": notional,
                             "target_bps": float(target),
-                            "expires_ms": now_ms() + MANUAL_ENTRY_GATE_TIMEOUT_MIN * 60_000,
+                            "expires_ms": expires_ms,
                         }
+                        exp_str = (f"expires {MANUAL_ENTRY_GATE_TIMEOUT_MIN}min"
+                                   if MANUAL_ENTRY_GATE_TIMEOUT_MIN > 0 else "no expiry")
                         send_alert(
                             f"/enter {symbol}: waiting for entry basis ≥ {float(target):.0f}bps "
-                            f"(expires {MANUAL_ENTRY_GATE_TIMEOUT_MIN}min)"
+                            f"({exp_str})"
                         )
                     else:
                         ok, msg = await executor.force_entry_maker(
@@ -970,7 +976,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 pending_entries.pop(symbol, None)
                 send_alert(f"/enter {symbol}: cancelled — position open in opposite direction")
                 continue
-            if now_ms() >= req["expires_ms"]:
+            if req.get("expires_ms", 0) and now_ms() >= req["expires_ms"]:
                 pending_entries.pop(symbol, None)
                 send_alert(f"/enter {symbol}: gate expired (basis never reached "
                            f"{req['target_bps']:.0f}bps) — not entered")

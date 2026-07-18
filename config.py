@@ -224,7 +224,9 @@ ENTRY_TAKER_ESCALATION_ENABLED = False
 # at or better than the target, so you don't cross at a bad level. A gated entry
 # that never reaches its target expires after this long; gated exits never expire
 # (a safety stop closes the position if the basis stays bad).
-MANUAL_ENTRY_GATE_TIMEOUT_MIN = 120
+# 0 = no expiry: a gated entry waits indefinitely (e.g. to catch an overnight
+# spike). /cancel SYM clears it manually.
+MANUAL_ENTRY_GATE_TIMEOUT_MIN = 0
 
 # ── Position sizing ──
 NOTIONAL_PER_LEG = 1000          # USD per leg
