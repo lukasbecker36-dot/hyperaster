@@ -1657,10 +1657,11 @@ class Executor:
         final_qty = min(hl_filled, pos.aster_hedged_qty)
         naked_hl = hl_filled - final_qty
         if naked_hl > residual * 0.001 + 1e-9:
-            log.critical(
-                f"{symbol}: maker entry left {naked_hl:.4f} HL UNHEDGED "
-                f"(filled {hl_filled}, hedged {pos.aster_hedged_qty}) — CHECK MANUALLY"
-            )
+            # The Aster hedge couldn't be established. Do NOT leave a naked
+            # directional HL leg — UNWIND it (cross HL back toward baseline) so a
+            # failed hedge results in FLAT, not naked exposure. HL is the liquid
+            # leg, so this succeeds even when the Aster book is untradeable.
+            naked_hl = await self._unwind_naked_hl(pos, long_hl, naked_hl, hl_filled)
         if final_qty <= 0:
             if pos.scale_pre_qty > 0:
                 self.pm.revert_scale_in(symbol)
@@ -1669,6 +1670,49 @@ class Executor:
             return
         log.warning(f"{symbol}: maker entry partial {final_qty}/{pos.qty} ({reason}) — opening")
         self.pm.confirm_hl_maker_open(symbol, final_qty, pos.hl_entry_price, pos.aster_entry_price)
+
+    async def _unwind_naked_hl(self, pos, long_hl, naked_hl, hl_filled) -> float:
+        """Cross the unhedgeable HL leg back to flat (a failed hedge must leave
+        FLAT, not naked). Returns the qty STILL naked after the attempt (0 on
+        success). long-HL leg unwinds by selling; short-HL by buying."""
+        symbol = pos.symbol
+        unwind_side = "sell" if long_hl else "buy"
+        unwound = 0.0
+        try:
+            hl_book = await self.client._get_hl_book(symbol)
+            ref = hl_book.bid if unwind_side == "sell" else hl_book.ask
+            if ref > 0:
+                ures = await self.client.place_hl_ioc(
+                    symbol, unwind_side, naked_hl, ref,
+                    buffer_bps=HL_EXIT_IOC_BUFFER_BPS)
+                if ures.success and ures.filled_qty > 0:
+                    unwound = ures.filled_qty
+                    self.pm.log_trade(pos.id, "hl", unwind_side, "ioc_unwind",
+                                      ures.order_id, ures.filled_qty, ures.fill_price,
+                                      notes="naked-leg unwind (hedge failed)")
+        except Exception as e:
+            log.error(f"{symbol}: naked-HL unwind errored ({e})")
+        still_naked = naked_hl - unwound
+        if still_naked > naked_hl * 0.01 + 1e-9:
+            log.critical(
+                f"{symbol}: {still_naked:.4f} HL NAKED — hedge AND unwind FAILED "
+                f"(filled {hl_filled}, hedged {pos.aster_hedged_qty}, "
+                f"unwound {unwound:.4f}) — CHECK VENUE NOW"
+            )
+            self.pm._trade_alert(
+                f"⚠️ {symbol}: {still_naked:.4f} HL NAKED — hedge AND unwind both "
+                f"failed. CHECK VENUE NOW."
+            )
+        else:
+            log.warning(
+                f"{symbol}: entry hedge failed — unwound {unwound:.4f} HL back to "
+                f"flat (no exposure taken)"
+            )
+            self.pm._trade_alert(
+                f"⚠️ {symbol}: entry hedge failed — unwound the HL leg back to flat, "
+                f"no position taken (nothing to do)."
+            )
+        return still_naked
 
     async def _manage_convergence_entry(self, pos, long_hl, hl_side, aster_hedge_side, hl_filled) -> bool:
         """Per-tick signal management for a resting convergence entry maker.
