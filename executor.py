@@ -34,7 +34,7 @@ from config import (
     MAKER_ENTRY_TIMEOUT_SEC, MAKER_REPRICE_TICK_FRAC,
     LIQUIDITY_GUARD_ENABLED, MIN_TOB_NOTIONAL_USD, MAX_VENUE_SPREAD_BPS,
     ENTRY_TAKER_ESCALATION_ENABLED, STOP_COOLDOWN_MINUTES,
-    AUTO_TRADE_ONLY_CALIBRATED, HL_EXIT_IOC_BUFFER_BPS,
+    AUTO_TRADE_ONLY_CALIBRATED, HL_EXIT_IOC_BUFFER_BPS, LEVERAGE,
     aster_symbol_for,
 )
 from auth import now_ms
@@ -309,6 +309,12 @@ class Executor:
 
         # ── Live: rest the HL post-only maker; poll_hl_maker advances it ──
         await self.client.ensure_perp_margin(symbol)
+        # Don't commit HL if Aster can't afford the hedge (naked-leg prevention).
+        afford_ok, afford_msg = await self._aster_can_afford(symbol, actual_notional)
+        if not afford_ok:
+            log.warning(f"{symbol}: entry skipped — {afford_msg}")
+            self._entry_streak.pop(symbol, None)
+            return False
         try:
             pre_pos = await self.client.get_hl_position(symbol)
             baseline_szi = float(pre_pos.get("szi", 0) or 0)
@@ -1416,6 +1422,15 @@ class Executor:
 
         # ── Live: rest the HL post-only maker; poll_hl_maker advances it ──
         await self.client.ensure_perp_margin(symbol)
+
+        # Pre-flight: verify Aster has the free margin to HEDGE the full size
+        # before committing the HL leg. Resting HL then discovering Aster can't
+        # afford the hedge is exactly what left a naked HL short on LLY
+        # ("Margin is insufficient" ×10). Refuse up front instead.
+        afford_ok, afford_msg = await self._aster_can_afford(symbol, qty * mid)
+        if not afford_ok:
+            return False, afford_msg
+
         try:
             pre_pos = await self.client.get_hl_position(symbol)
             baseline_szi = float(pre_pos.get("szi", 0) or 0)
@@ -1670,6 +1685,30 @@ class Executor:
             return
         log.warning(f"{symbol}: maker entry partial {final_qty}/{pos.qty} ({reason}) — opening")
         self.pm.confirm_hl_maker_open(symbol, final_qty, pos.hl_entry_price, pos.aster_entry_price)
+
+    async def _aster_can_afford(self, symbol: str, notional: float) -> tuple[bool, str]:
+        """Check Aster free margin covers the hedge for `notional` (per leg)
+        BEFORE the HL leg is committed. required = notional / LEVERAGE, with a
+        20% buffer for the taker cross / price move. Returns (ok, message).
+        On a balance-query failure we allow it (don't block on a transient) —
+        the naked-leg unwind is the backstop."""
+        try:
+            bal = await self.client.get_aster_balance("USDT")
+        except Exception as e:
+            log.warning(f"{symbol}: Aster balance check failed ({e}) — allowing entry")
+            return True, ""
+        avail = float(bal.get("available", 0) or 0)
+        if avail <= 0:
+            log.warning(f"{symbol}: Aster available balance read as 0 — allowing entry")
+            return True, ""
+        required = notional / max(1, LEVERAGE) * 1.20
+        if avail < required:
+            return False, (
+                f"{symbol}: insufficient Aster margin for the hedge — need "
+                f"~${required:.0f} free (${notional:.0f}/{LEVERAGE}x +buffer), "
+                f"have ${avail:.0f}. Deposit USDT or close an Aster position."
+            )
+        return True, ""
 
     async def _unwind_naked_hl(self, pos, long_hl, naked_hl, hl_filled) -> float:
         """Cross the unhedgeable HL leg back to flat (a failed hedge must leave
