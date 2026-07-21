@@ -1701,11 +1701,14 @@ class Executor:
         if avail <= 0:
             log.warning(f"{symbol}: Aster available balance read as 0 — allowing entry")
             return True, ""
-        required = notional / max(1, LEVERAGE) * 1.20
+        # Use the ACTUAL applied Aster leverage — Aster caps equity perps below
+        # the requested LEVERAGE (e.g. 3x), which needs more margin than 5x.
+        ast_lev = self.client.get_aster_leverage(symbol)
+        required = notional / max(1, ast_lev) * 1.20
         if avail < required:
             return False, (
                 f"{symbol}: insufficient Aster margin for the hedge — need "
-                f"~${required:.0f} free (${notional:.0f}/{LEVERAGE}x +buffer), "
+                f"~${required:.0f} free (${notional:.0f}/{ast_lev}x +buffer), "
                 f"have ${avail:.0f}. Deposit USDT or close an Aster position."
             )
         return True, ""

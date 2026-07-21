@@ -143,6 +143,9 @@ class ExchangeClient:
 
         # Symbols whose leverage + margin type have been set this run (idempotent).
         self._margin_ready: set[str] = set()
+        # Actually-applied Aster leverage per symbol (Aster caps equity perps
+        # below the requested LEVERAGE). Used by the margin pre-flight.
+        self._aster_leverage: dict[str, int] = {}
 
         # Mark/index price cache: symbol -> (mark_price, index_price, fetched_at_ms)
         self._mark_cache: dict[str, tuple[float, float, int]] = {}
@@ -1680,7 +1683,14 @@ class ExchangeClient:
             return False
 
     async def set_aster_leverage(self, symbol: str, leverage: int) -> bool:
-        """Set leverage on Aster for a symbol (POST /fapi/v1/leverage)."""
+        """Set leverage on Aster for a symbol (POST /fapi/v1/leverage).
+
+        Aster caps leverage per symbol (equity perps often max at 3x), and
+        silently APPLIES the cap while returning success. We record the actually
+        -applied leverage so the margin pre-flight uses the real number (a 3x
+        cap needs ~33% margin, not the 20% a 5x request implies) — otherwise the
+        check under-provisions and the hedge can still fail 'insufficient margin'.
+        """
         params = {"symbol": aster_symbol_for(symbol), "leverage": int(leverage)}
         signed = self._sign_aster(params)
         try:
@@ -1694,11 +1704,26 @@ class ExchangeClient:
                 log.info(f"Aster leverage {params['symbol']} {leverage}x: "
                          f"skipped (API-key issue, existing position) ({data})")
                 return True
+            if ok:
+                applied = int(float(data.get("leverage", leverage)))
+                self._aster_leverage[symbol] = applied
+                if applied < leverage:
+                    log.warning(
+                        f"Aster CAPPED leverage {params['symbol']}: requested "
+                        f"{leverage}x, applied {applied}x (this leg needs more "
+                        f"margin than the HL {leverage}x leg)"
+                    )
             log.info(f"Aster leverage set {params['symbol']} {leverage}x: {ok} ({data})")
             return ok
         except Exception as e:
             log.error(f"Aster set leverage error: {e}")
             return False
+
+    def get_aster_leverage(self, symbol: str) -> int:
+        """Actually-applied Aster leverage for a symbol (Aster may have capped
+        below the requested LEVERAGE). Falls back to the configured LEVERAGE
+        until set_aster_leverage has run for the symbol this session."""
+        return self._aster_leverage.get(symbol, LEVERAGE)
 
     async def set_aster_margin_type(self, symbol: str, margin_type: str) -> bool:
         """Set margin type on Aster (POST /fapi/v1/marginType). Treats the
