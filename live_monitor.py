@@ -178,6 +178,58 @@ def _write_pending_gates(pending_entries: dict, pending_exits: dict,
         pass
 
 
+def _restore_pending_gates(pending_entries: dict, pending_exits: dict, pm, alert):
+    """Reload waiting basis gates from pending_gates.json at startup so a restart
+    doesn't silently drop them. Only restores entries with no open position and
+    exits whose position is still open. Drips are NOT restored (they carry
+    executor-internal fill state that can't be safely reconstructed) — any
+    in-flight drip is surfaced by the intent/position reconcile instead."""
+    from config import MANUAL_ENTRY_GATE_TIMEOUT_MIN
+    try:
+        with open(_PENDING_GATES_FILE) as f:
+            data = json.load(f)
+    except Exception:
+        return
+    restored = []
+    for sym, r in (data.get("entries") or {}).items():
+        if pm.get(sym):          # a position already exists → don't re-arm entry
+            continue
+        try:
+            expires_ms = (now_ms() + MANUAL_ENTRY_GATE_TIMEOUT_MIN * 60_000
+                          if MANUAL_ENTRY_GATE_TIMEOUT_MIN > 0 else 0)
+            pending_entries[sym] = {
+                "direction": r["direction"],
+                "notional": float(r["notional"]),
+                "orig_notional": float(r.get("orig_notional", r["notional"])),
+                "target_bps": float(r["target_bps"]),
+                "expires_ms": expires_ms,
+            }
+            restored.append(f"ENTER {sym} ≥{float(r['target_bps']):.0f}bps")
+        except Exception:
+            continue
+    for sym, r in (data.get("exits") or {}).items():
+        pos = pm.get(sym)
+        if not pos or pos.status != "open":   # only re-arm exits on a live position
+            continue
+        try:
+            pe = {"target_bps": float(r["target_bps"])}
+            if r.get("maker_venue"):
+                pe["maker_venue"] = r["maker_venue"]
+            if r.get("close_notional"):
+                pe["close_notional"] = float(r["close_notional"])
+            pending_exits[sym] = pe
+            restored.append(f"CLOSE {sym} ≥{float(r['target_bps']):.0f}bps")
+        except Exception:
+            continue
+    if restored:
+        log.warning(f"Restored {len(restored)} pending gate(s) after restart: "
+                    + ", ".join(restored))
+        try:
+            alert("♻️ Restored gates after restart:\n  " + "\n  ".join(restored))
+        except Exception:
+            pass
+
+
 def _auto_entry_enabled() -> bool:
     """Read the runtime auto-entry flag. Missing/unreadable file = enabled (default)."""
     try:
@@ -397,6 +449,10 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     #   pending_exits:   symbol -> {target_bps}
     pending_entries: dict[str, dict] = {}
     pending_exits: dict[str, dict] = {}
+    # Restore waiting gates from disk — they live only in memory otherwise, so a
+    # restart (crash/OOM/deploy) silently dropped every armed gate while the
+    # position stayed open (observed: an overnight SKHX exit gate vanished).
+    _restore_pending_gates(pending_entries, pending_exits, pm, send_alert)
     # ("enter"|"exit", symbol) -> consecutive evaluations the basis held ≥ target
     gate_streaks: dict[tuple[str, str], int] = {}
     # top N candidates polled every fast tick
