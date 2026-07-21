@@ -1129,8 +1129,18 @@ class ExchangeClient:
         if (isinstance(ast, Exception) or isinstance(hl_fund, Exception)
                 or isinstance(hl_fee, Exception) or ast is None
                 or hl_fund is None or hl_fee is None):
-            return {"funding": 0.0, "fees": 0.0, "ok": False,
-                    "detail": f"query failed (ast={ast} hl_fund={hl_fund} hl_fee={hl_fee})"}
+            # Log WHICH leg failed at WARNING — otherwise the caller silently
+            # falls back to the estimate and /positions is stuck on "(est)".
+            bad = []
+            if isinstance(ast, Exception) or ast is None:
+                bad.append(f"aster_income={ast!r}")
+            if isinstance(hl_fund, Exception) or hl_fund is None:
+                bad.append(f"hl_funding={hl_fund!r}")
+            if isinstance(hl_fee, Exception) or hl_fee is None:
+                bad.append(f"hl_fees={hl_fee!r}")
+            detail = "reconcile query failed: " + "; ".join(bad)
+            log.warning(f"{symbol}: {detail}")
+            return {"funding": 0.0, "fees": 0.0, "ok": False, "detail": detail}
         funding = hl_fund + ast["funding"]          # both signed
         fees = hl_fee + (-ast["commission"])        # commission is negative → positive cost
         return {
@@ -1173,19 +1183,32 @@ class ExchangeClient:
             return False
         return reported.split(":")[-1] == base
 
+    async def _hl_info_list(self, req_type: str, base: str, start_ms: int,
+                            end_ms: int) -> list:
+        """POST /info for a user history query. XYZ perps live on the builder
+        dex, and user queries there need dex='xyz' (same as clearinghouseState).
+        Try WITH the dex first; if HL errors (non-list), retry WITHOUT so a
+        main-dex-only account still works. Raises if both shapes fail."""
+        body = {"type": req_type,
+                "user": self.api_keys["hl_account_address"],
+                "startTime": int(start_ms), "endTime": int(end_ms)}
+        last = None
+        for extra in ({"dex": "xyz"}, {}):
+            try:
+                async with self.session.post(
+                    HYPERLIQUID_API, json={**body, **extra}, timeout=self.timeout,
+                ) as r:
+                    data = await r.json(content_type=None)
+                if isinstance(data, list):
+                    return data
+                last = f"{req_type} not a list (dex={extra or 'none'}): {str(data)[:120]}"
+            except Exception as e:
+                last = f"{req_type} error (dex={extra or 'none'}): {e}"
+        raise ValueError(last or f"{req_type} failed")
+
     async def _hl_user_funding_sum(self, base: str, start_ms: int, end_ms: int) -> float:
-        """POST /info userFunding → summed USDC funding delta for the coin
-        (signed: +received / -paid)."""
-        async with self.session.post(
-            HYPERLIQUID_API,
-            json={"type": "userFunding",
-                  "user": self.api_keys["hl_account_address"],
-                  "startTime": int(start_ms), "endTime": int(end_ms)},
-            timeout=self.timeout,
-        ) as r:
-            data = await r.json(content_type=None)
-        if not isinstance(data, list):
-            raise ValueError(f"userFunding not a list: {str(data)[:150]}")
+        """userFunding → summed USDC funding delta for the coin (+recv / -paid)."""
+        data = await self._hl_info_list("userFunding", base, start_ms, end_ms)
         total = 0.0
         for row in data:
             delta = (row or {}).get("delta") or {}
@@ -1194,17 +1217,8 @@ class ExchangeClient:
         return total
 
     async def _hl_fill_fee_sum(self, base: str, start_ms: int, end_ms: int) -> float:
-        """POST /info userFillsByTime → summed fee for the coin (USDC cost, >=0)."""
-        async with self.session.post(
-            HYPERLIQUID_API,
-            json={"type": "userFillsByTime",
-                  "user": self.api_keys["hl_account_address"],
-                  "startTime": int(start_ms), "endTime": int(end_ms)},
-            timeout=self.timeout,
-        ) as r:
-            data = await r.json(content_type=None)
-        if not isinstance(data, list):
-            raise ValueError(f"userFillsByTime not a list: {str(data)[:150]}")
+        """userFillsByTime → summed fee for the coin (USDC cost, >=0)."""
+        data = await self._hl_info_list("userFillsByTime", base, start_ms, end_ms)
         return sum(float((f or {}).get("fee") or 0)
                    for f in data if self._hl_coin_matches((f or {}).get("coin", ""), base))
 
