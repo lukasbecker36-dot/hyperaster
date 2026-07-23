@@ -29,6 +29,7 @@ Commands:
   /help        command list
 """
 
+import html
 import json
 import os
 import subprocess
@@ -106,6 +107,32 @@ def send(chat_id: str, text: str, parse_mode: str | None = None):
             _api("sendMessage", params, timeout=15)
         except Exception as e:
             print(f"send failed: {e}", flush=True)
+
+
+def send_pre(chat_id: str, out: str, code: int = 0):
+    """Send subprocess output as a monospaced <pre> block, HTML-escaping the
+    body first. Without the escape, stray <, >, & in the text — e.g. the
+    '⚠ = < -10' / 'sum > fees' legend in /opps — trip Telegram's HTML parser
+    into a 400 Bad Request, which silently drops the reply and reads as a hung
+    command (you see the '⏳' message and then nothing)."""
+    if not out:
+        send(chat_id, f"(no output, exit {code})")
+        return
+    # Split on the RAW text (by line, so a wide table row stays intact) and wrap
+    # each chunk in its own <pre> — otherwise send()'s blind 3900-char chunking
+    # would cut a long block's open/close tags apart and 400 again.
+    chunk, lines = [], out.split("\n")
+    n = 0
+    for line in lines:
+        if n + len(line) + 1 > 3500 and chunk:
+            send(chat_id, f"<pre>{html.escape(chr(10).join(chunk))}</pre>",
+                 parse_mode="HTML")
+            chunk, n = [], 0
+        chunk.append(line)
+        n += len(line) + 1
+    if chunk:
+        send(chat_id, f"<pre>{html.escape(chr(10).join(chunk))}</pre>",
+             parse_mode="HTML")
 
 
 # ── Shell helpers ──
@@ -1252,8 +1279,7 @@ def cmd_backtest(chat_id: str, arg: str):
     what = f"{symbol} threshold sweep" if sweep else ("the universe" if not symbol else symbol)
     send(chat_id, f"⏳ {what} over {hours}h ({cost} cost, ~30–90s)…")
     code, out = run(cmd, timeout=200)
-    send(chat_id, f"<pre>{out}</pre>" if out else f"(no output, exit {code})",
-         parse_mode="HTML")
+    send_pre(chat_id, out, code)
 
 
 def cmd_book(chat_id: str, arg: str):
@@ -1269,8 +1295,7 @@ def cmd_book(chat_id: str, arg: str):
     script = BASE_DIR / "scripts" / "book_snapshot.py"
     send(chat_id, f"⏳ fetching {symbol} books…")
     code, out = run([PYTHON, str(script), symbol], timeout=30)
-    send(chat_id, f"<pre>{out}</pre>" if out else f"(no output, exit {code})",
-         parse_mode="HTML")
+    send_pre(chat_id, out, code)
 
 
 def cmd_basis(chat_id: str, arg: str):
@@ -1288,8 +1313,7 @@ def cmd_basis(chat_id: str, arg: str):
     script = BASE_DIR / "scripts" / "basis_snapshot.py"
     send(chat_id, f"⏳ fetching {symbol} basis…")
     code, out = run([PYTHON, str(script), symbol], timeout=45)
-    send(chat_id, f"<pre>{out}</pre>" if out else f"(no output, exit {code})",
-         parse_mode="HTML")
+    send_pre(chat_id, out, code)
 
 
 def cmd_opps(chat_id: str, arg: str):
@@ -1310,8 +1334,7 @@ def cmd_opps(chat_id: str, arg: str):
     if code == 124:
         out = (out + " — first run builds a fast index over the capture DB; "
                "re-run /opps and it'll be quick.")
-    send(chat_id, f"<pre>{out}</pre>" if out else f"(no output, exit {code})",
-         parse_mode="HTML")
+    send_pre(chat_id, out, code)
 
 
 def cmd_help(chat_id: str, _arg: str):
