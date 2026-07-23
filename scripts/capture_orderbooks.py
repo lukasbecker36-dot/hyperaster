@@ -114,6 +114,15 @@ def _init_db(path: str) -> sqlite3.Connection:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_snap_sym_ts ON book_snaps(symbol, ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_snap_ts ON book_snaps(ts)")
+    # Covering index for the /opps + /basis screeners: they scan the last 24h of
+    # the narrow top-of-book + funding columns. Without this the ts index still
+    # forces a per-row lookup into the main table, whose rows carry fat
+    # hl_levels/aster_levels JSON blobs — ~1M random page fetches that thrash the
+    # cache into disk seeks on a memory-tight box (the /opps hang). With every
+    # queried column in the index, that scan is index-only: no blob pages touched.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_snap_cover ON book_snaps("
+        "ts, symbol, hl_bid, hl_ask, aster_bid, aster_ask, hl_funding, aster_funding)")
     conn.commit()
     return conn
 

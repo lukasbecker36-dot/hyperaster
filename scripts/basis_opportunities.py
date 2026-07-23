@@ -39,6 +39,11 @@ from config import DATA_DIR, NON_EQUITY_SYMBOLS, CARRY_ROUND_TRIP_FEE
 CAPTURE_DB = os.path.join(DATA_DIR, "orderbook_capture.db")
 DAY_MS = 24 * 3_600_000
 MIN_SAMPLES = 200          # need decent 24h coverage before a p90 is meaningful
+# Hard cap on rows pulled into Python. The DB grows unbounded across restarts
+# (no retention prune), so a 24h window can still be huge; above this we sample
+# every k-th snapshot so a p90 stays stable while peak memory stays bounded on
+# the 4GB box. ~400k narrow rows ≈ 10k/name over 40 names — plenty for a p90.
+MAX_ROWS = 400_000
 FEE_BPS = CARRY_ROUND_TRIP_FEE * 10000   # maker-HL/taker-Ast round trip ≈ 4.8bp
 # Floor (sit-level round trip) below this = wide/one-sided book (a missed exit
 # spike is a loss). LLY's floor was ~-3.5 (fine); ZHIPU's ~-24 (trap).
@@ -56,6 +61,25 @@ def _fmt_n(n):
     return f"{n/1000:.1f}k" if n >= 1000 else str(n)
 
 
+def _ensure_cover_index():
+    """Build the covering index on an existing DB if the capture service hasn't
+    yet (older DBs predate it). Index-only scans are what keep /opps fast: the
+    query never touches the fat hl_levels/aster_levels blob pages. Opened
+    read-write briefly; if that fails (read-only FS, locked), we just fall back
+    to the slower path rather than erroring — best-effort."""
+    try:
+        c = sqlite3.connect(CAPTURE_DB, timeout=15)
+        c.execute("PRAGMA busy_timeout=10000")
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_snap_cover ON book_snaps("
+            "ts, symbol, hl_bid, hl_ask, aster_bid, aster_ask, "
+            "hl_funding, aster_funding)")
+        c.commit()
+        c.close()
+    except Exception:
+        pass
+
+
 def _load_p90s():
     """capture DB → [(sym, p90sum, n, carry, floor)] per name.
     floor = avg(buy_hl) + avg(buy_ast) = the sit-level round trip (≈ HL spread −
@@ -64,18 +88,31 @@ def _load_p90s():
     a missed spike is a loss — the ZHIPU trap. Used to gate ★ and penalise
     ranking so high-amplitude-but-broken-book names don't float to the top."""
     cutoff = int(time.time() * 1000) - DAY_MS
+    _ensure_cover_index()
     conn = sqlite3.connect(f"file:{CAPTURE_DB}?mode=ro", uri=True, timeout=15)
-    rows = conn.execute(
-        "SELECT symbol, hl_bid, hl_ask, aster_bid, aster_ask, hl_funding, "
-        "aster_funding FROM book_snaps "
-        "WHERE ts >= ? AND hl_bid > 0 AND hl_ask > 0 "
-        "AND aster_bid > 0 AND aster_ask > 0", (cutoff,)).fetchall()
-    conn.close()
+    # Count first (index-only, fast) so we can stride-sample huge windows down to
+    # MAX_ROWS instead of materialising millions of fat-book rows into Python.
+    n_win = conn.execute(
+        "SELECT count(*) FROM book_snaps WHERE ts >= ?", (cutoff,)).fetchone()[0]
+    stride = max(1, n_win // MAX_ROWS)
+    sql = ("SELECT symbol, hl_bid, hl_ask, aster_bid, aster_ask, hl_funding, "
+           "aster_funding FROM book_snaps "
+           "WHERE ts >= ? AND hl_bid > 0 AND hl_ask > 0 "
+           "AND aster_bid > 0 AND aster_ask > 0")
+    params = [cutoff]
+    if stride > 1:
+        # Sample whole capture cycles by time bucket (each cycle shares a ~ts, so
+        # this keeps every symbol represented) rather than by rowid, which could
+        # systematically drop a symbol.
+        sql += " AND ((ts / 3000) % ?) = 0"
+        params.append(stride)
     buy_hl = defaultdict(list)
     buy_ast = defaultdict(list)
     hl_fund = defaultdict(list)
     ast_fund = defaultdict(list)
-    for sym, hb, ha, ab, aa, hf, af in rows:
+    # Stream the cursor — don't fetchall — so we never hold the full result set
+    # AND the per-symbol lists at once.
+    for sym, hb, ha, ab, aa, hf, af in conn.execute(sql, params):
         if sym in NON_EQUITY_SYMBOLS:
             continue
         mid = (hb + ha + ab + aa) / 4
@@ -87,6 +124,7 @@ def _load_p90s():
             hl_fund[sym].append(float(hf))
         if af is not None:
             ast_fund[sym].append(float(af))
+    conn.close()
     ranked = []
     for sym, hl_list in buy_hl.items():
         if len(hl_list) < MIN_SAMPLES:

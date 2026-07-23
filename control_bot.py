@@ -1304,7 +1304,12 @@ def cmd_opps(chat_id: str, arg: str):
         n = "5"
     script = BASE_DIR / "scripts" / "basis_opportunities.py"
     send(chat_id, "⏳ ranking basis opportunities…")
-    code, out = run([PYTHON, str(script), n], timeout=45)
+    # 180s not 45s: the first call on an older DB builds the covering index (a
+    # one-time full scan); after that it's index-only and returns in seconds.
+    code, out = run([PYTHON, str(script), n], timeout=180)
+    if code == 124:
+        out = (out + " — first run builds a fast index over the capture DB; "
+               "re-run /opps and it'll be quick.")
     send(chat_id, f"<pre>{out}</pre>" if out else f"(no output, exit {code})",
          parse_mode="HTML")
 
