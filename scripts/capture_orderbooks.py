@@ -128,12 +128,14 @@ def _init_db(path: str) -> sqlite3.Connection:
 
 
 class Capturer:
-    def __init__(self, session, interval, depth, aster_depth, max_hours=0.0):
+    def __init__(self, session, interval, depth, aster_depth, max_hours=0.0,
+                 retention_hours=72.0):
         self.session = session
         self.interval = interval
         self.depth = depth              # store HL top-5 levels JSON
         self.aster_depth = aster_depth  # also fetch + store Aster 5-level depth
         self.max_hours = max_hours      # auto-stop after this long (0 = run forever)
+        self.retention_hours = retention_hours  # drop rows older than this (0 = keep all)
         self.timeout = aiohttp.ClientTimeout(total=8)
         self.symbols: list[str] = []    # canonical bases
         self._sem = asyncio.Semaphore(10)   # cap concurrent HL l2Book calls
@@ -319,6 +321,32 @@ class Capturer:
         except Exception:
             return None
 
+    def _prune(self, conn):
+        """Drop rows older than retention_hours so the DB size plateaus instead
+        of growing unbounded across restarts. Deleted pages are reused by later
+        inserts, so no VACUUM is needed for the file to stay flat at steady
+        state. Deletes in bounded batches (via the ts index) to avoid a long
+        write lock stalling the capture loop."""
+        if self.retention_hours <= 0:
+            return
+        cutoff = _now_ms() - int(self.retention_hours * 3600 * 1000)
+        try:
+            removed = 0
+            while True:
+                cur = conn.execute(
+                    "DELETE FROM book_snaps WHERE rowid IN "
+                    "(SELECT rowid FROM book_snaps WHERE ts < ? LIMIT 5000)",
+                    (cutoff,))
+                conn.commit()
+                if cur.rowcount <= 0:
+                    break
+                removed += cur.rowcount
+            if removed:
+                log.info(f"prune: dropped {removed} rows older than "
+                         f"{self.retention_hours}h")
+        except Exception as e:
+            log.warning(f"prune failed ({e})")
+
     # ── One capture cycle ──
 
     async def cycle(self, conn) -> int:
@@ -375,8 +403,10 @@ class Capturer:
             except ValueError:
                 pass  # not main thread
 
+        self._prune(conn)  # clear any backlog from before retention existed
         last_report = time.time()
         last_discover = time.time()
+        last_prune = time.time()
         while not stop["flag"]:
             if deadline and time.time() >= deadline:
                 log.info(f"Reached {self.max_hours}h capture limit — stopping")
@@ -399,6 +429,10 @@ class Capturer:
                         self.symbols = fresh
                 except Exception as e:
                     log.warning(f"re-discover failed ({e})")
+            # Prune aged-out rows every 30 min so the file size stays flat.
+            if time.time() - last_prune > 1800:
+                last_prune = time.time()
+                self._prune(conn)
             # Health + periodic progress.
             now = time.time()
             elapsed = now - t0
@@ -451,6 +485,9 @@ def main():
     ap.add_argument("--once", action="store_true", help="single cycle then exit (smoke test)")
     ap.add_argument("--max-hours", type=float, default=24.0,
                     help="auto-stop after this many hours (0 = run until killed)")
+    ap.add_argument("--retention-hours", type=float, default=72.0,
+                    help="drop rows older than this so the DB size stays flat "
+                         "(0 = keep everything)")
     a = ap.parse_args()
 
     logging.basicConfig(
@@ -463,7 +500,8 @@ def main():
 
     async def _run():
         async with aiohttp.ClientSession() as session:
-            cap = Capturer(session, a.interval, a.depth, a.aster_depth, a.max_hours)
+            cap = Capturer(session, a.interval, a.depth, a.aster_depth, a.max_hours,
+                           a.retention_hours)
             await cap.run(conn, run_once=a.once)
 
     try:
