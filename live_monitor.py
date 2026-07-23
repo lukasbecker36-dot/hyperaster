@@ -455,6 +455,25 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     _restore_pending_gates(pending_entries, pending_exits, pm, send_alert)
     # ("enter"|"exit", symbol) -> consecutive evaluations the basis held ≥ target
     gate_streaks: dict[tuple[str, str], int] = {}
+    # symbol -> last ms we warned that a gate couldn't evaluate (books empty).
+    # Throttles the "gate blind" warning to ~1/5min so a persistent HL rate-limit
+    # is visible (silent skips looked like the gate "wasn't live").
+    gate_blind_last: dict[str, int] = {}
+
+    def _warn_gate_blind(symbol: str, which: str):
+        now = now_ms()
+        if now - gate_blind_last.get(symbol, 0) > 300_000:
+            gate_blind_last[symbol] = now
+            log.warning(
+                f"gate {symbol}: cannot evaluate {which} — book unavailable "
+                f"(HL/Aster fetch empty; likely rate-limited). Gate NOT firing "
+                f"until books return."
+            )
+            try:
+                send_alert(f"⚠️ {symbol} {which} gate can't read the book "
+                           f"(rate-limited?) — not firing until it clears")
+            except Exception:
+                pass
     # top N candidates polled every fast tick
     candidates: list[str] = []
 
@@ -1040,9 +1059,11 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             try:
                 aster_book, hl_book = await client.get_both_books(symbol)
             except Exception:
+                _warn_gate_blind(symbol, "ENTER")
                 continue
             basis = _carry_basis_bps(req["direction"], "enter", aster_book, hl_book)
             if basis is None:
+                _warn_gate_blind(symbol, "ENTER")
                 continue
             log.info(
                 f"gate {symbol}: basis={basis:.1f}bps target={req['target_bps']:.0f}bps "
@@ -1076,9 +1097,11 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             try:
                 aster_book, hl_book = await client.get_both_books(symbol)
             except Exception:
+                _warn_gate_blind(symbol, "CLOSE")
                 continue
             basis = _carry_basis_bps(pos.direction, "exit", aster_book, hl_book)
             if basis is None:
+                _warn_gate_blind(symbol, "CLOSE")
                 continue
             target = pending_exits[symbol]["target_bps"]
             if basis >= target:
