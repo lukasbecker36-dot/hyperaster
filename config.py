@@ -296,12 +296,14 @@ ENTRY_THRESHOLD_BPS_BY_SYMBOL: dict = {
 # "xyz:SMSN"). For most names Aster uses the same base + "USDT". A few names
 # differ: HL uses a short/GDR ticker while Aster's *tradeable* book uses the
 # long name, and Aster's name-matching contract is a dead listing that 400s.
-#   - Samsung:  HL xyz:SMSN  <-> Aster SAMSUNGUSDT  (SMSNUSDT is dead)
-#   - SK Hynix: HL xyz:SKHX  <-> Aster SKHYNIXUSDT  (SKHXUSDT is dead)
+#   - Samsung:   HL xyz:SMSN  <-> Aster SAMSUNGUSDT  (SMSNUSDT is dead)
+#   - SK Hynix:  HL xyz:SKHX  <-> Aster SKHYNIXUSDT  (SKHXUSDT is dead)
+#   - BlackBerry: HL xyz:BB   <-> Aster BBXUSDT      (BBUSDT is a crypto, wrong)
 # Map: canonical base -> Aster's tradeable base symbol.
 ASTER_BASE_ALIAS: dict = {
     "SMSN": "SAMSUNG",
     "SKHX": "SKHYNIX",
+    "BB": "BBX",
 }
 # Reverse map for discovery / spec loading: Aster base -> canonical base.
 ASTER_BASE_TO_CANON: dict = {v: k for k, v in ASTER_BASE_ALIAS.items()}
@@ -331,12 +333,17 @@ NON_EQUITY_SYMBOLS: set = {
 # (catches mismatched instruments where Aster and HL track different underlyings)
 MAX_PRICE_RATIO_DIVERGENCE = 0.20   # 20%
 # Symbols permanently excluded from the scanner and monitor
-# BB: mismatched instruments vs HL XYZ
+# NOTE: BB (BlackBerry) was blocked for "mismatched instruments" — that was the
+# ASTER_BASE_ALIAS bug (BB→BBUSDT is a crypto; the real book is BBXUSDT). With
+# the BB->BBX alias added it now points at the right instrument, so it's
+# un-blocked. It won't auto-trade until added to ENTRY_THRESHOLD_BPS_BY_SYMBOL
+# (AUTO_TRADE_ONLY_CALIBRATED), and the 20% price-ratio guard still catches any
+# residual mismatch.
 # Peak-analysis blocklist: names with negative median peak reversion consistently
 # lose money after fees — the spread widens further instead of reverting.
 # Derived from scripts/backtest_1m.py --peak-analysis (48h, 480m baseline).
 BLOCKED_SYMBOLS: set = {
-    "BB", "BIRD",
+    "BIRD",
     "META", "COIN", "LLY", "IBM", "MSFT", "URNM", "BABA", "AVGO",
     "CRWV", "EWT", "BX", "USAR", "WDC",
     # 2026-06-15 peak-analysis blocklist refresh (48h, 480m baseline):
