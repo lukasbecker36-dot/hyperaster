@@ -1210,6 +1210,10 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             if runtime_flags["auto_entry"] != prev_auto:
                 state = "ENABLED" if runtime_flags["auto_entry"] else "DISABLED"
                 log.warning(f"Auto-entry {state} (runtime flag changed)")
+                # Resume the full-universe scan immediately when re-enabled
+                # (it's skipped while off), rather than waiting up to 5 min.
+                if runtime_flags["auto_entry"]:
+                    last_slow_scan = 0
             # Auto-entry off must also abort AUTO entries still in-flight (a
             # resting maker not yet filled) — not just stop new ones — or a
             # position keeps completing after you disabled it (ZM did). Manual
@@ -1304,29 +1308,40 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 await discover_new_symbols()
 
             # ── 2. Slow scan: rank all symbols every 5 min ──
+            # The full-universe scan exists ONLY to find auto-entry candidates
+            # (~40 HL l2Book fetches/5min + polling the top candidates every
+            # tick). When auto-entry is OFF it's pure wasted HL bandwidth — skip
+            # it so only open positions (fast tick) and armed gates (which fetch
+            # their own books) hit HL. This is the big lever against rate-limiting
+            # when you're only running manual carry trades.
             if now - last_slow_scan >= SLOW_SCAN_INTERVAL_SECONDS * 1000:
                 last_slow_scan = now
-                await client.refresh_hl_oracles(symbols)
-                all_results = await asyncio.gather(*[scan_symbol(s) for s in symbols])
-                open_syms = set(pm.positions.keys())
-                ranked = sorted(
-                    [r for r in all_results if r and r[0] not in open_syms],
-                    key=lambda r: r[1] / ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(r[0], ENTRY_THRESHOLD_BPS),
-                    reverse=True,
-                )
-                candidates = [r[0] for r in ranked[:FAST_CANDIDATES]]
-                # Candidates + open positions are re-processed in the fast tick
-                # below; skip them here so the entry persistence streak isn't
-                # double-counted within a single loop iteration.
-                fast_set = set(candidates) | set(open_syms)
-                for r in all_results:
-                    if r and r[0] not in fast_set:
-                        await process_result(r)
-                thresh_strs = " | ".join(
-                    f"{s} {spd:.0f}/{ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(s, ENTRY_THRESHOLD_BPS):.0f}bps base={base:+.0f}"
-                    for s, spd, _, base, *_ in ranked[:5]
-                )
-                log.info(f"Slow scan | Watching: {candidates} | Top 5: {thresh_strs}")
+                await client.refresh_hl_oracles(symbols)   # 1 cheap batch call
+                if not runtime_flags["auto_entry"]:
+                    candidates = []
+                    log.info("Slow scan SKIPPED (auto-entry off) — only open "
+                             "positions + armed gates fetch books")
+                else:
+                    all_results = await asyncio.gather(*[scan_symbol(s) for s in symbols])
+                    open_syms = set(pm.positions.keys())
+                    ranked = sorted(
+                        [r for r in all_results if r and r[0] not in open_syms],
+                        key=lambda r: r[1] / ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(r[0], ENTRY_THRESHOLD_BPS),
+                        reverse=True,
+                    )
+                    candidates = [r[0] for r in ranked[:FAST_CANDIDATES]]
+                    # Candidates + open positions are re-processed in the fast tick
+                    # below; skip them here so the entry persistence streak isn't
+                    # double-counted within a single loop iteration.
+                    fast_set = set(candidates) | set(open_syms)
+                    for r in all_results:
+                        if r and r[0] not in fast_set:
+                            await process_result(r)
+                    thresh_strs = " | ".join(
+                        f"{s} {spd:.0f}/{ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(s, ENTRY_THRESHOLD_BPS):.0f}bps base={base:+.0f}"
+                        for s, spd, _, base, *_ in ranked[:5]
+                    )
+                    log.info(f"Slow scan | Watching: {candidates} | Top 5: {thresh_strs}")
 
             # ── 3. Fast tick: poll candidates + open positions ──
             open_syms = set(pm.positions.keys())
