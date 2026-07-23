@@ -40,6 +40,9 @@ CAPTURE_DB = os.path.join(DATA_DIR, "orderbook_capture.db")
 DAY_MS = 24 * 3_600_000
 MIN_SAMPLES = 200          # need decent 24h coverage before a p90 is meaningful
 FEE_BPS = CARRY_ROUND_TRIP_FEE * 10000   # maker-HL/taker-Ast round trip ≈ 4.8bp
+# Floor (sit-level round trip) below this = wide/one-sided book (a missed exit
+# spike is a loss). LLY's floor was ~-3.5 (fine); ZHIPU's ~-24 (trap).
+FLOOR_MIN_BPS = -10.0
 
 
 def _percentile(xs, p):
@@ -54,7 +57,12 @@ def _fmt_n(n):
 
 
 def _load_p90s():
-    """capture DB → [(sym, p90_buy_hl, p90_buy_ast, sum, n)] sorted by sum."""
+    """capture DB → [(sym, p90sum, n, carry, floor)] per name.
+    floor = avg(buy_hl) + avg(buy_ast) = the sit-level round trip (≈ HL spread −
+    Aster spread). Near 0 = tight symmetric books, so a missed exit spike bails
+    ~breakeven; deep negative = wide/one-sided book (Aster book much wider), so
+    a missed spike is a loss — the ZHIPU trap. Used to gate ★ and penalise
+    ranking so high-amplitude-but-broken-book names don't float to the top."""
     cutoff = int(time.time() * 1000) - DAY_MS
     conn = sqlite3.connect(f"file:{CAPTURE_DB}?mode=ro", uri=True, timeout=15)
     rows = conn.execute(
@@ -95,8 +103,10 @@ def _load_p90s():
             hl_avg = sum(hl_fund[sym]) / len(hl_fund[sym])
             ast_avg = sum(ast_fund[sym]) / len(ast_fund[sym])
             carry = (hl_avg * 24 - ast_avg * 3) * 10000
-        ranked.append((sym, p90_hl, p90_ast, p90_hl + p90_ast, len(hl_list), carry))
-    ranked.sort(key=lambda r: r[3], reverse=True)
+        floor = (sum(buy_hl[sym]) / len(hl_list)
+                 + sum(buy_ast[sym]) / len(buy_ast[sym]))
+        ranked.append((sym, p90_hl + p90_ast, len(hl_list), carry, floor))
+    ranked.sort(key=lambda r: r[1], reverse=True)
     return ranked
 
 
@@ -117,33 +127,44 @@ def run(top: int):
 
     candidates = ranked[:max(top * 3, 12)]
     scored = []
-    for sym, ph, pa, s, n, c_ashl in candidates:  # carry of holding L-AST/S-HL
+    for sym, s, n, c_ashl, floor in candidates:  # c_ashl = carry holding L-AST/S-HL
         if c_ashl is None:
-            scored.append((sym, s, None, "?", s, n))
-            continue
-        # The better hold direction and its carry (what you'd earn waiting).
-        if c_ashl >= -c_ashl:
+            best_carry, hold = None, "?"
+        elif c_ashl >= -c_ashl:   # better hold direction + its carry
             best_carry, hold = c_ashl, "L-AST"
         else:
             best_carry, hold = -c_ashl, "L-HL"
-        scored.append((sym, s, best_carry, hold, s + best_carry, n))
-    scored.sort(key=lambda r: r[4], reverse=True)
+        # Rank score rewards amplitude + carry but PENALISES a negative floor
+        # (a wide/one-sided book where a missed exit spike is a loss), so
+        # ZHIPU-shaped traps sink instead of topping the list on amplitude alone.
+        score = s + (best_carry or 0) + min(0.0, floor)
+        scored.append((sym, s, best_carry, hold, floor, score, n))
+    scored.sort(key=lambda r: r[5], reverse=True)
 
-    hdr = f"{'#':>2} {'SYM':<7}{'sum':>6}{'c/d':>7} {'hold':<6}{'n':>6}"
+    hdr = f"{'#':>2} {'SYM':<7}{'sum':>6}{'floor':>7}{'c/d':>7} {'hold':<6}{'n':>6}"
     lines = ["🎯 Top basis opportunities (bps)", hdr, "─" * len(hdr)]
-    for i, (sym, s, carry, hold, score, n) in enumerate(scored[:top], 1):
+    for i, (sym, s, carry, hold, floor, score, n) in enumerate(scored[:top], 1):
+        # ★ = spread clears fees AND positive carry AND a sound floor (tight
+        # symmetric book). ⚠ = deep-negative floor → wide-book trap, no ★.
+        bad_floor = floor < FLOOR_MIN_BPS
         star = ""
-        if carry is not None and carry > 0 and s > FEE_BPS:
+        if not bad_floor and carry is not None and carry > 0 and s > FEE_BPS:
             star = " ★"
+        elif bad_floor:
+            star = " ⚠"
         c_str = f"{carry:>+7.1f}" if carry is not None else f"{'?':>7}"
-        lines.append(f"{i:>2} {sym:<7}{s:>+6.0f}{c_str} {hold:<6}{_fmt_n(n):>6}{star}")
+        lines.append(f"{i:>2} {sym:<7}{s:>+6.0f}{floor:>+7.0f}{c_str} "
+                     f"{hold:<6}{_fmt_n(n):>6}{star}")
     lines.append("─" * len(hdr))
-    lines.append("sum = p90 round trip (catch both legs' spikes). c/d = ~net")
-    lines.append("carry bps/day of the BETTER hold direction (from captured")
-    lines.append("rates, 8h Aster window assumed); hold = which (L-AST = long")
-    lines.append("Aster/short HL). Ranked by sum + carry.")
-    lines.append(f"★ = sum > fees ({FEE_BPS:.0f}bp) AND positive carry — spread to")
-    lines.append("earn and paid to wait. /basis SYM for exact carry + window.")
+    lines.append("sum = p90 round trip (catch both spikes). floor = sit-level")
+    lines.append("round trip (avg of both legs) — near 0 = tight symmetric book,")
+    lines.append(f"a missed exit bails ~breakeven; ⚠ = < {FLOOR_MIN_BPS:.0f} = "
+                 f"wide/one-sided")
+    lines.append("book, missed exit is a LOSS (no ★). c/d = ~net carry/day of the")
+    lines.append("BETTER hold (8h Aster window assumed). Rank = sum + carry + floor.")
+    lines.append(f"★ = sum > fees ({FEE_BPS:.0f}bp) + positive carry + sound floor —")
+    lines.append("spread to earn, paid to wait, breakeven if the exit's slow.")
+    lines.append("/basis SYM for exact carry + window before trading.")
     print("\n".join(lines))
 
 
