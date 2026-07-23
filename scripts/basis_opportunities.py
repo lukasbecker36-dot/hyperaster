@@ -25,7 +25,6 @@ the full pre-trade picture on one name.
 Usage: python scripts/basis_opportunities.py [N]     (default 5)
 """
 
-import asyncio
 import os
 import sqlite3
 import sys
@@ -33,13 +32,9 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-import aiohttp
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, str(Path(__file__).parent))
 
 from config import DATA_DIR, NON_EQUITY_SYMBOLS, CARRY_ROUND_TRIP_FEE
-from basis_snapshot import _funding_avg_24h
 
 CAPTURE_DB = os.path.join(DATA_DIR, "orderbook_capture.db")
 DAY_MS = 24 * 3_600_000
@@ -63,13 +58,16 @@ def _load_p90s():
     cutoff = int(time.time() * 1000) - DAY_MS
     conn = sqlite3.connect(f"file:{CAPTURE_DB}?mode=ro", uri=True, timeout=15)
     rows = conn.execute(
-        "SELECT symbol, hl_bid, hl_ask, aster_bid, aster_ask FROM book_snaps "
+        "SELECT symbol, hl_bid, hl_ask, aster_bid, aster_ask, hl_funding, "
+        "aster_funding FROM book_snaps "
         "WHERE ts >= ? AND hl_bid > 0 AND hl_ask > 0 "
         "AND aster_bid > 0 AND aster_ask > 0", (cutoff,)).fetchall()
     conn.close()
     buy_hl = defaultdict(list)
     buy_ast = defaultdict(list)
-    for sym, hb, ha, ab, aa in rows:
+    hl_fund = defaultdict(list)
+    ast_fund = defaultdict(list)
+    for sym, hb, ha, ab, aa, hf, af in rows:
         if sym in NON_EQUITY_SYMBOLS:
             continue
         mid = (hb + ha + ab + aa) / 4
@@ -77,40 +75,32 @@ def _load_p90s():
             continue
         buy_hl[sym].append((ab - hb) / mid * 10000)
         buy_ast[sym].append((ha - aa) / mid * 10000)
+        if hf is not None:
+            hl_fund[sym].append(float(hf))
+        if af is not None:
+            ast_fund[sym].append(float(af))
     ranked = []
     for sym, hl_list in buy_hl.items():
         if len(hl_list) < MIN_SAMPLES:
             continue
         p90_hl = _percentile(hl_list, 90)
         p90_ast = _percentile(buy_ast[sym], 90)
-        ranked.append((sym, p90_hl, p90_ast, p90_hl + p90_ast, len(hl_list)))
+        # Net carry (bps/day) of holding L-AST/S-HL, from the captured rates.
+        # HL funding is per-1h; Aster per settlement window. The window isn't
+        # stored, so assume the common 8h (3 settlements/day) — the SIGN and
+        # rough size are right for ranking; /basis SYM gives the exact per-name
+        # number with the detected window. None when funding wasn't captured.
+        carry = None
+        if hl_fund.get(sym) and ast_fund.get(sym):
+            hl_avg = sum(hl_fund[sym]) / len(hl_fund[sym])
+            ast_avg = sum(ast_fund[sym]) / len(ast_fund[sym])
+            carry = (hl_avg * 24 - ast_avg * 3) * 10000
+        ranked.append((sym, p90_hl, p90_ast, p90_hl + p90_ast, len(hl_list), carry))
     ranked.sort(key=lambda r: r[3], reverse=True)
     return ranked
 
 
-async def _fetch_carries(symbols):
-    """symbol -> carry bps/day for holding L-AST/S-HL (None on failure).
-    Settled 24h rates from the venues, correct Aster window per name."""
-    out = {}
-    timeout = aiohttp.ClientTimeout(total=30)
-    sem = asyncio.Semaphore(6)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async def one(sym):
-            async with sem:
-                try:
-                    hl24, ast24, win = await _funding_avg_24h(session, sym)
-                except Exception:
-                    out[sym] = None
-                    return
-                if hl24 is None or ast24 is None or not win:
-                    out[sym] = None
-                    return
-                out[sym] = (hl24 * 24 - ast24 * (24.0 / win)) * 10000
-        await asyncio.gather(*[one(s) for s in symbols])
-    return out
-
-
-async def run(top: int):
+def run(top: int):
     if not os.path.exists(CAPTURE_DB):
         print("🎯 No capture DB yet — start scripts/capture_orderbooks.py and let "
               "it run a while first.")
@@ -125,15 +115,9 @@ async def run(top: int):
               f"{MIN_SAMPLES*3//60}min at 3s). Let the capture run longer.")
         return
 
-    # Fetch settled funding only for the leading candidates (network cost),
-    # wide enough that a positive-carry name just below the raw-sum cut can
-    # still make the final table once carry is added.
     candidates = ranked[:max(top * 3, 12)]
-    carries = await _fetch_carries([r[0] for r in candidates])
-
     scored = []
-    for sym, ph, pa, s, n in candidates:
-        c_ashl = carries.get(sym)          # carry of holding L-AST/S-HL
+    for sym, ph, pa, s, n, c_ashl in candidates:  # carry of holding L-AST/S-HL
         if c_ashl is None:
             scored.append((sym, s, None, "?", s, n))
             continue
@@ -154,11 +138,12 @@ async def run(top: int):
         c_str = f"{carry:>+7.1f}" if carry is not None else f"{'?':>7}"
         lines.append(f"{i:>2} {sym:<7}{s:>+6.0f}{c_str} {hold:<6}{_fmt_n(n):>6}{star}")
     lines.append("─" * len(hdr))
-    lines.append("sum = p90 round trip (catch both legs' spikes). c/d = settled")
-    lines.append("net carry bps/day of the BETTER hold direction; hold = which")
-    lines.append(f"(L-AST = long Aster/short HL). Ranked by sum + carry.")
+    lines.append("sum = p90 round trip (catch both legs' spikes). c/d = ~net")
+    lines.append("carry bps/day of the BETTER hold direction (from captured")
+    lines.append("rates, 8h Aster window assumed); hold = which (L-AST = long")
+    lines.append("Aster/short HL). Ranked by sum + carry.")
     lines.append(f"★ = sum > fees ({FEE_BPS:.0f}bp) AND positive carry — spread to")
-    lines.append("earn and paid to wait. /basis SYM before trading one.")
+    lines.append("earn and paid to wait. /basis SYM for exact carry + window.")
     print("\n".join(lines))
 
 
@@ -166,7 +151,7 @@ def main():
     top = 5
     if len(sys.argv) > 1 and sys.argv[1].isdigit():
         top = max(1, min(int(sys.argv[1]), 20))
-    asyncio.run(run(top))
+    run(top)
 
 
 if __name__ == "__main__":
