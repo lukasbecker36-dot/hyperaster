@@ -63,7 +63,23 @@ ASTER_BOOKTICKER_URL = f"{ASTER_BASE}/fapi/v1/ticker/bookTicker"
 ASTER_PREMIUM_URL = f"{ASTER_BASE}/fapi/v1/premiumIndex"
 ASTER_DEPTH_URL = f"{ASTER_BASE}/fapi/v1/depth"
 
+# Written by the trader when a manual basis gate/drip is armed. While it's fresh
+# we skip our per-name HL l2Book fetches (the one HL cost that scales with the
+# universe) so the gate gets a clean HL read instead of competing for the same
+# rate budget. The batch calls (ctxs/aster) are single requests — cheap — so we
+# keep capturing oracle/funding/Aster book through the pause.
+GATE_ACTIVE_FILE = os.path.join(DATA_DIR, "gate_active")
+GATE_ACTIVE_FRESH_S = 90   # ignore a stale flag (crashed trader) after this
+
 log = logging.getLogger("capture")
+
+
+def _gate_active() -> bool:
+    """True when the trader has a manual gate armed and the flag is recent."""
+    try:
+        return (time.time() - os.path.getmtime(GATE_ACTIVE_FILE)) < GATE_ACTIVE_FRESH_S
+    except OSError:
+        return False
 
 
 def _load_universe_csv() -> list[str]:
@@ -141,6 +157,7 @@ class Capturer:
         self._sem = asyncio.Semaphore(10)   # cap concurrent HL l2Book calls
         self.rows_written = 0
         self.cycles = 0
+        self._gate_paused = False   # currently backing off HL for an armed gate
 
     # ── Universe discovery ──
 
@@ -354,7 +371,21 @@ class Capturer:
         hl_ctxs, aster_bt, aster_pm = await asyncio.gather(
             self._hl_ctxs(), self._aster_book_tickers(), self._aster_premium(),
         )
-        hl_books = await asyncio.gather(*[self._hl_book(s) for s in self.symbols])
+        # Back off the per-name HL l2Book fetches while a manual gate is armed so
+        # the trader's gate read isn't rate-limited. We still record this cycle
+        # from the cheap batch calls (HL mid/oracle/funding + Aster book); only
+        # the HL top-of-book + depth columns are blank for the pause.
+        if _gate_active():
+            if not self._gate_paused:
+                self._gate_paused = True
+                log.info("Manual gate armed — pausing per-name HL l2Book fetches "
+                         "to free HL rate budget for the trader")
+            hl_books = [None] * len(self.symbols)
+        else:
+            if self._gate_paused:
+                self._gate_paused = False
+                log.info("Manual gate cleared — resuming full HL book capture")
+            hl_books = await asyncio.gather(*[self._hl_book(s) for s in self.symbols])
         aster_depths = await asyncio.gather(*[self._aster_depth(s) for s in self.symbols])
 
         rows = []

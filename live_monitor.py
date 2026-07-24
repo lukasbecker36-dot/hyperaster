@@ -123,6 +123,12 @@ _AUTO_NOTIONAL_FILE = os.path.join(DATA_DIR, "auto_notional")
 _MANUAL_CMD_DIR = os.path.join(DATA_DIR, "manual_cmds")
 # Snapshot of basis-gated orders still waiting for their target, for /positions.
 _PENDING_GATES_FILE = os.path.join(DATA_DIR, "pending_gates.json")
+# Signals to the capture daemon that a manual basis gate (or drip) is armed and
+# needs a clean HL read. While this is fresh, capture skips its per-name HL
+# l2Book fetches (its biggest HL-budget cost) so the gate isn't blinded by
+# rate-limiting. Freshness-gated (mtime) so a crashed trader can't starve
+# capture forever.
+_GATE_ACTIVE_FILE = os.path.join(DATA_DIR, "gate_active")
 # Last-fetched exchange balances, written on the /balance request so the control
 # bot (which holds no API keys) can display them.
 _BALANCES_FILE = os.path.join(DATA_DIR, "balances.json")
@@ -174,6 +180,21 @@ def _write_pending_gates(pending_entries: dict, pending_exits: dict,
         with open(tmp, "w") as f:
             json.dump(data, f)
         os.replace(tmp, _PENDING_GATES_FILE)
+    except Exception:
+        pass
+
+
+def _write_gate_active(active: bool):
+    """Touch/refresh the gate-active flag when any manual gate/drip is armed, or
+    remove it when none are. The capture daemon reads it to back off HL while a
+    gate needs a clean read. Written every loop iteration so its mtime doubles
+    as a liveness signal for the capture daemon's freshness check."""
+    try:
+        if active:
+            with open(_GATE_ACTIVE_FILE, "w") as f:
+                f.write(str(time.time()))
+        elif os.path.exists(_GATE_ACTIVE_FILE):
+            os.remove(_GATE_ACTIVE_FILE)
     except Exception:
         pass
 
@@ -1358,6 +1379,8 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             _write_latest_spreads(latest_spreads, latest_est_net)
             _write_pending_gates(pending_entries, pending_exits,
                                  executor._drips, executor._drip_exits)
+            _write_gate_active(bool(pending_entries or pending_exits
+                                    or executor._drips or executor._drip_exits))
             try:
                 tmp = _HEALTH_FILE + ".tmp"
                 with open(tmp, "w") as fh:

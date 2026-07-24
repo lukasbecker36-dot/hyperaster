@@ -863,37 +863,56 @@ class ExchangeClient:
             log.debug(f"Aster book error {symbol}: {e}")
             return OrderBook()
 
-    async def _get_hl_book(self, symbol: str) -> OrderBook:
+    async def _get_hl_book(self, symbol: str, retries: int = 2) -> OrderBook:
+        """HL top-of-book. Retries a couple of times on an empty/rate-limited
+        read before giving up: a single 429 or empty body used to return an
+        empty OrderBook, which blinds the basis gate for that whole tick (the
+        "gate can't read the book" alert). A short in-tick retry clears most
+        transient rate-limit blips so the gate can still fire."""
         hl_coin = f"xyz:{symbol}"
-        try:
-            async with self.session.post(
-                HYPERLIQUID_API,
-                json={"type": "l2Book", "coin": hl_coin},
-                timeout=self.timeout,
-            ) as r:
-                data = await r.json()
-            levels = data.get("levels", [[], []])
-            bids_raw = levels[0] if len(levels) > 0 else []
-            asks_raw = levels[1] if len(levels) > 1 else []
-            if not bids_raw or not asks_raw:
+        for attempt in range(retries + 1):
+            try:
+                async with self.session.post(
+                    HYPERLIQUID_API,
+                    json={"type": "l2Book", "coin": hl_coin},
+                    timeout=self.timeout,
+                ) as r:
+                    if r.status == 429:
+                        log.warning(f"HL l2Book {symbol} rate-limited (429), "
+                                    f"attempt {attempt + 1}/{retries + 1}")
+                        if attempt < retries:
+                            await asyncio.sleep(0.3 * (attempt + 1))
+                        continue
+                    data = await r.json()
+                levels = data.get("levels", [[], []])
+                bids_raw = levels[0] if len(levels) > 0 else []
+                asks_raw = levels[1] if len(levels) > 1 else []
+                if not bids_raw or not asks_raw:
+                    if attempt < retries:
+                        await asyncio.sleep(0.25 * (attempt + 1))
+                        continue
+                    return OrderBook()
+                # HL returns bids descending (index 0 = best bid) and asks ascending
+                b0 = float(bids_raw[0]["px"])
+                a0 = float(asks_raw[0]["px"])
+                if b0 > a0:
+                    # levels[0] is actually asks (ascending), levels[1] is bids
+                    b0, a0 = a0, b0
+                    bids_raw, asks_raw = asks_raw, bids_raw
+                return OrderBook(
+                    bid=b0, ask=a0,
+                    bid_size=float(bids_raw[0]["sz"]),
+                    ask_size=float(asks_raw[0]["sz"]),
+                    bids=[(float(l["px"]), float(l["sz"])) for l in bids_raw],
+                    asks=[(float(l["px"]), float(l["sz"])) for l in asks_raw],
+                )
+            except Exception as e:
+                log.debug(f"HL book error {symbol} (attempt {attempt + 1}): {e}")
+                if attempt < retries:
+                    await asyncio.sleep(0.25 * (attempt + 1))
+                    continue
                 return OrderBook()
-            # HL returns bids descending (index 0 = best bid) and asks ascending
-            b0 = float(bids_raw[0]["px"])
-            a0 = float(asks_raw[0]["px"])
-            if b0 > a0:
-                # levels[0] is actually asks (ascending), levels[1] is bids
-                b0, a0 = a0, b0
-                bids_raw, asks_raw = asks_raw, bids_raw
-            return OrderBook(
-                bid=b0, ask=a0,
-                bid_size=float(bids_raw[0]["sz"]),
-                ask_size=float(asks_raw[0]["sz"]),
-                bids=[(float(l["px"]), float(l["sz"])) for l in bids_raw],
-                asks=[(float(l["px"]), float(l["sz"])) for l in asks_raw],
-            )
-        except Exception as e:
-            log.debug(f"HL book error {symbol}: {e}")
-            return OrderBook()
+        return OrderBook()
 
     # ── Quantity helpers ──
 
