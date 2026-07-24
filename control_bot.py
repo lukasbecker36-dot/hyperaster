@@ -24,7 +24,7 @@ Commands:
   /log [n]     last n journal lines (default 20)
   /start       start the trader service
   /stop        stop the trader  (requires: /stop YES)
-  /restart     git pull + restart the trader AND the control bot
+  /restart     git pull + restart the trader, capture daemon AND control bot
   /flatten     emergency close ALL positions (requires: /flatten YES)
   /help        command list
 """
@@ -67,6 +67,11 @@ SERVICE = os.getenv("CONTROL_SERVICE_NAME", "hyperaster")
 # control_bot.py changes). Defaults to "<trader>-control"; override via
 # CONTROL_BOT_SERVICE_NAME if yours differs.
 CONTROL_BOT_SERVICE = os.getenv("CONTROL_BOT_SERVICE_NAME", f"{SERVICE}-control")
+# The order-book capture daemon's systemd unit, so /restart also refreshes it
+# (it reads the gate-active backoff flag + runs the retention prune). Defaults to
+# "<trader>-capture"; override via CAPTURE_SERVICE_NAME. Restarted only if the
+# unit is actually loaded, so a wrong/absent name is a no-op, not an error.
+CAPTURE_SERVICE = os.getenv("CAPTURE_SERVICE_NAME", f"{SERVICE}-capture")
 BRANCH = os.getenv("CONTROL_BRANCH", "")
 
 def _allowed_chat_ids() -> set[str]:
@@ -664,6 +669,28 @@ def cmd_restart(chat_id: str, _arg: str):
     time.sleep(2)
     _, active = run(["systemctl", "is-active", SERVICE], timeout=10)
     send(chat_id, f"trader restart: {'ok' if rc == 0 else 'FAILED'} — now {active}\n{out}".strip())
+
+    # 1b. Restart the capture daemon too (separate unit) so it picks up the
+    #     gate-active backoff flag + retention prune. Only if it's loaded, and
+    #     not if it's the same unit as the trader (already restarted).
+    if CAPTURE_SERVICE and CAPTURE_SERVICE not in (SERVICE, CONTROL_BOT_SERVICE):
+        _, cap_load = run(
+            ["systemctl", "show", CAPTURE_SERVICE, "--property=LoadState", "--value"],
+            timeout=10,
+        )
+        if cap_load.strip() == "loaded":
+            rc_c, out_c = run(["systemctl", "restart", CAPTURE_SERVICE], timeout=30)
+            time.sleep(2)
+            _, cap_active = run(["systemctl", "is-active", CAPTURE_SERVICE], timeout=10)
+            send(chat_id, f"capture restart: {'ok' if rc_c == 0 else 'FAILED'} — "
+                          f"now {cap_active}\n{out_c}".strip())
+        else:
+            send(chat_id,
+                 f"ℹ️ capture service '{CAPTURE_SERVICE}' not found "
+                 f"(LoadState={cap_load.strip() or '?'}) — skipped. If your capture "
+                 f"daemon runs under a different unit or via nohup, restart it "
+                 f"manually to pick up the HL backoff + prune. Set "
+                 f"CAPTURE_SERVICE_NAME to silence this.")
 
     # 2. Restart the control bot itself LAST — this tears down THIS process, so it
     #    must be the final step and can't confirm afterwards. Skip if it's the same
@@ -1367,7 +1394,7 @@ def cmd_help(chat_id: str, _arg: str):
          "/live YES — switch to live mode (restarts)\n"
          "/start — start trader\n"
          "/stop YES — stop trader (positions left open!)\n"
-         "/restart — git pull + restart trader & control bot\n"
+         "/restart — git pull + restart trader, capture & control bot\n"
          "/flatten YES — emergency close ALL positions")
 
 
