@@ -1,0 +1,20 @@
+[Unit]
+Description=Hyperaster order-book + oracle capture daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hyperaster
+# --max-hours 0: run until stopped (no 24h auto-stop). Size is bounded instead
+# by the retention prune (--retention-hours, default 72h), so the DB plateaus.
+# Backs off its per-name HL l2Book fetches while the trader has a manual gate
+# armed (data/gate_active flag) so it can't rate-limit the gate's book read.
+ExecStart=/opt/hyperaster/.venv/bin/python scripts/capture_orderbooks.py --max-hours 0
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

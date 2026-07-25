@@ -1,10 +1,12 @@
 # Deployment — systemd + Telegram control
 
-Two services:
+Three services:
 - **`hyperaster`** — the arb monitor (`live_monitor.py`)
 - **`hyperaster-control`** — the Telegram control bot (`control_bot.py`)
+- **`hyperaster-capture`** — the order-book/oracle capture daemon
+  (`scripts/capture_orderbooks.py`), feeding `/opps` and `/basis`
 
-Both run from the venv at `/opt/hyperaster/.venv` and load secrets from
+All run from the venv at `/opt/hyperaster/.venv` and load secrets from
 `/opt/hyperaster/.env`.
 
 ## 1. Install the unit files
@@ -12,6 +14,7 @@ Both run from the venv at `/opt/hyperaster/.venv` and load secrets from
 ```bash
 sudo cp /opt/hyperaster/deploy/hyperaster.service /etc/systemd/system/
 sudo cp /opt/hyperaster/deploy/hyperaster-control.service /etc/systemd/system/
+sudo cp /opt/hyperaster/deploy/hyperaster-capture.service /etc/systemd/system/
 sudo systemctl daemon-reload
 ```
 
@@ -36,13 +39,15 @@ To find your chat id: message the bot once, then
 ```bash
 sudo systemctl enable --now hyperaster
 sudo systemctl enable --now hyperaster-control
+sudo systemctl enable --now hyperaster-capture
 ```
 
 ## 4. Verify
 
 ```bash
-systemctl status hyperaster hyperaster-control
+systemctl status hyperaster hyperaster-control hyperaster-capture
 journalctl -u hyperaster -f
+journalctl -u hyperaster-capture -f    # cycles=… rows=… every 60s
 ```
 
 Then from Telegram: `/status`, `/help`.
