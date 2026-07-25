@@ -166,6 +166,10 @@ class Capturer:
         self._gate_paused = False   # currently backing off HL for an armed gate
         self.hl_books_per_sec = DEFAULT_HL_BOOKS_PER_SEC
         self._paced_interval_logged = 0.0   # last effective interval we logged
+        # canonical base -> HL dex: "xyz" (HIP-3 equity perp) or "" (main-dex
+        # crypto perp). Determines the l2Book coin string ("xyz:AAPL" vs "BTC")
+        # and which metaAndAssetCtxs universe a name's oracle/funding comes from.
+        self.dex_of: dict[str, str] = {}
 
     def _effective_interval(self) -> float:
         """The configured interval, stretched up if the universe is too large to
@@ -174,10 +178,6 @@ class Capturer:
         to mostly-null books."""
         floor = len(self.symbols) / max(1.0, self.hl_books_per_sec)
         return max(self.interval, floor)
-        # canonical base -> HL dex: "xyz" (HIP-3 equity perp) or "" (main-dex
-        # crypto perp). Determines the l2Book coin string ("xyz:AAPL" vs "BTC")
-        # and which metaAndAssetCtxs universe a name's oracle/funding comes from.
-        self.dex_of: dict[str, str] = {}
 
     # ── Universe discovery ──
 
