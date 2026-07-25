@@ -38,10 +38,9 @@ HL_MAKER_FEE = 0.00015
 # cost more than equity ones. Per-symbol fees come from the *_fee(symbol) helpers.
 ASTER_MAKER_FEE = 0.0
 ASTER_TAKER_FEE = 0.00009
-# Aster standard (crypto) schedule. Verify the live numbers on the account's fee
-# tier before enabling crypto trading — these default to Aster's base tier.
-ASTER_CRYPTO_MAKER_FEE = 0.0001    # 1.0 bps
-ASTER_CRYPTO_TAKER_FEE = 0.00035   # 3.5 bps
+# Aster standard (crypto) schedule — confirmed on-account: 0bp maker, 4bp taker.
+ASTER_CRYPTO_MAKER_FEE = 0.0       # 0 bps
+ASTER_CRYPTO_TAKER_FEE = 0.0004    # 4.0 bps
 
 # Round-trip: convergence arb pays HL taker + Aster maker on both legs
 ROUND_TRIP_FEE = 2 * ASTER_MAKER_FEE + 2 * HL_TAKER_FEE  # ~0.09% = 9bps
@@ -52,9 +51,10 @@ CRYPTO_ROUND_TRIP_FEE = 2 * ASTER_CRYPTO_MAKER_FEE + 2 * HL_TAKER_FEE
 CRYPTO_CARRY_ROUND_TRIP_FEE = 2 * HL_MAKER_FEE + 2 * ASTER_CRYPTO_TAKER_FEE
 
 # Master switch for LIVE HL crypto (main-dex) order placement. Reads/analysis of
-# crypto are always on; this only gates actually PLACING crypto orders, until the
-# crypto margin + leg-risk safety nets are validated. Override via env.
-CRYPTO_TRADING_ENABLED = os.getenv("CRYPTO_TRADING_ENABLED", "").lower() in ("1", "true", "yes")
+# crypto are always on; this gates actually PLACING crypto orders. Enabled by
+# default now that the dex router + leg-risk safety nets route by dex; set
+# CRYPTO_TRADING_ENABLED=false in the env to disable without a code change.
+CRYPTO_TRADING_ENABLED = os.getenv("CRYPTO_TRADING_ENABLED", "true").lower() in ("1", "true", "yes")
 
 
 def _is_crypto_symbol(symbol: str) -> bool:
