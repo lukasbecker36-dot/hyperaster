@@ -45,9 +45,42 @@ CAPTURE_DB = os.path.join(DATA_DIR, "orderbook_capture.db")
 DAY_MS = 24 * 3_600_000
 
 
+# symbol -> HL dex ("xyz" equity / "" main-dex crypto), resolved once per run.
+_HL_DEX_CACHE: dict = {}
+
+
+async def _hl_dex(session, symbol):
+    """Which HL dex lists this symbol: 'xyz' (HIP-3 equity) or '' (main-dex
+    crypto). Checks the xyz universe first, then main; defaults to 'xyz'."""
+    if symbol in _HL_DEX_CACHE:
+        return _HL_DEX_CACHE[symbol]
+    for dex in ("xyz", None):
+        body = {"type": "metaAndAssetCtxs"}
+        if dex:
+            body["dex"] = dex
+        try:
+            async with session.post(HYPERLIQUID_API, json=body) as r:
+                data = await r.json(content_type=None)
+            names = {a.get("name", "").split(":")[-1]
+                     for a in data[0].get("universe", [])}
+            if symbol in names:
+                _HL_DEX_CACHE[symbol] = "xyz" if dex else ""
+                return _HL_DEX_CACHE[symbol]
+        except Exception:
+            pass
+    _HL_DEX_CACHE[symbol] = "xyz"
+    return "xyz"
+
+
+async def _hl_coin(session, symbol):
+    """HL l2Book/candle coin string for a symbol (dex-aware)."""
+    return f"xyz:{symbol}" if await _hl_dex(session, symbol) == "xyz" else symbol
+
+
 async def _hl_book(session, symbol):
     async with session.post(HYPERLIQUID_API,
-                            json={"type": "l2Book", "coin": f"xyz:{symbol}"}) as r:
+                            json={"type": "l2Book",
+                                  "coin": await _hl_coin(session, symbol)}) as r:
         data = await r.json(content_type=None)
     levels = (data or {}).get("levels", [[], []])
     bids, asks = levels[0] or [], levels[1] or []
@@ -91,7 +124,7 @@ async def _funding_avg_24h(session, symbol):
     try:
         async with session.post(HYPERLIQUID_API,
                                 json={"type": "fundingHistory",
-                                      "coin": f"xyz:{symbol}",
+                                      "coin": await _hl_coin(session, symbol),
                                       "startTime": start}) as r:
             rows = await r.json(content_type=None)
         rates = [float(x.get("fundingRate") or 0) for x in (rows or [])]
@@ -123,8 +156,10 @@ async def _funding(session, symbol):
     The Aster window varies by name; _funding_avg_24h detects it."""
     hl_r = ast_r = None
     try:
-        async with session.post(HYPERLIQUID_API,
-                                json={"type": "metaAndAssetCtxs", "dex": "xyz"}) as r:
+        body = {"type": "metaAndAssetCtxs"}
+        if await _hl_dex(session, symbol) == "xyz":
+            body["dex"] = "xyz"
+        async with session.post(HYPERLIQUID_API, json=body) as r:
             data = await r.json(content_type=None)
         meta, ctxs = data[0], data[1]
         for i, asset in enumerate(meta.get("universe", [])):
@@ -188,8 +223,9 @@ async def _avg_from_candles(session, symbol):
     (ignores each venue's own bid-ask width — marked approximate)."""
     end = int(time.time() * 1000)
     try:
+        hl_coin = await _hl_coin(session, symbol)
         hl_d, ast_d = await asyncio.gather(
-            history.hl_candles(session, f"xyz:{symbol}", end - DAY_MS, end, interval="1m"),
+            history.hl_candles(session, hl_coin, end - DAY_MS, end, interval="1m"),
             history.aster_candles(session, aster_symbol_for(symbol), end - DAY_MS, end,
                                   interval="1m"),
         )

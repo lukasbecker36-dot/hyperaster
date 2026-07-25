@@ -158,52 +158,78 @@ class Capturer:
         self.rows_written = 0
         self.cycles = 0
         self._gate_paused = False   # currently backing off HL for an armed gate
+        # canonical base -> HL dex: "xyz" (HIP-3 equity perp) or "" (main-dex
+        # crypto perp). Determines the l2Book coin string ("xyz:AAPL" vs "BTC")
+        # and which metaAndAssetCtxs universe a name's oracle/funding comes from.
+        self.dex_of: dict[str, str] = {}
 
     # ── Universe discovery ──
 
-    async def discover(self) -> list[str]:
-        """HL XYZ ∩ Aster, equity only (NON_EQUITY excluded). BLOCKED names are
-        intentionally KEPT — the point is to re-evaluate them from data.
+    def _hl_coin_for(self, base: str) -> str:
+        """HL l2Book coin string for a base: builder-dex equities are prefixed
+        'xyz:', main-dex crypto uses the bare ticker. Unknown → 'xyz:' (the
+        historical default, so the CSV-fallback equity universe still works)."""
+        return f"xyz:{base}" if self.dex_of.get(base, "xyz") == "xyz" else base
 
-        Live-queries both venues (retried — HL occasionally returns a null body
-        on a single request); if that yields nothing, falls back to the
-        overlap_symbols.csv the live bot maintains so a transient blip never
-        aborts a capture run."""
-        hl_bases = await self._hl_universe()
-        aster_bases = await self._aster_universe()
-        overlap = sorted((hl_bases & aster_bases) - set(NON_EQUITY_SYMBOLS))
-        if overlap:
-            return overlap
-        # Fallback: the persisted universe from the live bot.
-        csv_syms = _load_universe_csv()
-        if csv_syms:
-            log.warning(f"discover: live query empty (HL={len(hl_bases)} "
-                        f"Aster={len(aster_bases)}) — using overlap_symbols.csv "
-                        f"({len(csv_syms)} names)")
-            return csv_syms
-        return self.symbols
-
-    async def _hl_universe(self) -> set[str]:
+    async def _hl_meta(self, dex: str | None) -> tuple[list, list]:
+        """metaAndAssetCtxs for one HL dex (None = main perp dex). Returns
+        (universe, ctxs) or ([], []) after retries. HL occasionally returns a
+        null/dict body on a single request."""
+        body: dict = {"type": "metaAndAssetCtxs"}
+        if dex:
+            body["dex"] = dex
         for attempt in range(3):
             try:
                 async with self.session.post(
-                    HYPERLIQUID_API, json={"type": "metaAndAssetCtxs", "dex": "xyz"},
-                    timeout=self.timeout,
+                    HYPERLIQUID_API, json=body, timeout=self.timeout,
                 ) as r:
                     data = await r.json(content_type=None)
-                # HL returns [meta, ctxs]; a transient failure can be null/dict.
-                if isinstance(data, list) and data and isinstance(data[0], dict):
-                    out = {a.get("name", "").split(":")[-1]
-                           for a in data[0].get("universe", []) if a.get("name")}
-                    if out:
-                        return out
-                log.warning(f"discover: HL universe unexpected shape "
+                if (isinstance(data, list) and len(data) >= 2
+                        and isinstance(data[0], dict)):
+                    return data[0].get("universe", []), data[1]
+                log.warning(f"discover: HL meta dex={dex or 'main'} unexpected shape "
                             f"({type(data).__name__}) attempt {attempt+1}/3")
             except Exception as e:
-                log.warning(f"discover: HL universe fetch failed ({e}) "
+                log.warning(f"discover: HL meta dex={dex or 'main'} failed ({e}) "
                             f"attempt {attempt+1}/3")
             await asyncio.sleep(1.5)
-        return set()
+        return [], []
+
+    async def discover(self) -> list[str]:
+        """(HL XYZ ∪ HL main) ∩ Aster, commodities/indices/ETFs excluded. Covers
+        both equity (xyz) and crypto (main-dex) names common to both venues, and
+        records each name's HL dex. BLOCKED names are intentionally KEPT — the
+        point is to re-evaluate them from data.
+
+        Live-queries both venues; if that yields nothing, falls back to the
+        overlap_symbols.csv the live bot maintains so a transient blip never
+        aborts a capture run."""
+        xyz_univ, _ = await self._hl_meta("xyz")
+        main_univ, _ = await self._hl_meta(None)
+        xyz_bases = {a.get("name", "").split(":")[-1]
+                     for a in xyz_univ if a.get("name")}
+        main_bases = {a.get("name", "").split(":")[-1]
+                      for a in main_univ if a.get("name")}
+        aster_bases = await self._aster_universe()
+        overlap = sorted(((xyz_bases | main_bases) & aster_bases)
+                         - set(NON_EQUITY_SYMBOLS))
+        if overlap:
+            # Classify: an equity (xyz) listing takes precedence over a same-
+            # ticker main-dex name (real tickers rarely collide).
+            for b in overlap:
+                self.dex_of[b] = "xyz" if b in xyz_bases else ""
+            n_eq = sum(1 for b in overlap if self.dex_of[b] == "xyz")
+            log.info(f"discover: {len(overlap)} overlap names "
+                     f"({n_eq} equity + {len(overlap)-n_eq} crypto)")
+            return overlap
+        # Fallback: the persisted (equity) universe from the live bot.
+        csv_syms = _load_universe_csv()
+        if csv_syms:
+            log.warning(f"discover: live query empty (HL xyz={len(xyz_bases)} "
+                        f"main={len(main_bases)} Aster={len(aster_bases)}) — using "
+                        f"overlap_symbols.csv ({len(csv_syms)} names)")
+            return csv_syms
+        return self.symbols
 
     async def _aster_universe(self) -> set[str]:
         for attempt in range(3):
@@ -230,27 +256,24 @@ class Capturer:
     # ── Batch fetchers (one call each, all names) ──
 
     async def _hl_ctxs(self) -> dict:
-        """canonical base -> {mid, mark, oracle, funding}. One call."""
-        out = {}
-        try:
-            async with self.session.post(
-                HYPERLIQUID_API, json={"type": "metaAndAssetCtxs", "dex": "xyz"},
-                timeout=self.timeout,
-            ) as r:
-                data = await r.json(content_type=None)
-            meta, ctxs = data[0], data[1]
-            for i, asset in enumerate(meta.get("universe", [])):
+        """canonical base -> {mid, mark, oracle, funding} for the captured
+        universe, from BOTH HL dexes (xyz equities + main-dex crypto). Two batch
+        calls. xyz wins on a same-ticker collision (matches discover())."""
+        wanted = set(self.symbols)
+        out: dict = {}
+        for dex in ("xyz", None):
+            univ, ctxs = await self._hl_meta(dex)
+            for i, asset in enumerate(univ):
                 base = asset.get("name", "").split(":")[-1]
-                if i < len(ctxs) and base:
-                    c = ctxs[i]
-                    out[base] = {
-                        "mid": _f(c.get("midPx")),
-                        "mark": _f(c.get("markPx")),
-                        "oracle": _f(c.get("oraclePx")),
-                        "funding": _f(c.get("funding")),
-                    }
-        except Exception as e:
-            log.warning(f"HL ctxs fetch failed ({e})")
+                if not base or base not in wanted or base in out or i >= len(ctxs):
+                    continue
+                c = ctxs[i]
+                out[base] = {
+                    "mid": _f(c.get("midPx")),
+                    "mark": _f(c.get("markPx")),
+                    "oracle": _f(c.get("oraclePx")),
+                    "funding": _f(c.get("funding")),
+                }
         return out
 
     async def _aster_book_tickers(self) -> dict:
@@ -292,7 +315,7 @@ class Capturer:
     # ── Per-coin HL book (true top-of-book + optional depth) ──
 
     async def _hl_book(self, base: str) -> dict | None:
-        hl_coin = f"xyz:{base}"
+        hl_coin = self._hl_coin_for(base)
         async with self._sem:
             try:
                 async with self.session.post(
