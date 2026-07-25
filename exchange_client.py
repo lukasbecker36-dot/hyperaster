@@ -39,7 +39,7 @@ from config import (
     ASTER_LEVERAGE_URL, ASTER_MARGIN_TYPE_URL, LEVERAGE, ASTER_MARGIN_TYPE,
     ORACLE_CORRECTION_ENABLED, ORACLE_BASELINE_MIN_SAMPLES,
     ORACLE_STALENESS_GUARD_ENABLED, ORACLE_STALE_MINUTES,
-    EXECUTABLE_SIGNAL_ENABLED, ASTER_REDUCE_ONLY,
+    EXECUTABLE_SIGNAL_ENABLED, ASTER_REDUCE_ONLY, CRYPTO_TRADING_ENABLED,
 )
 from src import history
 
@@ -138,8 +138,17 @@ class ExchangeClient:
         self.aster_specs: dict[str, ContractSpec] = {}
         self.hl_specs: dict[str, ContractSpec] = {}
 
-        # xyz:COIN -> asset_index in XYZ universe
+        # xyz:COIN -> asset_index in XYZ universe (legacy key; equities only)
         self._hl_xyz_indices: dict[str, int] = {}
+        # Unified per-symbol routing for crypto (main-dex) + equity (xyz-dex):
+        #   _hl_dex[sym]          -> "xyz" (HIP-3 equity) or "" (main-dex crypto)
+        #   _hl_asset_index[sym]  -> the integer asset id used in order actions
+        #                            (xyz: 110000+pos; main: bare universe pos)
+        # HL crypto perps live in the MAIN perp account (cross-margined),
+        # SEPARATE from the isolated HIP-3 xyz margin — so position/balance/user
+        # queries route by dex, not one blanket dex="xyz".
+        self._hl_dex: dict[str, str] = {}
+        self._hl_asset_index: dict[str, int] = {}
 
         # Symbols whose leverage + margin type have been set this run (idempotent).
         self._margin_ready: set[str] = set()
@@ -202,22 +211,66 @@ class ExchangeClient:
     async def start(self, symbols: list[str]):
         """Load specs for all symbols."""
         self.session = aiohttp.ClientSession()
+        # Load xyz equity specs first so is_hl_crypto() is correct before the
+        # main-dex loader (which skips names already claimed as equities), then
+        # fill in any remaining names from the main (crypto) dex.
         await asyncio.gather(
             self._load_aster_specs(symbols),
             self._load_hl_xyz_specs(symbols),
-            self.refresh_hl_oracles(symbols),
         )
+        await self._load_hl_main_specs(symbols)
+        await self.refresh_hl_oracles(symbols)
 
     async def close(self):
         if self.session:
             await self.session.close()
 
+    # ── HL dex routing (equity xyz vs main-dex crypto) ──
+
+    def is_hl_crypto(self, symbol: str) -> bool:
+        """True if this name is an HL main-dex crypto perp (not a HIP-3 equity).
+        Unknown names default to equity (False), preserving legacy behaviour."""
+        return self._hl_dex.get(symbol, "xyz") == ""
+
+    def crypto_symbols(self) -> set:
+        """Loaded main-dex crypto names (for persisting the fee-classification set)."""
+        return {s for s, d in self._hl_dex.items() if d == ""}
+
+    def _hl_coin(self, symbol: str) -> str:
+        """HL coin string for info calls (l2Book/candles/fundingHistory):
+        'xyz:AAPL' for equities, bare 'BTC' for main-dex crypto."""
+        return symbol if self.is_hl_crypto(symbol) else f"xyz:{symbol}"
+
+    def _hl_trade_guard(self, symbol: str) -> str:
+        """Refuse to PLACE an HL order for a main-dex crypto name until crypto
+        execution is explicitly enabled. Crypto perps use the main perp margin
+        account (not the isolated xyz margin), and the naked-leg/margin
+        pre-flight safety nets are still xyz-scoped — placing a live crypto leg
+        before they're adapted risks a naked directional stock/crypto position.
+        Empty string = allowed. Reads/analysis are never gated, only placement."""
+        if self.is_hl_crypto(symbol) and not CRYPTO_TRADING_ENABLED:
+            return (f"{symbol}: HL crypto (main-dex) live trading is not enabled. "
+                    f"Set CRYPTO_TRADING_ENABLED=true only after the crypto "
+                    f"margin + leg-risk safety nets are validated. Order refused.")
+        return ""
+
+    def _hl_state_body(self, base_body: dict, symbol: str | None = None,
+                       dex: str | None = "__auto__") -> dict:
+        """Attach the dex param to a clearinghouse/user-history body. Equities
+        need dex='xyz'; main-dex crypto omits it. Pass an explicit dex to force
+        one universe (e.g. querying all xyz positions)."""
+        body = dict(base_body)
+        if dex == "__auto__":
+            dex = "" if (symbol is not None and self.is_hl_crypto(symbol)) else "xyz"
+        if dex:
+            body["dex"] = dex
+        return body
+
     async def ensure_symbol_loaded(self, symbol: str) -> bool:
         """Dynamically load specs for a symbol not in the startup universe.
 
         Returns True if the symbol is ready (specs + asset index populated)."""
-        hl_coin = f"xyz:{symbol}"
-        loaded = (hl_coin in self._hl_xyz_indices and symbol in self.hl_specs
+        loaded = (symbol in self._hl_asset_index and symbol in self.hl_specs
                   and symbol in self.aster_specs)
         if not loaded:
             log.info(f"Dynamically loading specs for {symbol}…")
@@ -225,8 +278,11 @@ class ExchangeClient:
                 self._load_aster_specs([symbol]),
                 self._load_hl_xyz_specs([symbol]),
             )
-            if hl_coin not in self._hl_xyz_indices:
-                log.error(f"{symbol}: not found in HL XYZ universe after dynamic load")
+            if symbol not in self._hl_asset_index:
+                # Not an xyz equity — try the main (crypto) dex.
+                await self._load_hl_main_specs([symbol])
+            if symbol not in self._hl_asset_index:
+                log.error(f"{symbol}: not found in HL XYZ or main universe after dynamic load")
                 return False
             if symbol not in self.aster_specs:
                 log.error(f"{symbol}: not found on Aster after dynamic load")
@@ -242,27 +298,32 @@ class ExchangeClient:
 
     async def discover_overlap_bases(self) -> set[str]:
         """Live-query both venues and return the set of canonical bases listed on
-        BOTH (HL XYZ ∩ Aster). Applies cross-venue aliases (SAMSUNG→SMSN etc.).
+        BOTH ((HL XYZ ∪ HL main-dex) ∩ Aster). Covers equity (xyz) AND crypto
+        (main-dex) names. Applies cross-venue aliases (SAMSUNG→SMSN etc.).
 
         No equity filtering here — the caller applies BLOCKED/NON_EQUITY excludes.
         Returns an empty set on any fetch failure so the caller can skip this round
         without mutating the universe."""
         hl_bases: set[str] = set()
         aster_bases: set[str] = set()
-        try:
-            async with self.session.post(
-                HYPERLIQUID_API,
-                json={"type": "metaAndAssetCtxs", "dex": "xyz"},
-                timeout=self.timeout,
-            ) as r:
-                data = await r.json()
-            for asset in data[0].get("universe", []):
-                name = asset.get("name", "")
-                if name:
-                    hl_bases.add(name.split(":")[-1])
-        except Exception as e:
-            log.warning(f"discover_overlap: HL universe fetch failed ({e})")
-            return set()
+        for dex in ("xyz", None):
+            body = {"type": "metaAndAssetCtxs"}
+            if dex:
+                body["dex"] = dex
+            try:
+                async with self.session.post(
+                    HYPERLIQUID_API, json=body, timeout=self.timeout,
+                ) as r:
+                    data = await r.json()
+                for asset in data[0].get("universe", []):
+                    name = asset.get("name", "")
+                    if name:
+                        hl_bases.add(name.split(":")[-1])
+            except Exception as e:
+                log.warning(f"discover_overlap: HL {dex or 'main'} universe fetch failed ({e})")
+                # The xyz leg is required; a main-dex blip just drops crypto this round.
+                if dex == "xyz":
+                    return set()
         try:
             async with self.session.get(ASTER_EXCHANGE_INFO_URL, timeout=self.timeout) as r:
                 info = await r.json()
@@ -389,6 +450,8 @@ class ExchangeClient:
                 step = round(10 ** -sz_dec, sz_dec)
                 asset_idx = xyz_offset + i  # correct index for order actions
                 self._hl_xyz_indices[coin_name] = asset_idx
+                self._hl_dex[base] = "xyz"
+                self._hl_asset_index[base] = asset_idx
 
                 # Price precision: HL allows at most (6 - szDecimals) significant
                 # figures, but never fewer than 1. The tick size may also come from
@@ -425,12 +488,58 @@ class ExchangeClient:
         # include tick size for builder dex perps, and the formula-derived default
         # (10^-pxDec) is often wrong. The minimum price increment between
         # orderbook levels IS the tick.
-        await self._infer_hl_tick_sizes(symbols)
+        await self._infer_hl_tick_sizes([s for s in symbols if not self.is_hl_crypto(s)])
+
+    async def _load_hl_main_specs(self, symbols: list[str]):
+        """Load main-dex (crypto) perp specs + asset indices from metaAndAssetCtxs
+        with NO dex param. Main perps index by bare universe position (no 110000
+        builder offset). Only names present in the main universe are populated,
+        so equity names in `symbols` are simply skipped here (they load via
+        _load_hl_xyz_specs). Tick/szDecimals come straight from metadata, which
+        IS reliable for main-dex perps (unlike builder dexes)."""
+        try:
+            async with self.session.post(
+                HYPERLIQUID_API,
+                json={"type": "metaAndAssetCtxs"},
+                timeout=self.timeout,
+            ) as r:
+                data = await r.json()
+            meta, ctxs = data[0], data[1]
+            sym_set = set(symbols)
+            now = now_ms()
+            for i, asset in enumerate(meta.get("universe", [])):
+                base = asset.get("name", "").split(":")[-1]
+                if base not in sym_set or base in self._hl_dex:
+                    continue  # unknown, or already claimed as an xyz equity
+                sz_dec = int(asset.get("szDecimals", 3))
+                step = round(10 ** -sz_dec, sz_dec)
+                px_dec = max(6 - sz_dec, 1)
+                tick = float(asset.get("tickSize", 0) or 0)
+                if tick <= 0:
+                    tick = round(10 ** -px_dec, px_dec)
+                self._hl_dex[base] = ""            # main-dex crypto
+                self._hl_asset_index[base] = i     # bare universe position
+                self.hl_specs[base] = ContractSpec(
+                    tick_size=tick, step_size=step, min_qty=step,
+                    min_notional=10.0, price_precision=px_dec, qty_precision=sz_dec,
+                )
+                if i < len(ctxs):
+                    oracle_px = float(ctxs[i].get("oraclePx") or 0)
+                    if oracle_px > 0:
+                        self._hl_oracle_cache[base] = (oracle_px, now)
+            loaded = [s for s in symbols if self.is_hl_crypto(s)]
+            if loaded:
+                log.info(f"HL main-dex (crypto) specs loaded for: {loaded}")
+        except Exception as e:
+            log.error(f"Failed to load HL main-dex specs: {e}")
+        # Crypto ticks come from metadata reliably, but infer from the book too
+        # in case a name has a coarser real tick than the sig-fig default.
+        await self._infer_hl_tick_sizes([s for s in symbols if self.is_hl_crypto(s)])
 
     async def _infer_hl_tick_sizes(self, symbols: list[str]):
         """Probe each symbol's HL orderbook to discover the real tick size."""
         for symbol in symbols:
-            hl_coin = f"xyz:{symbol}"
+            hl_coin = self._hl_coin(symbol)
             try:
                 async with self.session.post(
                     HYPERLIQUID_API,
@@ -536,31 +645,38 @@ class ExchangeClient:
         return cached[1] if cached else 0.0
 
     async def refresh_hl_oracles(self, symbols: list[str]):
-        """Fetch HL XYZ oracle prices via metaAndAssetCtxs and cache them."""
-        try:
-            async with self.session.post(
-                HYPERLIQUID_API,
-                json={"type": "metaAndAssetCtxs", "dex": "xyz"},
-                timeout=self.timeout,
-            ) as r:
-                data = await r.json()
-            meta, ctxs = data[0], data[1]
-            now = now_ms()
-            sym_set = set(symbols)
-            for i, asset in enumerate(meta.get("universe", [])):
-                base = asset.get("name", "").split(":")[-1]
-                if base in sym_set and i < len(ctxs):
-                    oracle_px = float(ctxs[i].get("oraclePx") or 0)
-                    if oracle_px > 0:
-                        self._hl_oracle_cache[base] = (oracle_px, now)
-                    # HL funding is published as an hourly rate.
-                    try:
-                        self._hl_funding_cache[base] = (float(ctxs[i].get("funding") or 0), now)
-                    except (TypeError, ValueError):
-                        pass
-            log.debug(f"HL oracle prices refreshed for {len(self._hl_oracle_cache)} symbols")
-        except Exception as e:
-            log.warning(f"Failed to refresh HL oracle prices: {e}")
+        """Fetch HL oracle prices + hourly funding via metaAndAssetCtxs and cache
+        them, from BOTH dexes (xyz equities + main-dex crypto). Only queries the
+        main dex if the universe actually contains a crypto name, so equity-only
+        deployments keep a single call."""
+        sym_set = set(symbols)
+        want_main = any(self.is_hl_crypto(s) for s in sym_set)
+        dexes = ["xyz"] + ([None] if want_main else [])
+        for dex in dexes:
+            body = {"type": "metaAndAssetCtxs"}
+            if dex:
+                body["dex"] = dex
+            try:
+                async with self.session.post(
+                    HYPERLIQUID_API, json=body, timeout=self.timeout,
+                ) as r:
+                    data = await r.json()
+                meta, ctxs = data[0], data[1]
+                now = now_ms()
+                for i, asset in enumerate(meta.get("universe", [])):
+                    base = asset.get("name", "").split(":")[-1]
+                    if base in sym_set and i < len(ctxs):
+                        oracle_px = float(ctxs[i].get("oraclePx") or 0)
+                        if oracle_px > 0:
+                            self._hl_oracle_cache[base] = (oracle_px, now)
+                        # HL funding is published as an hourly rate.
+                        try:
+                            self._hl_funding_cache[base] = (float(ctxs[i].get("funding") or 0), now)
+                        except (TypeError, ValueError):
+                            pass
+            except Exception as e:
+                log.warning(f"Failed to refresh HL {dex or 'main'} oracle prices: {e}")
+        log.debug(f"HL oracle prices refreshed for {len(self._hl_oracle_cache)} symbols")
 
     def get_hl_oracle(self, symbol: str) -> float:
         """Return cached HL XYZ oracle price."""
@@ -869,7 +985,7 @@ class ExchangeClient:
         empty OrderBook, which blinds the basis gate for that whole tick (the
         "gate can't read the book" alert). A short in-tick retry clears most
         transient rate-limit blips so the gate can still fire."""
-        hl_coin = f"xyz:{symbol}"
+        hl_coin = self._hl_coin(symbol)
         for attempt in range(retries + 1):
             try:
                 async with self.session.post(
@@ -1360,8 +1476,11 @@ class ExchangeClient:
         fill, it just makes the order marketable if the book moved. Exits pass a
         wider buffer (HL_EXIT_IOC_BUFFER_BPS) so a jumpy book can't dodge the cross.
         """
-        hl_coin = f"xyz:{symbol}"
-        asset_idx = self._hl_xyz_indices.get(hl_coin)
+        guard = self._hl_trade_guard(symbol)
+        if guard:
+            return OrderResult(success=False, error=guard)
+        hl_coin = self._hl_coin(symbol)
+        asset_idx = self._hl_asset_index.get(symbol)
         if asset_idx is None:
             return OrderResult(success=False, error=f"HL asset index not found for {hl_coin}")
 
@@ -1440,8 +1559,11 @@ class ExchangeClient:
         On success returns the resting order id (filled_qty=0); if it somehow
         fills immediately, returns the fill. Used for maker-leg-first entries.
         """
-        hl_coin = f"xyz:{symbol}"
-        asset_idx = self._hl_xyz_indices.get(hl_coin)
+        guard = self._hl_trade_guard(symbol)
+        if guard:
+            return OrderResult(success=False, error=guard)
+        hl_coin = self._hl_coin(symbol)
+        asset_idx = self._hl_asset_index.get(symbol)
         if asset_idx is None:
             return OrderResult(success=False, error=f"HL asset index not found for {hl_coin}")
 
@@ -1522,9 +1644,8 @@ class ExchangeClient:
             return {}
 
     async def cancel_hl_order(self, symbol: str, order_id: str) -> bool:
-        """Cancel a resting HL XYZ order by oid."""
-        hl_coin = f"xyz:{symbol}"
-        asset_idx = self._hl_xyz_indices.get(hl_coin)
+        """Cancel a resting HL order by oid (xyz or main dex)."""
+        asset_idx = self._hl_asset_index.get(symbol)
         if asset_idx is None:
             return False
         action = {"type": "cancel", "cancels": [{"a": asset_idx, "o": int(order_id)}]}
@@ -1571,21 +1692,21 @@ class ExchangeClient:
         return False, current - baseline_szi, current
 
     async def get_hl_position(self, symbol: str) -> dict:
-        hl_coin = f"xyz:{symbol}"
+        # Route to the dex that holds this symbol's margin: equities on xyz,
+        # crypto on the main perp account. The reported coin is bare on main,
+        # 'xyz:SYM' on the builder dex — match on the last segment.
+        hl_coin = self._hl_coin(symbol)
+        body = self._hl_state_body(
+            {"type": "clearinghouseState",
+             "user": self.api_keys["hl_account_address"]}, symbol)
         try:
             async with self.session.post(
-                HYPERLIQUID_API,
-                json={
-                    "type": "clearinghouseState",
-                    "user": self.api_keys["hl_account_address"],
-                    "dex": "xyz",
-                },
-                timeout=self.timeout,
+                HYPERLIQUID_API, json=body, timeout=self.timeout,
             ) as r:
                 data = await r.json()
             for pos in data.get("assetPositions", []):
                 p = pos.get("position", {})
-                if p.get("coin") == hl_coin:
+                if self._hl_coin_matches(p.get("coin", ""), symbol):
                     return p
             return {}
         except Exception as e:
@@ -1593,28 +1714,26 @@ class ExchangeClient:
             return {}
 
     async def get_all_hl_positions(self) -> list[dict]:
-        """Return all open HL XYZ positions (non-zero szi)."""
-        try:
-            async with self.session.post(
-                HYPERLIQUID_API,
-                json={
-                    "type": "clearinghouseState",
-                    "user": self.api_keys["hl_account_address"],
-                    "dex": "xyz",
-                },
-                timeout=self.timeout,
-            ) as r:
-                data = await r.json()
-            results = []
-            for pos in data.get("assetPositions", []):
-                p = pos.get("position", {})
-                szi = float(p.get("szi", 0) or 0)
-                if abs(szi) > 1e-12:
-                    results.append(p)
-            return results
-        except Exception as e:
-            log.error(f"HL all positions query error: {e}")
-            return []
+        """Return all open HL positions (non-zero szi) across BOTH the xyz equity
+        dex and the main crypto dex."""
+        results = []
+        for dex in ("xyz", ""):
+            body = self._hl_state_body(
+                {"type": "clearinghouseState",
+                 "user": self.api_keys["hl_account_address"]}, dex=dex)
+            try:
+                async with self.session.post(
+                    HYPERLIQUID_API, json=body, timeout=self.timeout,
+                ) as r:
+                    data = await r.json()
+                for pos in data.get("assetPositions", []):
+                    p = pos.get("position", {})
+                    szi = float(p.get("szi", 0) or 0)
+                    if abs(szi) > 1e-12:
+                        results.append(p)
+            except Exception as e:
+                log.error(f"HL all positions query error (dex={dex or 'main'}): {e}")
+        return results
 
     async def get_all_aster_positions(self) -> list[dict]:
         """Return all open Aster positions (non-zero positionAmt)."""
@@ -1632,18 +1751,17 @@ class ExchangeClient:
             log.error(f"Aster all positions query error: {e}")
             return []
 
-    async def get_hl_balance(self) -> dict:
-        """HL XYZ-dex account balance (USDC). HIP-3 margin is isolated to the
-        builder dex, so this queries the xyz-dex clearinghouse state — the funds
-        the bot actually trades these perps against. Returns {} on failure."""
+    async def get_hl_balance(self, dex: str = "xyz") -> dict:
+        """HL account balance (USDC) for a dex. HIP-3 equity margin is isolated
+        to the xyz builder dex; crypto margin lives in the main perp account
+        (dex=""). Pass the dex whose funds back the leg you're sizing. Returns {}
+        on failure."""
         try:
             async with self.session.post(
                 HYPERLIQUID_API,
-                json={
-                    "type": "clearinghouseState",
-                    "user": self.api_keys["hl_account_address"],
-                    "dex": "xyz",
-                },
+                json=self._hl_state_body(
+                    {"type": "clearinghouseState",
+                     "user": self.api_keys["hl_account_address"]}, dex=dex),
                 timeout=self.timeout,
             ) as r:
                 data = await r.json()
@@ -1684,12 +1802,11 @@ class ExchangeClient:
             return {}
 
     async def set_hl_leverage(self, symbol: str, leverage: int, cross: bool = True) -> bool:
-        """Set leverage for a symbol on HL XYZ. updateLeverage wants the integer
-        asset index (same id used for order placement), not the coin name."""
-        hl_coin = f"xyz:{symbol}"
-        asset_idx = self._hl_xyz_indices.get(hl_coin)
+        """Set leverage for a symbol on HL (xyz or main dex). updateLeverage wants
+        the integer asset index (same id used for order placement), not the coin."""
+        asset_idx = self._hl_asset_index.get(symbol)
         if asset_idx is None:
-            log.error(f"HL set leverage: asset index not found for {hl_coin}")
+            log.error(f"HL set leverage: asset index not found for {symbol}")
             return False
         action = {
             "type": "updateLeverage",

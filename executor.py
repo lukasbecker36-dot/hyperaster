@@ -30,6 +30,7 @@ from config import (
     NOTIONAL_PER_LEG, ENTRY_TIMEOUT_MINUTES, EXIT_TIMEOUT_MINUTES,
     MAX_PRICE_RATIO_DIVERGENCE, BLOCKED_SYMBOLS, MIN_EXECUTABLE_PREMIUM_BPS,
     ENTRY_CONFIRM_TICKS, ENTRY_COST_MARGIN_BPS, ROUND_TRIP_FEE, CARRY_ROUND_TRIP_FEE,
+    carry_round_trip_fee, round_trip_fee,
     EXIT_TARGET_NET_USD, EXIT_TARGET_NET_USD_BY_SYMBOL,
     MAKER_ENTRY_TIMEOUT_SEC, MAKER_REPRICE_TICK_FRAC,
     LIQUIDITY_GUARD_ENABLED, MIN_TOB_NOTIONAL_USD, MAX_VENUE_SPREAD_BPS,
@@ -204,7 +205,7 @@ class Executor:
         # only cross the Aster leg as a taker. So the floor is the carry round-trip
         # (HL-maker + Aster-taker ≈ 4.8bps) plus the Aster spread once. (The taker
         # spread floor is reconstructed in the poll for the taker-taker escalation.)
-        maker_floor, _ = self._entry_cost_floors(mid, aster_book, hl_book)
+        maker_floor, _ = self._entry_cost_floors(mid, aster_book, hl_book, symbol)
         threshold = max(base_threshold, maker_floor)
         if maker_floor > base_threshold:
             log.debug(f"{symbol}: maker cost floor {maker_floor:.0f}bps > base {base_threshold:.0f}bps")
@@ -264,7 +265,7 @@ class Executor:
         # test notional would fail this gate on every name.
         base_target = EXIT_TARGET_NET_USD_BY_SYMBOL.get(symbol, EXIT_TARGET_NET_USD)
         sym_target = base_target * (actual_notional / NOTIONAL_PER_LEG)
-        est_fees = actual_notional * CARRY_ROUND_TRIP_FEE
+        est_fees = actual_notional * carry_round_trip_fee(symbol)
         max_gross = actual_notional * excess_bps / 10000
         if max_gross < sym_target * 1.5 + est_fees:
             log.debug(
@@ -371,21 +372,24 @@ class Executor:
                 return False
         return True
 
-    def _entry_cost_floors(self, mid, aster_book, hl_book) -> tuple[float, float]:
+    def _entry_cost_floors(self, mid, aster_book, hl_book,
+                           symbol: str | None = None) -> tuple[float, float]:
         """Return (maker_floor_bps, taker_floor_bps) the entry edge must clear.
 
         maker: HL rests (no HL crossing), only the Aster spread is crossed +
-               carry round-trip fees (HL-maker/Aster-taker ≈4.8bps).
-        taker: both books crossed + taker round-trip fees (9bps) — used by the
-               poll's taker-taker escalation.
+               carry round-trip fees (HL-maker/Aster-taker ≈4.8bps equity, more
+               for crypto since Aster charges taker fees on crypto perps).
+        taker: both books crossed + taker round-trip fees — used by the poll's
+               taker-taker escalation.
         """
         if mid <= 0:
             return 0.0, 0.0
         aster_spread_bps = (aster_book.ask - aster_book.bid) / mid * 10000
         hl_spread_bps = (hl_book.ask - hl_book.bid) / mid * 10000
-        maker_floor = CARRY_ROUND_TRIP_FEE * 10000 + aster_spread_bps + ENTRY_COST_MARGIN_BPS
-        taker_floor = (ROUND_TRIP_FEE * 10000 + aster_spread_bps + hl_spread_bps
-                       + ENTRY_COST_MARGIN_BPS)
+        carry_fee = (carry_round_trip_fee(symbol) if symbol else CARRY_ROUND_TRIP_FEE) * 10000
+        taker_fee = (round_trip_fee(symbol) if symbol else ROUND_TRIP_FEE) * 10000
+        maker_floor = carry_fee + aster_spread_bps + ENTRY_COST_MARGIN_BPS
+        taker_floor = taker_fee + aster_spread_bps + hl_spread_bps + ENTRY_COST_MARGIN_BPS
         return maker_floor, taker_floor
 
     # ── Manual forced entry (funding-carry holds) ──
@@ -1780,7 +1784,7 @@ class Executor:
         excess = min(raw_excess, corr_excess)
 
         base_threshold = ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(symbol, ENTRY_THRESHOLD_BPS)
-        maker_floor, taker_floor = self._entry_cost_floors(mid, aster_book, hl_book)
+        maker_floor, taker_floor = self._entry_cost_floors(mid, aster_book, hl_book, symbol)
         threshold_maker = max(base_threshold, maker_floor)
         threshold_taker = max(base_threshold, taker_floor)
 
@@ -2497,8 +2501,7 @@ class Executor:
         # Use the convergence (taker) fee model (9bps) — more conservative than the
         # actual mixed trip (entry-maker + exit-taker ≈ 7.8bps). This ensures we
         # only escalate when it's clearly worth it.
-        from config import ROUND_TRIP_FEE
-        taker_fees = (pos.notional_usd or pos.qty * mid) * ROUND_TRIP_FEE
+        taker_fees = (pos.notional_usd or pos.qty * mid) * round_trip_fee(pos.symbol)
         elapsed_hours = max(0.0, (now_ms() - pos.entry_time) / 3_600_000)
         from position_manager import estimate_funding_pnl
         taker_funding = estimate_funding_pnl(

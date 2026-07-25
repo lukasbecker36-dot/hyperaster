@@ -32,14 +32,85 @@ ASTER_MARGIN_TYPE = "ISOLATED"        # ISOLATED | CROSSED
 HL_TAKER_FEE = 0.00045
 HL_MAKER_FEE = 0.00015
 
-# Aster: RWA Sprint Season 1 (May-Jun 2026) - 0bps maker, 0.9bps taker
+# Aster: RWA Sprint Season 1 (May-Jun 2026) - 0bps maker, 0.9bps taker.
+# NOTE: the 0/0.9bp schedule is the STOCK-perp promo. Aster CRYPTO perps charge
+# the standard schedule — set ASTER_CRYPTO_*_FEE below — so crypto round trips
+# cost more than equity ones. Per-symbol fees come from the *_fee(symbol) helpers.
 ASTER_MAKER_FEE = 0.0
 ASTER_TAKER_FEE = 0.00009
+# Aster standard (crypto) schedule. Verify the live numbers on the account's fee
+# tier before enabling crypto trading — these default to Aster's base tier.
+ASTER_CRYPTO_MAKER_FEE = 0.0001    # 1.0 bps
+ASTER_CRYPTO_TAKER_FEE = 0.00035   # 3.5 bps
 
 # Round-trip: convergence arb pays HL taker + Aster maker on both legs
 ROUND_TRIP_FEE = 2 * ASTER_MAKER_FEE + 2 * HL_TAKER_FEE  # ~0.09% = 9bps
 # Carry trades execute HL maker + Aster taker on both legs
 CARRY_ROUND_TRIP_FEE = 2 * HL_MAKER_FEE + 2 * ASTER_TAKER_FEE  # ~0.048% ≈ 4.8bps
+# Crypto variants (HL main-dex + Aster standard schedule)
+CRYPTO_ROUND_TRIP_FEE = 2 * ASTER_CRYPTO_MAKER_FEE + 2 * HL_TAKER_FEE
+CRYPTO_CARRY_ROUND_TRIP_FEE = 2 * HL_MAKER_FEE + 2 * ASTER_CRYPTO_TAKER_FEE
+
+# Master switch for LIVE HL crypto (main-dex) order placement. Reads/analysis of
+# crypto are always on; this only gates actually PLACING crypto orders, until the
+# crypto margin + leg-risk safety nets are validated. Override via env.
+CRYPTO_TRADING_ENABLED = os.getenv("CRYPTO_TRADING_ENABLED", "").lower() in ("1", "true", "yes")
+
+
+def _is_crypto_symbol(symbol: str) -> bool:
+    """Best-effort crypto classification for fee selection in contexts without a
+    live client (scripts, P&L). Sources, in order: the crypto set the live bot
+    persists on discovery (data/crypto_symbols.json), else False (equity).
+    The live trader passes authoritative per-symbol info where it can."""
+    return symbol in _load_crypto_symbols()
+
+
+_CRYPTO_SET_CACHE: dict = {"ts": 0.0, "set": set()}
+
+
+def _load_crypto_symbols() -> set:
+    """Cached read of data/crypto_symbols.json (written by the trader/capture on
+    discovery). Refreshed every 60s. Empty set if the file is absent."""
+    import json
+    import time as _t
+    now = _t.time()
+    if now - _CRYPTO_SET_CACHE["ts"] < 60 and _CRYPTO_SET_CACHE["set"]:
+        return _CRYPTO_SET_CACHE["set"]
+    path = os.path.join(DATA_DIR, "crypto_symbols.json")
+    try:
+        with open(path) as fh:
+            syms = set(json.load(fh))
+    except Exception:
+        syms = set()
+    _CRYPTO_SET_CACHE.update(ts=now, set=syms)
+    return syms
+
+
+def save_crypto_symbols(syms) -> None:
+    """Persist the discovered main-dex crypto set so fee helpers in client-less
+    contexts (scripts, P&L) classify correctly. Atomic write; best-effort."""
+    import json
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        path = os.path.join(DATA_DIR, "crypto_symbols.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(sorted(syms), fh)
+        os.replace(tmp, path)
+        _CRYPTO_SET_CACHE.update(ts=0.0, set=set(syms))  # invalidate cache
+    except Exception:
+        pass
+
+
+def carry_round_trip_fee(symbol: str) -> float:
+    """Per-symbol maker-HL/taker-Aster round-trip fee (fraction). Crypto pays the
+    Aster standard taker; equities pay the stock-perp promo."""
+    return CRYPTO_CARRY_ROUND_TRIP_FEE if _is_crypto_symbol(symbol) else CARRY_ROUND_TRIP_FEE
+
+
+def round_trip_fee(symbol: str) -> float:
+    """Per-symbol taker-taker round-trip fee (fraction), crypto-aware."""
+    return CRYPTO_ROUND_TRIP_FEE if _is_crypto_symbol(symbol) else ROUND_TRIP_FEE
 
 # Minimum net executable premium (bps) after subtracting smoothed oracle delta.
 # Belt-and-suspenders floor: prevents entries where oracle delta noise inflates the

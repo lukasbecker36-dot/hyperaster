@@ -37,7 +37,8 @@ from config import (
     EXIT_THRESHOLD_BPS, MAX_HOLD_HOURS, MAX_CONCURRENT_POSITIONS,
     HEARTBEAT_INTERVAL_MINUTES, PAPER_MODE, DATA_DIR, OUTPUT_DIR,
     BLOCKED_SYMBOLS, NON_EQUITY_SYMBOLS, ENTRY_CONFIRM_TICKS, ADVERSE_STOP_BPS,
-    ROUND_TRIP_FEE, CARRY_ROUND_TRIP_FEE, NOTIONAL_PER_LEG, EXIT_TARGET_NET_USD,
+    ROUND_TRIP_FEE, CARRY_ROUND_TRIP_FEE, carry_round_trip_fee, round_trip_fee,
+    NOTIONAL_PER_LEG, EXIT_TARGET_NET_USD,
     EXIT_TARGET_NET_USD_BY_SYMBOL, MAX_FUNDING_DRAG_USD,
     BASIS_ADVERSE_STOP_USD,
     MANUAL_ENTRY_GATE_TIMEOUT_MIN, aster_symbol_for, ASTER_BASE_TO_CANON,
@@ -394,6 +395,14 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     client = ExchangeClient(api_keys)
     await client.start(all_load_syms)
 
+    # Persist the discovered crypto set so fee helpers (and client-less scripts)
+    # classify main-dex crypto names correctly.
+    try:
+        from config import save_crypto_symbols
+        save_crypto_symbols(client.crypto_symbols())
+    except Exception:
+        pass
+
     # Verify all specs loaded
     missing = [s for s in symbols if s not in client.aster_specs or s not in client.hl_specs]
     if missing:
@@ -586,7 +595,8 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                                  + (aster_book.bid - pos.aster_entry_price)) * pos.qty
                 else:
                     est_gross = 0.0
-                rt_fee = CARRY_ROUND_TRIP_FEE if maker_first else ROUND_TRIP_FEE
+                rt_fee = (carry_round_trip_fee(pos.symbol) if maker_first
+                          else round_trip_fee(pos.symbol))
                 est_fees = (pos.notional_usd or NOTIONAL_PER_LEG) * rt_fee
                 # Prefer the ACTUAL settled funding reconciled from the venues
                 # (refreshed ~5min); the entry-rate estimate extrapolates one

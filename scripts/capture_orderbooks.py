@@ -221,6 +221,12 @@ class Capturer:
             n_eq = sum(1 for b in overlap if self.dex_of[b] == "xyz")
             log.info(f"discover: {len(overlap)} overlap names "
                      f"({n_eq} equity + {len(overlap)-n_eq} crypto)")
+            # Persist the crypto set so the fee helpers classify correctly.
+            try:
+                from config import save_crypto_symbols
+                save_crypto_symbols({b for b, d in self.dex_of.items() if d == ""})
+            except Exception:
+                pass
             return overlap
         # Fallback: the persisted (equity) universe from the live bot.
         csv_syms = _load_universe_csv()

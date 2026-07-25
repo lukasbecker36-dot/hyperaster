@@ -34,7 +34,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from config import DATA_DIR, NON_EQUITY_SYMBOLS, CARRY_ROUND_TRIP_FEE
+from config import (DATA_DIR, NON_EQUITY_SYMBOLS, CARRY_ROUND_TRIP_FEE,
+                    carry_round_trip_fee)
 
 CAPTURE_DB = os.path.join(DATA_DIR, "orderbook_capture.db")
 DAY_MS = 24 * 3_600_000
@@ -185,8 +186,9 @@ def run(top: int):
         # ★ = spread clears fees AND positive carry AND a sound floor (tight
         # symmetric book). ⚠ = deep-negative floor → wide-book trap, no ★.
         bad_floor = floor < FLOOR_MIN_BPS
+        fee_bps = carry_round_trip_fee(sym) * 10000  # crypto pays more than equity
         star = ""
-        if not bad_floor and carry is not None and carry > 0 and s > FEE_BPS:
+        if not bad_floor and carry is not None and carry > 0 and s > fee_bps:
             star = " ★"
         elif bad_floor:
             star = " ⚠"
@@ -200,7 +202,8 @@ def run(top: int):
                  f"wide/one-sided")
     lines.append("book, missed exit is a LOSS (no ★). c/d = ~net carry/day of the")
     lines.append("BETTER hold (8h Aster window assumed). Rank = sum + carry + floor.")
-    lines.append(f"★ = sum > fees ({FEE_BPS:.0f}bp) + positive carry + sound floor —")
+    lines.append(f"★ = sum > fees (equity {FEE_BPS:.0f}bp / crypto higher) + "
+                 f"positive carry + sound floor —")
     lines.append("spread to earn, paid to wait, breakeven if the exit's slow.")
     lines.append("/basis SYM for exact carry + window before trading.")
     print("\n".join(lines))

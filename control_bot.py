@@ -358,7 +358,7 @@ def _pending_gate_lines() -> list[str]:
 def cmd_positions(chat_id: str, _arg: str):
     try:
         from config import (
-            ROUND_TRIP_FEE, CARRY_ROUND_TRIP_FEE,
+            ROUND_TRIP_FEE, CARRY_ROUND_TRIP_FEE, carry_round_trip_fee, round_trip_fee,
             EXIT_TARGET_NET_USD, EXIT_TARGET_NET_USD_BY_SYMBOL, NOTIONAL_PER_LEG,
         )
         from position_manager import estimate_funding_pnl
@@ -427,7 +427,8 @@ def cmd_positions(chat_id: str, _arg: str):
             continue
         # Maker-first (carry + convergence) pay HL-maker/Aster-taker; legacy
         # taker convergence pays HL-taker/Aster-maker.
-        fees = notional * (CARRY_ROUND_TRIP_FEE if entry_maker_venue == "hl" else ROUND_TRIP_FEE)
+        fees = notional * (carry_round_trip_fee(sym) if entry_maker_venue == "hl"
+                           else round_trip_fee(sym))
         # Funding: prefer the ACTUAL settled figure the trader reconciled from the
         # venues (position_costs.json, refreshed ~5min). The estimate extrapolates
         # a single entry-snapshot rate linearly and drifts badly on names whose
