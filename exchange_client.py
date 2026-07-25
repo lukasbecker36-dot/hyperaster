@@ -907,7 +907,7 @@ class ExchangeClient:
         start_ms = end_ms - self._book_spread_window_ms
 
         async def warm_one(canon: str):
-            hl_coin = f"xyz:{canon}"
+            hl_coin = self._hl_coin(canon)
             ast_sym = aster_symbol_for(canon)
             try:
                 hl_data, ast_data = await asyncio.gather(
@@ -1321,14 +1321,17 @@ class ExchangeClient:
     async def _hl_info_list(self, req_type: str, base: str, start_ms: int,
                             end_ms: int) -> list:
         """POST /info for a user history query. XYZ perps live on the builder
-        dex, and user queries there need dex='xyz' (same as clearinghouseState).
-        Try WITH the dex first; if HL errors (non-list), retry WITHOUT so a
-        main-dex-only account still works. Raises if both shapes fail."""
+        dex (user queries need dex='xyz'); main-dex crypto omits it. Lead with
+        the dex that actually holds this coin, then fall back to the other shape.
+        A crypto coin's funding lives ONLY on the main dex, so querying xyz first
+        would return an empty-but-valid list and miss it — hence the ordering.
+        Raises if both shapes fail."""
         body = {"type": req_type,
                 "user": self.api_keys["hl_account_address"],
                 "startTime": int(start_ms), "endTime": int(end_ms)}
         last = None
-        for extra in ({"dex": "xyz"}, {}):
+        attempts = ({}, {"dex": "xyz"}) if self.is_hl_crypto(base) else ({"dex": "xyz"}, {})
+        for extra in attempts:
             try:
                 async with self.session.post(
                     HYPERLIQUID_API, json={**body, **extra}, timeout=self.timeout,
