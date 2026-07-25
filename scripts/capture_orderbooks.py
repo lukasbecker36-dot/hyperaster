@@ -70,6 +70,12 @@ ASTER_DEPTH_URL = f"{ASTER_BASE}/fapi/v1/depth"
 # keep capturing oracle/funding/Aster book through the pause.
 GATE_ACTIVE_FILE = os.path.join(DATA_DIR, "gate_active")
 GATE_ACTIVE_FRESH_S = 90   # ignore a stale flag (crashed trader) after this
+# HL l2Book budget for capture (calls/sec). HL's info limit is ~1200 weight/min
+# and l2Book is weight 2 → ~10 books/s total; we leave headroom for the trader,
+# so the per-cycle interval auto-stretches to keep the whole universe under this
+# (a 200-name universe can't be swept every 3s without being rate-limited to
+# nulls). Override via --hl-books-per-sec.
+DEFAULT_HL_BOOKS_PER_SEC = 7.0
 
 log = logging.getLogger("capture")
 
@@ -158,6 +164,16 @@ class Capturer:
         self.rows_written = 0
         self.cycles = 0
         self._gate_paused = False   # currently backing off HL for an armed gate
+        self.hl_books_per_sec = DEFAULT_HL_BOOKS_PER_SEC
+        self._paced_interval_logged = 0.0   # last effective interval we logged
+
+    def _effective_interval(self) -> float:
+        """The configured interval, stretched up if the universe is too large to
+        sweep within HL's l2Book budget. Keeps the per-name book fetches under
+        ~hl_books_per_sec so a big (crypto-inclusive) universe isn't rate-limited
+        to mostly-null books."""
+        floor = len(self.symbols) / max(1.0, self.hl_books_per_sec)
+        return max(self.interval, floor)
         # canonical base -> HL dex: "xyz" (HIP-3 equity perp) or "" (main-dex
         # crypto perp). Determines the l2Book coin string ("xyz:AAPL" vs "BTC")
         # and which metaAndAssetCtxs universe a name's oracle/funding comes from.
@@ -214,10 +230,23 @@ class Capturer:
         overlap = sorted(((xyz_bases | main_bases) & aster_bases)
                          - set(NON_EQUITY_SYMBOLS))
         if overlap:
+            # Non-destructive on a PARTIAL HL failure: if one dex's meta came back
+            # empty (HL frequently nulls a single request), don't drop the names
+            # we already had from it — union with the current universe so a
+            # transient blip can't shrink us back to equity-only. Keeping a
+            # briefly-delisted name is harmless (its book just reads empty).
+            if (not xyz_bases or not main_bases) and self.symbols:
+                overlap = sorted(set(overlap) | set(self.symbols))
             # Classify: an equity (xyz) listing takes precedence over a same-
-            # ticker main-dex name (real tickers rarely collide).
+            # ticker main-dex name (real tickers rarely collide). Preserve prior
+            # classification for names kept via the union above.
             for b in overlap:
-                self.dex_of[b] = "xyz" if b in xyz_bases else ""
+                if b in xyz_bases:
+                    self.dex_of[b] = "xyz"
+                elif b in main_bases:
+                    self.dex_of[b] = ""
+                else:
+                    self.dex_of.setdefault(b, "xyz")
             n_eq = sum(1 for b in overlap if self.dex_of[b] == "xyz")
             log.info(f"discover: {len(overlap)} overlap names "
                      f"({n_eq} equity + {len(overlap)-n_eq} crypto)")
@@ -290,6 +319,8 @@ class Capturer:
                 data = await r.json(content_type=None)
             rows = data if isinstance(data, list) else [data]
             for row in rows:
+                if not isinstance(row, dict):
+                    continue
                 base = _aster_to_canon(row.get("symbol", ""))
                 if base:
                     out[base] = {
@@ -308,6 +339,8 @@ class Capturer:
                 data = await r.json(content_type=None)
             rows = data if isinstance(data, list) else [data]
             for row in rows:
+                if not isinstance(row, dict):
+                    continue
                 base = _aster_to_canon(row.get("symbol", ""))
                 if base:
                     out[base] = {
@@ -331,6 +364,10 @@ class Capturer:
                     data = await r.json(content_type=None)
             except Exception:
                 return None
+        # HL returns a null/non-dict body under rate-limiting — guard before .get
+        # (this NoneType.get was crashing whole capture cycles).
+        if not isinstance(data, dict):
+            return None
         levels = data.get("levels", [[], []])
         bids = levels[0] if len(levels) > 0 else []
         asks = levels[1] if len(levels) > 1 else []
@@ -399,7 +436,13 @@ class Capturer:
         ts = _now_ms()
         hl_ctxs, aster_bt, aster_pm = await asyncio.gather(
             self._hl_ctxs(), self._aster_book_tickers(), self._aster_premium(),
+            return_exceptions=True,
         )
+        # Coerce a failed batch call to an empty dict — one flaky venue response
+        # must not abort the whole cycle (loses every name's data for that tick).
+        hl_ctxs = hl_ctxs if isinstance(hl_ctxs, dict) else {}
+        aster_bt = aster_bt if isinstance(aster_bt, dict) else {}
+        aster_pm = aster_pm if isinstance(aster_pm, dict) else {}
         # Back off the per-name HL l2Book fetches while a manual gate is armed so
         # the trader's gate read isn't rate-limited. We still record this cycle
         # from the cheap batch calls (HL mid/oracle/funding + Aster book); only
@@ -414,8 +457,12 @@ class Capturer:
             if self._gate_paused:
                 self._gate_paused = False
                 log.info("Manual gate cleared — resuming full HL book capture")
-            hl_books = await asyncio.gather(*[self._hl_book(s) for s in self.symbols])
-        aster_depths = await asyncio.gather(*[self._aster_depth(s) for s in self.symbols])
+            hl_books = await asyncio.gather(
+                *[self._hl_book(s) for s in self.symbols], return_exceptions=True)
+            hl_books = [b if isinstance(b, dict) else None for b in hl_books]
+        aster_depths = await asyncio.gather(
+            *[self._aster_depth(s) for s in self.symbols], return_exceptions=True)
+        aster_depths = [d if isinstance(d, str) else None for d in aster_depths]
 
         rows = []
         for s, hb, adep in zip(self.symbols, hl_books, aster_depths):
@@ -448,7 +495,11 @@ class Capturer:
             log.error("No overlap universe discovered — aborting")
             return
         deadline = (time.time() + self.max_hours * 3600) if self.max_hours > 0 else None
-        log.info(f"Capturing {len(self.symbols)} names @ {self.interval}s"
+        eff = self._effective_interval()
+        log.info(f"Capturing {len(self.symbols)} names @ {eff:.0f}s"
+                 + (f" (paced up from {self.interval:.0f}s to fit HL's "
+                    f"~{self.hl_books_per_sec:.0f} book/s budget)"
+                    if eff > self.interval + 0.5 else "")
                  + (f" — auto-stop in {self.max_hours}h" if deadline else "")
                  + f": {', '.join(self.symbols)}")
 
@@ -503,7 +554,12 @@ class Capturer:
                 _write_health(conn, self)
             if run_once:
                 break
-            await asyncio.sleep(max(0.0, self.interval - elapsed))
+            eff = self._effective_interval()
+            if abs(eff - self._paced_interval_logged) > 1.0 and eff > self.interval + 0.5:
+                self._paced_interval_logged = eff
+                log.info(f"Cycle interval auto-paced to {eff:.0f}s for "
+                         f"{len(self.symbols)} names (HL book budget)")
+            await asyncio.sleep(max(0.0, eff - elapsed))
         _write_health(conn, self)
         log.info(f"Stopped. total cycles={self.cycles} rows={self.rows_written}")
 
@@ -548,6 +604,9 @@ def main():
     ap.add_argument("--retention-hours", type=float, default=72.0,
                     help="drop rows older than this so the DB size stays flat "
                          "(0 = keep everything)")
+    ap.add_argument("--hl-books-per-sec", type=float, default=DEFAULT_HL_BOOKS_PER_SEC,
+                    help="HL l2Book budget/sec; the cycle interval auto-stretches "
+                         "to keep the universe sweep under this (avoids null books)")
     a = ap.parse_args()
 
     logging.basicConfig(
@@ -562,6 +621,7 @@ def main():
         async with aiohttp.ClientSession() as session:
             cap = Capturer(session, a.interval, a.depth, a.aster_depth, a.max_hours,
                            a.retention_hours)
+            cap.hl_books_per_sec = a.hl_books_per_sec
             await cap.run(conn, run_once=a.once)
 
     try:
