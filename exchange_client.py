@@ -1854,10 +1854,18 @@ class ExchangeClient:
                     return False
                 data = await r.json()
             ok = data.get("status") == "ok"
-            log.info(f"HL leverage set {hl_coin} {leverage}x cross={cross}: {ok} ({data})")
+            # `hl_coin` used to be a local here; de8fe84 switched the action to
+            # asset_idx and left this f-string referencing it. The NameError fired
+            # AFTER the call landed, inside the try, so it was swallowed and this
+            # returned False on success — ensure_perp_margin never cached
+            # _margin_ready, so every entry re-sent updateLeverage (wasted HL
+            # address-rate budget) while reporting margin setup as failed.
+            log.info(f"HL leverage set {self._hl_coin(symbol)} (asset {asset_idx}, "
+                     f"dex={self._hl_dex.get(symbol, 'xyz') or 'main'}) "
+                     f"{leverage}x cross={cross}: {ok} ({data})")
             return ok
         except Exception as e:
-            log.error(f"HL set leverage error: {e}")
+            log.error(f"HL set leverage error for {symbol}: {e}")
             return False
 
     async def set_aster_leverage(self, symbol: str, leverage: int) -> bool:

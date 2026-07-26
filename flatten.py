@@ -109,53 +109,63 @@ def symbols_from_db() -> list[str]:
 
 
 async def reconcile_symbols(api_keys: dict) -> list[str]:
-    """Query both venues for live positions (DB-independent)."""
-    from config import HYPERLIQUID_API
+    """Query both venues for live positions (DB-independent).
+
+    HL is queried across BOTH dexes via get_all_hl_positions(). This used to post
+    clearinghouseState with a hardcoded dex="xyz" and filter coin.startswith
+    ("xyz:"), which made every main-dex CRYPTO position invisible to the
+    emergency flatten — the one thing it exists to catch. A naked HL crypto leg
+    (Aster hedge failed, or the Aster side already closed) was then found by
+    neither venue's scan and flatten reported success with the leg still open.
+    """
     import aiohttp
 
     found: set[str] = set()
-    async with aiohttp.ClientSession() as session:
-        # HL positions
-        try:
-            async with session.post(
-                HYPERLIQUID_API,
-                json={
-                    "type": "clearinghouseState",
-                    "user": api_keys["hl_account_address"],
-                    "dex": "xyz",
-                },
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as r:
-                data = await r.json()
-            for pos in data.get("assetPositions", []):
-                p = pos.get("position", {})
-                coin = p.get("coin", "")
-                if coin.startswith("xyz:") and float(p.get("szi", 0) or 0) != 0:
-                    found.add(coin[4:])
-        except Exception as e:
-            log.error(f"HL reconcile failed: {e}")
-
-    # Aster positions: ExchangeClient handles signing
     client = ExchangeClient(api_keys)
     client.session = aiohttp.ClientSession()
     try:
-        from config import ASTER_POSITION_URL
-        from auth import sign_aster_request
-        params = sign_aster_request(
-            {},
-            private_key=api_keys["aster_api_secret"],
-            user_address=api_keys["aster_wallet_address"],
-            signer_address=api_keys["aster_signer_address"],
-        )
-        async with client.session.get(ASTER_POSITION_URL, params=params) as r:
-            data = await r.json()
-        if isinstance(data, list):
-            for p in data:
-                sym = p.get("symbol", "")
-                if sym.endswith("USDT") and abs(float(p.get("positionAmt", 0) or 0)) > 0:
-                    found.add(sym[:-4])
-    except Exception as e:
-        log.error(f"Aster reconcile failed: {e}")
+        # HL: both dexes. Coin is "xyz:AAPL" on the builder dex and bare "BTC" on
+        # main, so the canonical base is whatever follows the last colon.
+        try:
+            hl_positions = await client.get_all_hl_positions()
+            for p in hl_positions:
+                coin = p.get("coin", "")
+                if coin:
+                    found.add(coin.split(":")[-1])
+            if hl_positions:
+                log.info(f"HL reconcile found: "
+                         f"{[p.get('coin') for p in hl_positions]}")
+        except Exception as e:
+            log.error(f"HL reconcile failed: {e}")
+
+        # Aster positions: ExchangeClient handles signing
+        try:
+            from config import ASTER_POSITION_URL, ASTER_BASE_TO_CANON
+            from auth import sign_aster_request
+            params = sign_aster_request(
+                {},
+                private_key=api_keys["aster_api_secret"],
+                user_address=api_keys["aster_wallet_address"],
+                signer_address=api_keys["aster_signer_address"],
+            )
+            async with client.session.get(ASTER_POSITION_URL, params=params) as r:
+                data = await r.json()
+            if isinstance(data, list):
+                for p in data:
+                    sym = p.get("symbol", "")
+                    if abs(float(p.get("positionAmt", 0) or 0)) <= 0:
+                        continue
+                    for suffix in ("USDT", "USDC", "USD"):
+                        if sym.endswith(suffix):
+                            base = sym[: -len(suffix)]
+                            # Aster's tradeable book uses the long name for a few
+                            # equities (SAMSUNGUSDT, SKHYNIXUSDT, BBXUSDT). Without
+                            # this map flatten got "SAMSUNG", which has no HL spec,
+                            # so it closed the Aster leg and left HL naked.
+                            found.add(ASTER_BASE_TO_CANON.get(base, base))
+                            break
+        except Exception as e:
+            log.error(f"Aster reconcile failed: {e}")
     finally:
         await client.session.close()
 
