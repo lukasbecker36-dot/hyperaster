@@ -208,6 +208,12 @@ class ExchangeClient:
         self._half_spread_diff_history: dict[str, deque] = {}
         self._last_half_spread_ts: dict[str, int] = {}
 
+        # symbol -> ms of the last HL 429 on its l2Book. _get_hl_book swallows a
+        # rate-limited read into an empty OrderBook, so without this a caller
+        # can't tell "HL throttled us" from "we asked for a coin that doesn't
+        # exist on that dex" — the two were conflated into one guessed warning.
+        self._hl_429_last: dict[str, int] = {}
+
     async def start(self, symbols: list[str]):
         """Load specs for all symbols."""
         self.session = aiohttp.ClientSession()
@@ -235,6 +241,24 @@ class ExchangeClient:
     def crypto_symbols(self) -> set:
         """Loaded main-dex crypto names (for persisting the fee-classification set)."""
         return {s for s, d in self._hl_dex.items() if d == ""}
+
+    def is_symbol_loaded(self, symbol: str) -> bool:
+        """True if specs + HL asset index/dex are populated for this name.
+        An UNLOADED name silently routes to the xyz dex (see is_hl_crypto), so a
+        crypto book read becomes 'xyz:BTC' and comes back empty — callers that
+        read books without going through ensure_symbol_loaded need to know."""
+        return (symbol in self._hl_dex and symbol in self._hl_asset_index
+                and symbol in self.hl_specs and symbol in self.aster_specs)
+
+    def hl_coin(self, symbol: str) -> str:
+        """Public accessor for the HL coin string we actually query (diagnostics)."""
+        return self._hl_coin(symbol)
+
+    def hl_recent_429_ms(self, symbol: str) -> int:
+        """ms since the last HL 429 seen for this symbol's book, or -1 if never.
+        Lets a caller state 'rate-limited' as a fact instead of a guess."""
+        last = self._hl_429_last.get(symbol, 0)
+        return (now_ms() - last) if last else -1
 
     def _hl_coin(self, symbol: str) -> str:
         """HL coin string for info calls (l2Book/candles/fundingHistory):
@@ -994,6 +1018,7 @@ class ExchangeClient:
                     timeout=self.timeout,
                 ) as r:
                     if r.status == 429:
+                        self._hl_429_last[symbol] = now_ms()
                         log.warning(f"HL l2Book {symbol} rate-limited (429), "
                                     f"attempt {attempt + 1}/{retries + 1}")
                         if attempt < retries:

@@ -287,6 +287,40 @@ def _auto_notional() -> float:
         return NOTIONAL_PER_LEG
 
 
+def blind_reason(client, symbol: str, aster_book=None, hl_book=None,
+                 exc: Exception | None = None) -> str:
+    """Say WHY a gate can't read the book, per venue.
+
+    The previous message blamed rate-limiting unconditionally, which masked a
+    real bug: a name the client never loaded silently routes to the xyz dex, so a
+    main-dex crypto gate asked HL for 'xyz:BTC' and got an empty book (HTTP 200,
+    no 429). That is not a rate limit and no amount of waiting clears it. Report
+    the actual HL coin string, whether we have genuinely seen a 429, and which
+    venue is empty.
+    """
+    if exc is not None:
+        return f"book fetch raised: {type(exc).__name__}: {exc}"
+    parts = []
+    if hl_book is None or hl_book.bid <= 0 or hl_book.ask <= 0:
+        coin = client.hl_coin(symbol)
+        age = client.hl_recent_429_ms(symbol)
+        if 0 <= age < 60_000:
+            parts.append(f"HL {coin} empty — 429 {age / 1000:.0f}s ago (rate-limited)")
+        elif not client.is_symbol_loaded(symbol):
+            parts.append(
+                f"HL {coin} empty and {symbol} has NO SPECS LOADED, so the dex was "
+                f"GUESSED as xyz. If {symbol} is a main-dex crypto perp that guess "
+                f"is wrong and no wait will fix it. NOT a rate limit — run "
+                f"/book {symbol} to see which dex actually has it"
+            )
+        else:
+            parts.append(f"HL {coin} returned no levels (no recent 429)")
+    if aster_book is None or aster_book.bid <= 0 or aster_book.ask <= 0:
+        parts.append(f"Aster {aster_symbol_for(symbol)} returned no top-of-book "
+                     f"(depth empty or failed mark sanity check)")
+    return " | ".join(parts) or "book incomplete (unknown cause)"
+
+
 def _carry_basis_bps(direction: str, action: str, aster_book, hl_book):
     """Executable basis (bps) in the position's FAVOUR for the given action.
 
@@ -483,6 +517,14 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     # restart (crash/OOM/deploy) silently dropped every armed gate while the
     # position stayed open (observed: an overnight SKHX exit gate vanished).
     _restore_pending_gates(pending_entries, pending_exits, pm, send_alert)
+    # A restored gate on a name outside the startup universe has no specs, so its
+    # book read would route to the wrong HL dex (crypto → 'xyz:BTC' → empty).
+    # Load them now so a restart doesn't resurrect a permanently-blind gate.
+    for _sym in list(pending_entries) + list(pending_exits):
+        if not client.is_symbol_loaded(_sym):
+            if not await client.ensure_symbol_loaded(_sym):
+                log.warning(f"restored gate {_sym}: specs would not load — it "
+                            f"cannot evaluate until they do")
     # ("enter"|"exit", symbol) -> consecutive evaluations the basis held ≥ target
     gate_streaks: dict[tuple[str, str], int] = {}
     # symbol -> last ms we warned that a gate couldn't evaluate (books empty).
@@ -490,18 +532,19 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     # is visible (silent skips looked like the gate "wasn't live").
     gate_blind_last: dict[str, int] = {}
 
-    def _warn_gate_blind(symbol: str, which: str):
+    def _warn_gate_blind(symbol: str, which: str, aster_book=None, hl_book=None,
+                         exc: Exception | None = None):
         now = now_ms()
         if now - gate_blind_last.get(symbol, 0) > 300_000:
             gate_blind_last[symbol] = now
+            reason = blind_reason(client, symbol, aster_book, hl_book, exc)
             log.warning(
-                f"gate {symbol}: cannot evaluate {which} — book unavailable "
-                f"(HL/Aster fetch empty; likely rate-limited). Gate NOT firing "
-                f"until books return."
+                f"gate {symbol}: cannot evaluate {which} — {reason}. "
+                f"Gate NOT firing until it clears."
             )
             try:
-                send_alert(f"⚠️ {symbol} {which} gate can't read the book "
-                           f"(rate-limited?) — not firing until it clears")
+                send_alert(f"⚠️ {symbol} {which} gate can't read the book:\n"
+                           f"{reason}")
             except Exception:
                 pass
     # top N candidates polled every fast tick
@@ -780,6 +823,22 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     direction = cmd.get("direction", "")
                     notional = float(cmd.get("notional", 0) or 0)
                     if target is not None:
+                        # Load specs BEFORE arming. The immediate path below goes
+                        # through force_entry_maker, which loads them itself; the
+                        # gate path reads books directly, and an unloaded name
+                        # defaults to the xyz dex — so a gated /enter on a
+                        # main-dex crypto name fetched l2Book "xyz:BTC", got
+                        # nothing, and warned "can't read the book" every 5min
+                        # forever without ever firing. /opps ranks the whole
+                        # capture universe (crypto + BLOCKED names included), so
+                        # gating a name outside the trading universe is normal.
+                        if not await client.ensure_symbol_loaded(symbol):
+                            send_alert(
+                                f"/enter {symbol}: NOT armed — symbol not found on "
+                                f"one or both venues (no HL asset index or no Aster "
+                                f"contract). Check the ticker with /book {symbol}."
+                            )
+                            continue
                         # Basis-gated: hold until the executable entry basis clears
                         # the target instead of crossing now.
                         # 0 (or less) disables expiry — the gate waits
@@ -796,7 +855,9 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                                    if MANUAL_ENTRY_GATE_TIMEOUT_MIN > 0 else "no expiry")
                         send_alert(
                             f"/enter {symbol}: waiting for entry basis ≥ {float(target):.0f}bps "
-                            f"({exp_str})"
+                            f"({exp_str})\n"
+                            f"venues: HL {client.hl_coin(symbol)} / "
+                            f"Aster {aster_symbol_for(symbol)}"
                         )
                     else:
                         ok, msg = await executor.force_entry_maker(
@@ -812,6 +873,17 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     maker_venue = cmd.get("maker_venue", "")
                     close_notional = float(cmd.get("close_notional", 0) or 0)
                     if target is not None:
+                        # Same dex-routing trap as the entry gate: an adopted
+                        # (/import) position on a name outside the startup
+                        # universe would read books on the wrong dex. Best-effort
+                        # only — never refuse to arm an EXIT, the position is
+                        # already open and has to be closeable.
+                        if not client.is_symbol_loaded(symbol):
+                            if not await client.ensure_symbol_loaded(symbol):
+                                log.warning(
+                                    f"/close {symbol}: specs would not load — the "
+                                    f"exit gate may not be able to read books"
+                                )
                         pe = {"target_bps": float(target)}
                         if maker_venue:
                             pe["maker_venue"] = maker_venue
@@ -1089,12 +1161,12 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 continue
             try:
                 aster_book, hl_book = await client.get_both_books(symbol)
-            except Exception:
-                _warn_gate_blind(symbol, "ENTER")
+            except Exception as e:
+                _warn_gate_blind(symbol, "ENTER", exc=e)
                 continue
             basis = _carry_basis_bps(req["direction"], "enter", aster_book, hl_book)
             if basis is None:
-                _warn_gate_blind(symbol, "ENTER")
+                _warn_gate_blind(symbol, "ENTER", aster_book, hl_book)
                 continue
             log.info(
                 f"gate {symbol}: basis={basis:.1f}bps target={req['target_bps']:.0f}bps "
@@ -1127,12 +1199,12 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 continue
             try:
                 aster_book, hl_book = await client.get_both_books(symbol)
-            except Exception:
-                _warn_gate_blind(symbol, "CLOSE")
+            except Exception as e:
+                _warn_gate_blind(symbol, "CLOSE", exc=e)
                 continue
             basis = _carry_basis_bps(pos.direction, "exit", aster_book, hl_book)
             if basis is None:
-                _warn_gate_blind(symbol, "CLOSE")
+                _warn_gate_blind(symbol, "CLOSE", aster_book, hl_book)
                 continue
             target = pending_exits[symbol]["target_bps"]
             if basis >= target:
