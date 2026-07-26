@@ -19,6 +19,7 @@ from database import get_connection
 from config import (
     ASTER_MAKER_FEE, ASTER_TAKER_FEE, HL_MAKER_FEE, HL_TAKER_FEE,
     TRADE_ALERTS_ENABLED,
+    fmt_px,
 )
 
 try:
@@ -258,7 +259,7 @@ class PositionManager:
         log.info(
             f"Position #{pid} ENTERING: {symbol} {direction} | "
             f"spread={entry_spread_bps:.1f}bps | qty={qty} | "
-            f"HL filled @ {hl_entry_price:.2f} | Aster GTX resting {aster_entry_order_id}"
+            f"HL filled @ {fmt_px(hl_entry_price)} | Aster GTX resting {aster_entry_order_id}"
         )
         return pos
 
@@ -312,7 +313,7 @@ class PositionManager:
         self.positions[symbol] = pos
         log.info(
             f"Position #{pid} ENTERING (HL maker): {symbol} {direction} | "
-            f"qty target={qty} | HL maker resting {hl_maker_order_id} @ {hl_ref_price:.2f}"
+            f"qty target={qty} | HL maker resting {hl_maker_order_id} @ {fmt_px(hl_ref_price)}"
         )
         return pos
 
@@ -421,12 +422,12 @@ class PositionManager:
         conn.close()
         log.info(
             f"Position #{pos.id} OPEN (HL maker): {symbol} | qty={final_qty} | "
-            f"HL @ {pos.hl_entry_price:.2f} | Aster @ {pos.aster_entry_price:.2f}"
+            f"HL @ {fmt_px(pos.hl_entry_price)} | Aster @ {fmt_px(pos.aster_entry_price)}"
         )
         self._trade_alert(
             f"🟢 ENTERED {symbol} {_dir_short(pos.direction)} | qty={final_qty} "
-            f"${pos.notional_usd:.0f} | HL @ {pos.hl_entry_price:.2f} "
-            f"Ast @ {pos.aster_entry_price:.2f}"
+            f"${pos.notional_usd:.0f} | HL @ {fmt_px(pos.hl_entry_price)} "
+            f"Ast @ {fmt_px(pos.aster_entry_price)}"
         )
 
     def start_scale_in(
@@ -476,7 +477,7 @@ class PositionManager:
         conn.close()
         log.warning(
             f"Position #{pos.id} SCALE-IN started: {symbol} +{increment_qty} "
-            f"(existing {pos.scale_pre_qty}) | HL maker @ {hl_ref_price:.2f}"
+            f"(existing {pos.scale_pre_qty}) | HL maker @ {fmt_px(hl_ref_price)}"
         )
         return True
 
@@ -629,12 +630,12 @@ class PositionManager:
         conn.close()
         log.info(
             f"Position #{pos.id} OPEN: {symbol} | "
-            f"HL @ {pos.hl_entry_price:.2f} | Aster @ {aster_fill_price:.2f}"
+            f"HL @ {fmt_px(pos.hl_entry_price)} | Aster @ {fmt_px(aster_fill_price)}"
         )
         self._trade_alert(
             f"🟢 ENTERED {symbol} {_dir_short(pos.direction)} | qty={pos.qty} "
-            f"${pos.notional_usd:.0f} | HL @ {pos.hl_entry_price:.2f} "
-            f"Ast @ {aster_fill_price:.2f}"
+            f"${pos.notional_usd:.0f} | HL @ {fmt_px(pos.hl_entry_price)} "
+            f"Ast @ {fmt_px(aster_fill_price)}"
         )
 
     def confirm_aster_entry_partial(
@@ -658,12 +659,12 @@ class PositionManager:
         conn.close()
         log.warning(
             f"Position #{pos.id} OPEN (partial): {symbol} | qty shrunk to {matched_qty} | "
-            f"HL @ {pos.hl_entry_price:.2f} | Aster @ {aster_fill_price:.2f}"
+            f"HL @ {fmt_px(pos.hl_entry_price)} | Aster @ {fmt_px(aster_fill_price)}"
         )
         self._trade_alert(
             f"🟢 ENTERED {symbol} {_dir_short(pos.direction)} (partial) | qty={matched_qty} "
-            f"${pos.notional_usd:.0f} | HL @ {pos.hl_entry_price:.2f} "
-            f"Ast @ {aster_fill_price:.2f}"
+            f"${pos.notional_usd:.0f} | HL @ {fmt_px(pos.hl_entry_price)} "
+            f"Ast @ {fmt_px(aster_fill_price)}"
         )
 
     def start_exiting_hl_maker(
@@ -698,7 +699,7 @@ class PositionManager:
         conn.close()
         log.info(
             f"Position #{pos.id} EXITING (HL maker): {symbol} | "
-            f"HL maker resting {hl_maker_order_id} @ {hl_ref_price:.2f} | "
+            f"HL maker resting {hl_maker_order_id} @ {fmt_px(hl_ref_price)} | "
             f"spread={exit_spread_bps:.1f}bps"
         )
 
@@ -779,13 +780,13 @@ class PositionManager:
         if aster_exit_price <= 0:
             log.critical(
                 f"{symbol}: exit booked with Aster price 0 — using entry price "
-                f"{pos.aster_entry_price:.2f}; P&L on that leg is approximate"
+                f"{fmt_px(pos.aster_entry_price)}; P&L on that leg is approximate"
             )
             aster_exit_price = pos.aster_entry_price
         if pos.hl_exit_price <= 0:
             log.critical(
                 f"{symbol}: exit booked with HL price 0 — using entry price "
-                f"{pos.hl_entry_price:.2f}; P&L on that leg is approximate"
+                f"{fmt_px(pos.hl_entry_price)}; P&L on that leg is approximate"
             )
             pos.hl_exit_price = pos.hl_entry_price
         pos.aster_exit_price = aster_exit_price
@@ -1035,7 +1036,7 @@ class PositionManager:
         self.positions[symbol] = pos
         log.warning(
             f"Position #{pid} IMPORTED: {symbol} {direction} | "
-            f"qty={qty} ${notional:.0f} | HL @ {hl_price:.2f} | Aster @ {aster_price:.2f}"
+            f"qty={qty} ${notional:.0f} | HL @ {fmt_px(hl_price)} | Aster @ {fmt_px(aster_price)}"
         )
         return pos
 

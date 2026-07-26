@@ -42,6 +42,7 @@ from config import (
     EXIT_TARGET_NET_USD_BY_SYMBOL, MAX_FUNDING_DRAG_USD,
     BASIS_ADVERSE_STOP_USD,
     MANUAL_ENTRY_GATE_TIMEOUT_MIN, aster_symbol_for, ASTER_BASE_TO_CANON,
+    fmt_px,
 )
 
 SLOW_SCAN_INTERVAL_SECONDS = 300   # re-rank all symbols every 5 min
@@ -768,7 +769,7 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                                 f"spread={spread_bps:.1f} entry_base={entry_base:.1f} "
                                 f"corr={correction:+.1f} exec_dev={exec_dev:+.1f} "
                                 f"est_net=${est_net:.2f} dir={pos_dir} held={elapsed_hours:.1f}h "
-                                f"HL={hl_book.mid:.2f} Ast={aster_book.mid:.2f}"
+                                f"HL={fmt_px(hl_book.mid)} Ast={fmt_px(aster_book.mid)}"
                             )
                             should_exit, reason = True, "converge"
                         elif own_excess <= 0 and elapsed_hours >= 0.5:
@@ -1133,9 +1134,9 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             short_dir = "HL↑ Ast↓" if "long_hl" in direction else "HL↓ Ast↑"
             imported.append(
                 f"  • {base} #{pos.id} {short_dir} qty={qty} "
-                f"HL@{hl_px:.2f} Ast@{ast_px:.2f} ${pos.notional_usd:.0f}"
+                f"HL@{fmt_px(hl_px)} Ast@{fmt_px(ast_px)} ${pos.notional_usd:.0f}"
             )
-            log.warning(f"Imported {base}: {direction} qty={qty} HL@{hl_px:.2f} Ast@{ast_px:.2f}")
+            log.warning(f"Imported {base}: {direction} qty={qty} HL@{fmt_px(hl_px)} Ast@{fmt_px(ast_px)}")
         send_alert("✅ Imported positions:\n" + "\n".join(imported))
 
     async def evaluate_gated_orders():

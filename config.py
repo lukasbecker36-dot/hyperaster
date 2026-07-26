@@ -385,6 +385,52 @@ def aster_symbol_for(base: str) -> str:
     return f"{ASTER_BASE_ALIAS.get(base, base)}USDT"
 
 
+# ── Price rendering ──
+
+def px_decimals(px) -> int:
+    """Decimal places that keep a price readable across the whole universe.
+
+    Equities are $10-$1000; main-dex crypto spans PAXG (~$4000) to Notcoin
+    (~$0.00036). A flat .2f rendered every sub-cent token as "0.00" — a real
+    Notcoin maker entry logged as "HL sell maker @ 0.00", which reads as a bug
+    and hides the actual level. Order pricing is unaffected (that goes through
+    format_hl_price/snap_aster_price); this is purely for logs, alerts and the
+    Telegram screens.
+    """
+    try:
+        p = abs(float(px))
+    except (TypeError, ValueError):
+        return 2
+    if p >= 100:
+        return 2
+    if p >= 1:
+        return 4
+    if p >= 0.01:
+        return 6
+    return 8
+
+
+def fmt_px(px) -> str:
+    """Price as a string with adaptive precision, trailing zeros trimmed to a
+    2-decimal floor. Non-numeric/None -> '?'.
+
+    The floor keeps equities looking like prices (4012.50, not 4012.5) while the
+    trim keeps crypto tight (0.00036, not 0.00036000). A zero/missing price
+    renders as a plain '0.00' rather than a long, precise-looking 0.00000000.
+    """
+    try:
+        p = float(px)
+    except (TypeError, ValueError):
+        return "?"
+    s = f"{p:.{px_decimals(p)}f}"
+    if "." in s:
+        whole, frac = s.split(".")
+        frac = frac.rstrip("0")
+        frac = frac.ljust(2, "0")
+        s = f"{whole}.{frac}"
+    return s
+
+
 # ── Non-equity exclusions ──
 # Commodities, FX, indices, ETFs, and tokens that appear in the XYZ/Aster
 # overlap but are not single-stock equity perps.

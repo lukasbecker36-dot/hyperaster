@@ -61,6 +61,19 @@ AUTO_NOTIONAL_FILE = BASE_DIR / "data" / "auto_notional"
 MANUAL_CMD_DIR = BASE_DIR / "data" / "manual_cmds"
 BALANCES_FILE = BASE_DIR / "data" / "balances.json"
 
+# Adaptive price precision, so sub-cent crypto (Notcoin ~$0.00036) doesn't render
+# as "0.00" in /positions and /trades. Imported from config, but this bot is
+# stdlib-only by design and tolerates config being unimportable (see db_path),
+# so it degrades to the old fixed 2dp rather than failing to start.
+try:
+    from config import fmt_px
+except Exception:
+    def fmt_px(px) -> str:
+        try:
+            return f"{float(px):.2f}"
+        except (TypeError, ValueError):
+            return "?"
+
 TOKEN = os.getenv("ALERT_TELEGRAM_BOT_TOKEN", "")
 SERVICE = os.getenv("CONTROL_SERVICE_NAME", "hyperaster")
 # The control bot's OWN systemd unit, so /restart can restart it too (to pick up
@@ -414,7 +427,7 @@ def cmd_positions(chat_id: str, _arg: str):
             prog = f"{hedged_qty:.3f}/{tgt:.3f}sh" if tgt else f"{hedged_qty:.3f}sh"
             pct = f" ({hedged_qty / tgt * 100:.0f}%)" if tgt else ""
             if status in ("entering", "scaling"):
-                px = f" @ {hl_px:.2f}" if hl_px else ""
+                px = f" @ {fmt_px(hl_px)}" if hl_px else ""
                 detail = f"HL maker resting{px}, hedged {prog}{pct}"
             elif status == "exiting":
                 detail = f"closing {tgt:.3f}sh — HL maker resting, hedged {prog}{pct}"
@@ -497,7 +510,7 @@ def cmd_positions(chat_id: str, _arg: str):
             lines.append(
                 f"• {sym}{tag} [{status}] {short_dir}\n"
                 f"{basis_str}"
-                f"    HL:{hl_px:.2f}  Ast:{ast_px:.2f}  qty={qty_str}\n"
+                f"    HL:{fmt_px(hl_px)}  Ast:{fmt_px(ast_px)}  qty={qty_str}\n"
                 f"    funding=${funding:+.2f}{fund_src}  fees=${fees:.2f}  "
                 f"held={held_h:.1f}h{est_net_str}"
             )
@@ -506,7 +519,7 @@ def cmd_positions(chat_id: str, _arg: str):
                 f"• {sym}{tag} [{status}] {short_dir}\n"
                 f"    excess: entry={spread:+.0f}bps  {excess_str}  exit≤0bps\n"
                 f"{basis_str}"
-                f"    HL:{hl_px:.2f}  Ast:{ast_px:.2f}  qty={qty_str}\n"
+                f"    HL:{fmt_px(hl_px)}  Ast:{fmt_px(ast_px)}  qty={qty_str}\n"
                 f"    funding=${funding:+.2f}{fund_src}  fees=${fees:.2f}  "
                 f"held={held_h:.1f}h{est_net_str}\n"
                 f"    target=${sym_target:.2f} net | need gross≥${sym_target - funding + fees:.2f}"
@@ -822,7 +835,7 @@ def cmd_trades(chat_id: str, arg: str):
         lines.append(
             f"\n• {sym}{tag} {short_dir} — {reason}\n"
             f"  entry excess={entry_sp or 0:.1f}bps → exit excess={exit_excess:.1f}bps\n"
-            f"  HL: {hl_in:.2f}→{hl_out:.2f}  Ast: {ast_in:.2f}→{ast_out:.2f}\n"
+            f"  HL: {fmt_px(hl_in)}→{fmt_px(hl_out)}  Ast: {fmt_px(ast_in)}→{fmt_px(ast_out)}\n"
             f"  qty={qty}  notional=${notional or 0:.0f}\n"
             f"  gross=${gross:.4f}  fees=${fees:.4f}  funding=${funding:+.4f}\n"
             f"  net=${net:.4f}  held={held_h:.1f}h"

@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import (
     HYPERLIQUID_API, ASTER_BASE, DATA_DIR, aster_symbol_for,
+    fmt_px,
 )
 from src import history
 
@@ -297,7 +298,7 @@ async def main():
         lines.append(f"{'buy-AST leg':<11}{buy_ast_now:>+8.1f}")
         lines.append("  = ENTER L-AST/S-HL · EXIT L-HL/S-AST")
     lines.append(f"round trip now (enter+exit): {buy_hl_now + buy_ast_now:+.1f}bps")
-    lines.append(f"books  HL {hl_bid:.2f}/{hl_ask:.2f}  Ast {ast_bid:.2f}/{ast_ask:.2f}")
+    lines.append(f"books  HL {fmt_px(hl_bid)}/{fmt_px(hl_ask)}  Ast {fmt_px(ast_bid)}/{fmt_px(ast_ask)}")
 
     # Funding: Aster rates are PER WINDOW and the window varies by name (SKHX
     # settles every 4h, most 8h) — detected above from settlement timestamps.

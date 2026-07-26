@@ -40,6 +40,7 @@ from config import (
     ORACLE_CORRECTION_ENABLED, ORACLE_BASELINE_MIN_SAMPLES,
     ORACLE_STALENESS_GUARD_ENABLED, ORACLE_STALE_MINUTES,
     EXECUTABLE_SIGNAL_ENABLED, ASTER_REDUCE_ONLY, CRYPTO_TRADING_ENABLED,
+    fmt_px,
 )
 from src import history
 
@@ -987,10 +988,10 @@ class ExchangeClient:
             mark_price = await self._get_aster_mark(symbol)
             if mark_price > 0:
                 if abs(bid - mark_price) / mark_price > 0.30:
-                    log.debug(f"Aster {symbol}: depth bid {bid} vs mark {mark_price:.2f} — stale, skipping")
+                    log.debug(f"Aster {symbol}: depth bid {bid} vs mark {fmt_px(mark_price)} — stale, skipping")
                     return OrderBook()
                 if abs(ask - mark_price) / mark_price > 0.30:
-                    log.debug(f"Aster {symbol}: depth ask {ask} vs mark {mark_price:.2f} — stale, skipping")
+                    log.debug(f"Aster {symbol}: depth ask {ask} vs mark {fmt_px(mark_price)} — stale, skipping")
                     return OrderBook()
 
             return OrderBook(

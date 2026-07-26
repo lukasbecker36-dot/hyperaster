@@ -37,6 +37,7 @@ from config import (
     ENTRY_TAKER_ESCALATION_ENABLED, STOP_COOLDOWN_MINUTES,
     AUTO_TRADE_ONLY_CALIBRATED, HL_EXIT_IOC_BUFFER_BPS, LEVERAGE,
     aster_symbol_for,
+    fmt_px,
 )
 from auth import now_ms
 
@@ -138,8 +139,8 @@ class Executor:
         if price_ratio > MAX_PRICE_RATIO_DIVERGENCE:
             if symbol not in self._price_mismatch_warned:
                 log.warning(
-                    f"{symbol}: price mismatch {aster_book.mid:.4f} (Aster) vs "
-                    f"{hl_book.mid:.4f} (HL) — {price_ratio*100:.0f}% apart, skipping"
+                    f"{symbol}: price mismatch {fmt_px(aster_book.mid)} (Aster) vs "
+                    f"{fmt_px(hl_book.mid)} (HL) — {price_ratio*100:.0f}% apart, skipping"
                 )
                 self._price_mismatch_warned.add(symbol)
             return False
@@ -285,7 +286,7 @@ class Executor:
             f"ENTRY {symbol}: {direction} maker-first | excess={excess_bps:.1f}bps "
             f"spread={spread_bps:+.1f}bps base={baseline_bps:+.1f}bps "
             f"orac_corr={correction:+.1f}bps exec_dev={exec_dev:+.1f}bps | "
-            f"qty={qty} | HL {hl_maker_side} maker @ {hl_ref:.2f}"
+            f"qty={qty} | HL {hl_maker_side} maker @ {fmt_px(hl_ref)}"
         )
 
         # Snapshot funding rates at entry (HL hourly, Aster 8h) for carry accounting.
@@ -338,7 +339,7 @@ class Executor:
             aster_funding_window_h=aster_win_h,
         )
         self._entry_streak.pop(symbol, None)
-        log.info(f"{symbol}: convergence maker resting {alo.order_id} @ {hl_ref:.2f} — hedging on fill")
+        log.info(f"{symbol}: convergence maker resting {alo.order_id} @ {fmt_px(hl_ref)} — hedging on fill")
         return True
 
     def _book_liquid_enough(self, symbol, aster_book, hl_book, mid) -> bool:
@@ -435,8 +436,8 @@ class Executor:
         price_ratio = abs(aster_book.mid - hl_book.mid) / min(aster_book.mid, hl_book.mid)
         if price_ratio > MAX_PRICE_RATIO_DIVERGENCE:
             return False, (
-                f"{symbol}: price mismatch {aster_book.mid:.4f} (Ast) vs "
-                f"{hl_book.mid:.4f} (HL), {price_ratio*100:.0f}% apart — refusing"
+                f"{symbol}: price mismatch {fmt_px(aster_book.mid)} (Ast) vs "
+                f"{fmt_px(hl_book.mid)} (HL), {price_ratio*100:.0f}% apart — refusing"
             )
 
         if direction == "long_hl_short_aster":
@@ -461,8 +462,8 @@ class Executor:
 
         log.warning(
             f"MANUAL ENTRY {symbol}: {direction} | notional≈${actual_notional:.0f} "
-            f"qty={qty} | HL {hl_side} @ {hl_ref_price:.2f} | "
-            f"Aster {aster_side} @ {aster_ref_price:.2f} | hold_for_funding={hold_for_funding}"
+            f"qty={qty} | HL {hl_side} @ {fmt_px(hl_ref_price)} | "
+            f"Aster {aster_side} @ {fmt_px(aster_ref_price)} | hold_for_funding={hold_for_funding}"
         )
 
         if self.paper_mode:
@@ -529,7 +530,7 @@ class Executor:
         complete_intent(hl_intent_id, "filled",
                         notes=f"order_id={hl_result.order_id} qty={hl_result.filled_qty}")
         actual_qty = hl_result.filled_qty
-        log.warning(f"{symbol}: HL {hl_side} filled {actual_qty} @ {hl_result.fill_price:.2f}")
+        log.warning(f"{symbol}: HL {hl_side} filled {actual_qty} @ {fmt_px(hl_result.fill_price)}")
 
         if existing:
             # Scale-in: the position must stay "open", so a resting Aster GTX
@@ -985,7 +986,7 @@ class Executor:
 
         log.warning(
             f"drip_exit {symbol}: -{hedge_qty} @ basis={basis_bps:.0f}bps "
-            f"HL@{hl_res.fill_price:.2f} Ast@{ast_res.fill_price:.2f} "
+            f"HL@{fmt_px(hl_res.fill_price)} Ast@{fmt_px(ast_res.fill_price)} "
             f"({de['exited_qty']:.3f}/{de['total_qty']:.3f})"
         )
 
@@ -1054,7 +1055,7 @@ class Executor:
 
         mid = (aster_book.mid + hl_book.mid) / 2
         if mid <= 0:
-            log.info(f"drip {symbol}: mid={mid:.4f} — skipping")
+            log.info(f"drip {symbol}: mid={fmt_px(mid)} — skipping")
             return
 
         # Size this bite first so we can compute VWAP-based basis.
@@ -1083,7 +1084,7 @@ class Executor:
         bite_qty = self.client.snap_aster_qty(symbol, raw_qty)
         bite_notional_actual = bite_qty * mid
         if bite_qty <= 0:
-            log.info(f"drip {symbol}: bite_qty snapped to 0 (mid={mid:.2f})")
+            log.info(f"drip {symbol}: bite_qty snapped to 0 (mid={fmt_px(mid)})")
             return
 
         if direction == "long_hl_short_aster":
@@ -1175,7 +1176,7 @@ class Executor:
                     drip["filled_notional"] += fill_notional
                     drip["fills"] += 1
                     log.warning(f"drip {symbol}: +{hedge_qty} buffer hedged on HL "
-                                f"@ {hl_res.fill_price:.2f} "
+                                f"@ {fmt_px(hl_res.fill_price)} "
                                 f"(${drip['filled_notional']:.0f}/${drip['target_notional']:.0f})")
                     if drip["filled_notional"] >= drip["target_notional"]:
                         msg = (f"drip complete: {symbol} ${drip['filled_notional']:.0f} "
@@ -1308,7 +1309,7 @@ class Executor:
         drip["fills"] += 1
         log.warning(
             f"drip {symbol}: +{hedge_qty} hedged @ basis={basis_bps:.0f}bps "
-            f"HL@{hl_res.fill_price:.2f} Ast@{ast_res.fill_price:.2f} "
+            f"HL@{fmt_px(hl_res.fill_price)} Ast@{fmt_px(ast_res.fill_price)} "
             f"(${drip['filled_notional']:.0f}/${drip['target_notional']:.0f})"
         )
         if drip["filled_notional"] >= drip["target_notional"]:
@@ -1374,8 +1375,8 @@ class Executor:
         price_ratio = abs(aster_book.mid - hl_book.mid) / min(aster_book.mid, hl_book.mid)
         if price_ratio > MAX_PRICE_RATIO_DIVERGENCE:
             return False, (
-                f"{symbol}: price mismatch {aster_book.mid:.4f} (Ast) vs "
-                f"{hl_book.mid:.4f} (HL), {price_ratio*100:.0f}% apart — refusing"
+                f"{symbol}: price mismatch {fmt_px(aster_book.mid)} (Ast) vs "
+                f"{fmt_px(hl_book.mid)} (HL), {price_ratio*100:.0f}% apart — refusing"
             )
 
         # HL leg is the maker. Long HL -> buy resting at the bid; short HL ->
@@ -1397,7 +1398,7 @@ class Executor:
 
         log.warning(
             f"MAKER ENTRY {symbol}: {direction} | notional≈${qty*mid:.0f} qty={qty} | "
-            f"HL {hl_side} maker @ {hl_ref_price:.2f}"
+            f"HL {hl_side} maker @ {fmt_px(hl_ref_price)}"
         )
 
         if self.paper_mode:
@@ -1465,7 +1466,7 @@ class Executor:
                 await self.client.cancel_hl_order(symbol, alo.order_id)
                 return False, f"{symbol}: scale-in could not start (position state changed)"
             return True, (
-                f"scaling {symbol} {direction} +${qty*mid:.0f} @ {hl_ref_price:.2f} "
+                f"scaling {symbol} {direction} +${qty*mid:.0f} @ {fmt_px(hl_ref_price)} "
                 f"(existing {existing.scale_pre_qty or existing.qty} qty) — hedging on fill"
             )
 
@@ -1479,7 +1480,7 @@ class Executor:
             aster_funding_window_h=aster_win_h,
         )
         return True, (
-            f"resting HL maker for {symbol} {direction} ${qty*mid:.0f} @ {hl_ref_price:.2f} "
+            f"resting HL maker for {symbol} {direction} ${qty*mid:.0f} @ {fmt_px(hl_ref_price)} "
             f"— hedging on fill"
         )
 
@@ -1605,7 +1606,7 @@ class Executor:
                     self.pm.log_trade(pos.id, "aster", aster_hedge_side, "ioc_hedge",
                                       res.order_id, res.filled_qty, res.fill_price,
                                       notes="maker-entry hedge")
-                    log.warning(f"{symbol}: hedged {res.filled_qty} on Aster @ {res.fill_price:.2f} "
+                    log.warning(f"{symbol}: hedged {res.filled_qty} on Aster @ {fmt_px(res.fill_price)} "
                                 f"({new_hedged}/{pos.qty})")
                 else:
                     complete_intent(hedge_intent, "rejected",
@@ -1949,7 +1950,7 @@ class Executor:
         if alo.success:
             pos.hl_entry_price = touch
             self._set_entry_order_id(pos, alo.order_id, price=touch)
-            log.info(f"{symbol}: repriced HL maker -> {alo.order_id} @ {touch:.2f} (rem {remainder})")
+            log.info(f"{symbol}: repriced HL maker -> {alo.order_id} @ {fmt_px(touch)} (rem {remainder})")
         else:
             # Cancel+place is NOT atomic: the old order is already cancelled, so
             # nothing rests now. Record that (clear the id) so the next tick
@@ -2013,7 +2014,7 @@ class Executor:
 
         log.info(
             f"PARTIAL CLOSE {symbol} ({reason}): qty={close_qty:.4f}/{pos.qty:.4f} "
-            f"spread={spread_bps:.1f}bps | Aster {aster_side} @ {aster_ref:.4f} | HL {hl_side} @ {hl_ref:.2f}"
+            f"spread={spread_bps:.1f}bps | Aster {aster_side} @ {fmt_px(aster_ref)} | HL {hl_side} @ {fmt_px(hl_ref)}"
         )
 
         if self.paper_mode:
@@ -2041,7 +2042,7 @@ class Executor:
             return False
         complete_intent(a_intent, "filled", notes=f"qty={aster_res.filled_qty}", position_id=pos.id)
         aster_filled = aster_res.filled_qty
-        log.info(f"{symbol}: partial close Aster filled {aster_filled} @ {aster_res.fill_price:.4f}")
+        log.info(f"{symbol}: partial close Aster filled {aster_filled} @ {fmt_px(aster_res.fill_price)}")
 
         # Leg 2: hedge by closing the matched HL qty (IOC taker). Retry the liquid
         # leg a few times so an Aster fill is never left naked.
@@ -2081,7 +2082,7 @@ class Executor:
         self.pm.scale_out(symbol, closed, remove_notional, hl_avg, aster_res.fill_price)
         log.warning(
             f"PARTIAL CLOSE OK {symbol}: closed {closed:.4f} "
-            f"(Aster @ {aster_res.fill_price:.4f}, HL @ {hl_avg:.2f}) "
+            f"(Aster @ {fmt_px(aster_res.fill_price)}, HL @ {fmt_px(hl_avg)}) "
             f"remaining={pos.qty:.4f}"
         )
         return True
@@ -2262,7 +2263,7 @@ class Executor:
         partial = " (PARTIAL)" if qty < pos.qty else ""
         log.warning(
             f"MAKER EXIT{partial} {symbol} ({reason}): {pos.direction} | qty={qty}/{pos.qty} | "
-            f"HL {hl_side} maker @ {hl_ref:.2f}"
+            f"HL {hl_side} maker @ {fmt_px(hl_ref)}"
         )
 
         if self.paper_mode:
@@ -2392,7 +2393,7 @@ class Executor:
                     self.pm.log_trade(pos.id, "aster", aster_hedge_side, "ioc_close",
                                       res.order_id, res.filled_qty, res.fill_price,
                                       notes="maker-exit close")
-                    log.warning(f"{symbol}: closed {res.filled_qty} on Aster @ {res.fill_price:.2f} "
+                    log.warning(f"{symbol}: closed {res.filled_qty} on Aster @ {fmt_px(res.fill_price)} "
                                 f"({new_closed}/{pos.qty})")
                 else:
                     complete_intent(hedge_intent, "rejected",
@@ -2466,7 +2467,7 @@ class Executor:
             if ast_px <= 0:
                 ast_px = pos.aster_entry_price
             log.warning(f"{symbol}: stuck maker exit — both legs flat on venue, "
-                        f"finalizing @ HL {hl_px:.2f} / Ast {ast_px:.2f}")
+                        f"finalizing @ HL {fmt_px(hl_px)} / Ast {fmt_px(ast_px)}")
             if symbol in self._partial_closes:
                 self._finalize_partial_close(symbol, pos.qty, hl_px, ast_px)
             else:
@@ -2651,7 +2652,7 @@ class Executor:
                          (alo.order_id, touch, pos.id))
             conn.commit()
             conn.close()
-            log.info(f"{symbol}: repriced HL exit maker -> {alo.order_id} @ {touch:.2f}")
+            log.info(f"{symbol}: repriced HL exit maker -> {alo.order_id} @ {fmt_px(touch)}")
         else:
             self._exit_repost_pending.add(symbol)
             log.warning(f"{symbol}: HL exit maker reprice failed ({alo.error})")
@@ -2828,7 +2829,7 @@ class Executor:
             symbol, close_side, force_qty, ref_price, reduce_only=True)
         if result.success and result.filled_qty > 0:
             log.info(
-                f"{symbol}: Aster force-exit filled {result.filled_qty} @ {result.fill_price:.4f}"
+                f"{symbol}: Aster force-exit filled {result.filled_qty} @ {fmt_px(result.fill_price)}"
             )
             complete_intent(force_intent_id, "filled",
                             notes=f"oid={result.order_id} qty={result.filled_qty}",
@@ -2974,7 +2975,7 @@ class Executor:
             conn.commit()
             conn.close()
             log.info(
-                f"{symbol}: Aster GTX repriced {side.upper()} @ {target_price:.2f} -> {new_oid}"
+                f"{symbol}: Aster GTX repriced {side.upper()} @ {fmt_px(target_price)} -> {new_oid}"
             )
         else:
             log.error(f"{symbol}: Aster GTX reprice failed: {new_result.error}")
@@ -3028,7 +3029,7 @@ class Executor:
 
         log.info(
             f"EXIT {symbol} ({reason}): spread={exit_spread_bps:.1f}bps | "
-            f"HL {hl_close_side} @ {hl_ref_price:.2f} | Aster {aster_close_side} @ {aster_ref_price:.2f}"
+            f"HL {hl_close_side} @ {fmt_px(hl_ref_price)} | Aster {aster_close_side} @ {fmt_px(aster_ref_price)}"
         )
 
         # Snapshot HL baseline + record intent BEFORE the close call. Closing the
@@ -3119,7 +3120,7 @@ class Executor:
                 f"residual {qty - hl_filled} will need manual close"
             )
 
-        log.info(f"{symbol}: HL exit filled {hl_filled} @ {hl_avg_price:.2f}")
+        log.info(f"{symbol}: HL exit filled {hl_filled} @ {fmt_px(hl_avg_price)}")
 
         # Step 2: Aster close — match the HL filled qty exactly to stay hedged
         aster_qty = self.client.snap_aster_qty(symbol, hl_filled)
@@ -3206,11 +3207,11 @@ class Executor:
         close_side = "sell" if pos.direction == "long_hl_short_aster" else "buy"
         hl_book = await self.client._get_hl_book(symbol)
         ref_price = hl_book.bid if close_side == "sell" else hl_book.ask
-        log.warning(f"{symbol}: emergency closing HL leg ({close_side} @ {ref_price:.2f})")
+        log.warning(f"{symbol}: emergency closing HL leg ({close_side} @ {fmt_px(ref_price)})")
         result = await self.client.place_hl_ioc(symbol, close_side, pos.qty, ref_price,
                                                 buffer_bps=HL_EXIT_IOC_BUFFER_BPS)
         if result.success:
-            log.info(f"{symbol}: HL emergency close filled @ {result.fill_price:.2f}")
+            log.info(f"{symbol}: HL emergency close filled @ {fmt_px(result.fill_price)}")
             self.pm.mark_error(symbol, "entry_timeout_hl_closed")
         else:
             log.critical(f"{symbol}: HL emergency close FAILED — {result.error}. Manual intervention!")

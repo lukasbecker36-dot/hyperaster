@@ -21,7 +21,7 @@ import aiohttp
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from config import aster_symbol_for
+from config import aster_symbol_for, px_decimals
 
 HL_URL = "https://api.hyperliquid.xyz/info"
 ASTER_URL = "https://fapi.asterdex.com/fapi/v1/depth"
@@ -84,15 +84,11 @@ def _spread_bps(bid: Decimal, ask: Decimal) -> Decimal:
 
 def _fmt_px(px) -> str:
     """Adaptive price precision so sub-dollar crypto (HMSTR ~$0.001) doesn't
-    render as 0.00, while big equities stay readable."""
+    render as 0.00, while big equities stay readable. Column-padded for the
+    table; the precision ladder itself lives in config.px_decimals so this and
+    the log/alert formatter (config.fmt_px) can't drift apart."""
     p = float(px)
-    if p >= 100:
-        return f"{p:>12.2f}"
-    if p >= 1:
-        return f"{p:>12.4f}"
-    if p >= 0.01:
-        return f"{p:>12.6f}"
-    return f"{p:>12.8f}"
+    return f"{p:>12.{px_decimals(p)}f}"
 
 
 async def run(symbol: str, levels: int) -> str:
