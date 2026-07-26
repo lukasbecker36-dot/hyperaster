@@ -221,7 +221,9 @@ class Capturer:
         overlap_symbols.csv the live bot maintains so a transient blip never
         aborts a capture run."""
         xyz_univ, _ = await self._hl_meta("xyz")
-        main_univ, _ = await self._hl_meta(None)
+        # Under EQUITY_ONLY the main-dex universe is never used, so don't pay for
+        # it (20 weight, x3 on HL's frequent null bodies).
+        main_univ = [] if EQUITY_ONLY else (await self._hl_meta(None))[0]
         xyz_bases = {a.get("name", "").split(":")[-1]
                      for a in xyz_univ if a.get("name")}
         main_bases = {a.get("name", "").split(":")[-1]
@@ -265,8 +267,24 @@ class Capturer:
             except Exception:
                 pass
             return overlap
-        # Fallback: the persisted (equity) universe from the live bot.
+        # Fallback: the persisted universe from the live bot. NOTE this file is
+        # NOT equity-only — the trader's auto-discovery appended every crypto
+        # overlap to it, and its hl_coin column is hardcoded "xyz:<sym>" so it
+        # can't be used to classify. So the EQUITY_ONLY filter has to be applied
+        # here too, from the persisted crypto set: a single failed xyz meta call
+        # otherwise silently restored the whole 201-name crypto universe (which
+        # is exactly what happened on the first deploy of this change).
         csv_syms = _load_universe_csv()
+        if csv_syms and EQUITY_ONLY:
+            try:
+                from config import is_crypto_symbol
+                before = len(csv_syms)
+                csv_syms = [s for s in csv_syms if not is_crypto_symbol(s)]
+                if before != len(csv_syms):
+                    log.info(f"discover: EQUITY_ONLY dropped {before - len(csv_syms)} "
+                             f"crypto name(s) from the CSV fallback")
+            except Exception as e:
+                log.warning(f"discover: EQUITY_ONLY fallback filter failed ({e})")
         if csv_syms:
             log.warning(f"discover: live query empty (HL xyz={len(xyz_bases)} "
                         f"main={len(main_bases)} Aster={len(aster_bases)}) — using "
