@@ -300,11 +300,16 @@ class Capturer:
 
     async def _hl_ctxs(self) -> dict:
         """canonical base -> {mid, mark, oracle, funding} for the captured
-        universe, from BOTH HL dexes (xyz equities + main-dex crypto). Two batch
-        calls. xyz wins on a same-ticker collision (matches discover())."""
+        universe. xyz wins on a same-ticker collision (matches discover()).
+
+        Under EQUITY_ONLY the main-dex call is skipped: nothing in the sweep comes
+        from it, so it was 20 weight/cycle (x3 on the retries HL's null bodies
+        trigger) spent on names we no longer record.
+        """
         wanted = set(self.symbols)
         out: dict = {}
-        for dex in ("xyz", None):
+        dexes = ("xyz",) if EQUITY_ONLY else ("xyz", None)
+        for dex in dexes:
             univ, ctxs = await self._hl_meta(dex)
             for i, asset in enumerate(univ):
                 base = asset.get("name", "").split(":")[-1]
