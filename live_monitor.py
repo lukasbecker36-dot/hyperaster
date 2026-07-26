@@ -42,6 +42,7 @@ from config import (
     EXIT_TARGET_NET_USD_BY_SYMBOL, MAX_FUNDING_DRAG_USD,
     BASIS_ADVERSE_STOP_USD,
     MANUAL_ENTRY_GATE_TIMEOUT_MIN, aster_symbol_for, ASTER_BASE_TO_CANON,
+    EQUITY_ONLY, CRYPTO_TRADING_ENABLED,
     fmt_px,
 )
 
@@ -391,14 +392,6 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     if blocked:
         log.info(f"Excluded blocked symbols: {blocked}")
 
-    log.info("=" * 70)
-    log.info("EQUITY PERP ARB MONITOR — Aster vs Hyperliquid XYZ")
-    log.info(f"Mode:         {'PAPER' if paper_mode else 'LIVE'}")
-    log.info(f"Symbols ({len(symbols)}): {symbols}")
-    log.info(f"Poll:         {POLL_INTERVAL_SECONDS}s main | {ASTER_FILL_POLL_SECONDS}s Aster fill poll")
-    log.info(f"Max positions: {MAX_CONCURRENT_POSITIONS}")
-    log.info("=" * 70)
-
     init_db()
 
     try:
@@ -416,10 +409,41 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             log.error(f"Cannot start live: {e}")
             return
 
+    client = ExchangeClient(api_keys)
+
+    # EQUITY_ONLY: drop non-xyz (main-dex crypto) names BEFORE start(), so we
+    # don't pay spec loading, tick inference or the candle warmup for them — the
+    # warmup is an unbounded gather of candleSnapshot per name and was the single
+    # biggest HL burst at startup (178 names, only 106 warmed).
+    if EQUITY_ONLY:
+        xyz_bases = await client.hl_xyz_bases()
+        if xyz_bases:
+            dropped = [s for s in symbols if s not in xyz_bases]
+            symbols = [s for s in symbols if s in xyz_bases]
+            if dropped:
+                log.info(f"EQUITY_ONLY: excluded {len(dropped)} non-equity name(s) "
+                         f"from the universe: {dropped}")
+        else:
+            # Don't narrow on a failed lookup — that would silently trade a
+            # 26-name universe because one HL call got rate-limited.
+            log.warning("EQUITY_ONLY set but the HL xyz universe fetch failed — "
+                        "keeping the full universe this run")
+
+    log.info("=" * 70)
+    log.info("EQUITY PERP ARB MONITOR — Aster vs Hyperliquid XYZ")
+    log.info(f"Mode:         {'PAPER' if paper_mode else 'LIVE'}")
+    log.info(f"Universe:     {'EQUITY ONLY' if EQUITY_ONLY else 'equity + crypto'}"
+             f" | crypto orders {'REFUSED' if not CRYPTO_TRADING_ENABLED else 'allowed'}")
+    log.info(f"Symbols ({len(symbols)}): {symbols}")
+    log.info(f"Poll:         {POLL_INTERVAL_SECONDS}s main | {ASTER_FILL_POLL_SECONDS}s Aster fill poll")
+    log.info(f"Max positions: {MAX_CONCURRENT_POSITIONS}")
+    log.info("=" * 70)
+
     # Load specs for EVERY open position, even ones outside the startup universe
-    # (blocked names, or auto-discovered symbols not yet in overlap_symbols.csv).
-    # Without this, an open position on such a symbol can't be exited — the HL
-    # asset index is never loaded (observed: DKNG "HL asset index not found").
+    # (blocked names, auto-discovered symbols not yet in overlap_symbols.csv, or
+    # a crypto position opened before EQUITY_ONLY was set). Without this, an open
+    # position on such a symbol can't be exited — the HL asset index is never
+    # loaded (observed: DKNG "HL asset index not found").
     pm_preload = PositionManager(paper_mode=paper_mode)
     open_pos_syms = set(pm_preload.positions.keys())
     extra_pos_syms = open_pos_syms - set(symbols)
@@ -427,7 +451,6 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
         log.info(f"Open positions outside startup universe (loading specs for exit): {extra_pos_syms}")
     all_load_syms = list(dict.fromkeys(symbols + list(open_pos_syms)))
 
-    client = ExchangeClient(api_keys)
     await client.start(all_load_syms)
 
     # Persist the discovered crypto set so fee helpers (and client-less scripts)
@@ -1248,7 +1271,9 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
         """Re-query both venues for the current overlap and add any newly-listed
         equity perp that appears on BOTH exchanges to the live universe. Loads its
         specs and warms its baseline so the scanner can pick it up on the next slow
-        scan. Excluded names (BLOCKED/NON_EQUITY) are skipped."""
+        scan. Excluded names (BLOCKED/NON_EQUITY) are skipped, and under
+        EQUITY_ONLY so is anything outside the xyz dex — otherwise this hourly
+        sweep would quietly re-add every crypto overlap an hour after startup."""
         try:
             overlap = await client.discover_overlap_bases()
         except Exception as e:
@@ -1256,6 +1281,13 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
             return
         if not overlap:
             return
+        if EQUITY_ONLY:
+            xyz_bases = await client.hl_xyz_bases()
+            if not xyz_bases:
+                log.warning("auto-discovery: xyz universe unavailable — skipping "
+                            "this round rather than risk adding crypto names")
+                return
+            overlap = {s for s in overlap if s in xyz_bases}
         known = set(symbols)
         new = sorted(overlap - known - exclude)
         if not new:

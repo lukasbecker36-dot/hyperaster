@@ -10,7 +10,13 @@ WorkingDirectory=/opt/hyperaster
 # by the retention prune (--retention-hours, default 72h), so the DB plateaus.
 # Backs off its per-name HL l2Book fetches while the trader has a manual gate
 # armed (data/gate_active flag) so it can't rate-limit the gate's book read.
-ExecStart=/opt/hyperaster/.venv/bin/python scripts/capture_orderbooks.py --max-hours 0
+# --hl-books-per-sec 4 (not the 7 default): HL's info limit is 1200 weight/min
+# per IP and l2Book is weight 2, so 7/s = 840 weight/min = 70% of the whole
+# budget, permanently — which is what was starving the trader (78x 429/hour
+# observed). 4/s = 480 weight/min leaves ~720 for the trader's own book reads.
+# Combined with EQUITY_ONLY (~40 names, not 210) the sweep is still ~10s/name,
+# far better than the 30s the crypto-inclusive universe gave.
+ExecStart=/opt/hyperaster/.venv/bin/python scripts/capture_orderbooks.py --max-hours 0 --hl-books-per-sec 4
 Restart=always
 RestartSec=10
 StandardOutput=journal

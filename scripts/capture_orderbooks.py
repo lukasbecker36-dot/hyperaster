@@ -56,7 +56,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import (
     HYPERLIQUID_API, ASTER_BASE, ASTER_EXCHANGE_INFO_URL, DATA_DIR, OUTPUT_DIR,
-    NON_EQUITY_SYMBOLS, ASTER_BASE_TO_CANON, aster_symbol_for,
+    NON_EQUITY_SYMBOLS, ASTER_BASE_TO_CANON, aster_symbol_for, EQUITY_ONLY,
 )
 
 ASTER_BOOKTICKER_URL = f"{ASTER_BASE}/fapi/v1/ticker/bookTicker"
@@ -227,15 +227,23 @@ class Capturer:
         main_bases = {a.get("name", "").split(":")[-1]
                       for a in main_univ if a.get("name")}
         aster_bases = await self._aster_universe()
-        overlap = sorted(((xyz_bases | main_bases) & aster_bases)
-                         - set(NON_EQUITY_SYMBOLS))
+        # Under EQUITY_ONLY, capture only the xyz dex. Note this does NOT reduce
+        # HL request rate — _effective_interval() holds the sweep at
+        # hl_books_per_sec regardless of N — it buys RESOLUTION: 210 names is one
+        # snap per 30s, ~40 equities is one per ~6s. That matters because the
+        # entry gates are set from the p90 of this series, and coarse sampling
+        # truncates its tails (observed: SKHX went 4.5s -> 30s when crypto landed).
+        hl_bases = xyz_bases if EQUITY_ONLY else (xyz_bases | main_bases)
+        overlap = sorted((hl_bases & aster_bases) - set(NON_EQUITY_SYMBOLS))
         if overlap:
-            # Non-destructive on a PARTIAL HL failure: if one dex's meta came back
-            # empty (HL frequently nulls a single request), don't drop the names
-            # we already had from it — union with the current universe so a
-            # transient blip can't shrink us back to equity-only. Keeping a
-            # briefly-delisted name is harmless (its book just reads empty).
-            if (not xyz_bases or not main_bases) and self.symbols:
+            # Non-destructive on a PARTIAL HL failure: if a needed dex's meta came
+            # back empty (HL frequently nulls a single request), don't drop the
+            # names we already had from it — union with the current universe so a
+            # transient blip can't shrink the sweep. Keeping a briefly-delisted
+            # name is harmless (its book just reads empty). Under EQUITY_ONLY only
+            # the xyz leg matters, so a main-dex blip is not a failure at all.
+            hl_incomplete = (not xyz_bases) if EQUITY_ONLY else (not xyz_bases or not main_bases)
+            if hl_incomplete and self.symbols:
                 overlap = sorted(set(overlap) | set(self.symbols))
             # Classify: an equity (xyz) listing takes precedence over a same-
             # ticker main-dex name (real tickers rarely collide). Preserve prior

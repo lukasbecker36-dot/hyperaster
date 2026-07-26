@@ -56,6 +56,25 @@ CRYPTO_CARRY_ROUND_TRIP_FEE = 2 * HL_MAKER_FEE + 2 * ASTER_CRYPTO_TAKER_FEE
 # CRYPTO_TRADING_ENABLED=false in the env to disable without a code change.
 CRYPTO_TRADING_ENABLED = os.getenv("CRYPTO_TRADING_ENABLED", "true").lower() in ("1", "true", "yes")
 
+# Restrict the trading + capture UNIVERSE to HIP-3 equity perps (the xyz dex).
+# Independent of CRYPTO_TRADING_ENABLED, which only gates order placement:
+# this keeps crypto names out of the scanner, the candle warmup and the capture
+# sweep entirely.
+#
+# Why on by default: a crypto round trip costs 11.0bps (2x Aster's 4bp crypto
+# taker) vs 4.8bps on stock perps, and the crypto overlap is either
+# liquid-with-no-edge (ETH: 1bp spread, p90 round trip +3bps) or
+# edge-with-no-liquidity (NOT: $22k/day volume; TURBO: $86 at the Aster touch).
+# Worse, carrying 151 crypto names cut EQUITY capture resolution 6.7x
+# (4.5s -> 30s per name), which truncates the tails of the p90 distribution the
+# entry gates are set from — so it actively degraded the strategy that works.
+#
+# Set EQUITY_ONLY=false to widen again. Worth revisiting if Aster extends the 0%
+# maker/taker promo to crypto: 8 of those 11bps are the two Aster taker
+# crossings, so crypto round trips would drop to ~3bps and names like ETH and
+# XMR would become interesting.
+EQUITY_ONLY = os.getenv("EQUITY_ONLY", "true").lower() in ("1", "true", "yes")
+
 
 def _is_crypto_symbol(symbol: str) -> bool:
     """Best-effort crypto classification for fee selection in contexts without a
@@ -63,6 +82,13 @@ def _is_crypto_symbol(symbol: str) -> bool:
     persists on discovery (data/crypto_symbols.json), else False (equity).
     The live trader passes authoritative per-symbol info where it can."""
     return symbol in _load_crypto_symbols()
+
+
+def is_crypto_symbol(symbol: str) -> bool:
+    """Public name for the persisted crypto classification. Used by the screeners
+    to exclude crypto under EQUITY_ONLY, so a name's inclusion and the fee shown
+    for it always come from the same source."""
+    return _is_crypto_symbol(symbol)
 
 
 _CRYPTO_SET_CACHE: dict = {"ts": 0.0, "set": set()}
@@ -88,16 +114,26 @@ def _load_crypto_symbols() -> set:
 
 def save_crypto_symbols(syms) -> None:
     """Persist the discovered main-dex crypto set so fee helpers in client-less
-    contexts (scripts, P&L) classify correctly. Atomic write; best-effort."""
+    contexts (scripts, P&L) classify correctly. Atomic write; best-effort.
+
+    UNIONS with what is already on disk rather than replacing it. Under
+    EQUITY_ONLY the trader loads no crypto specs, so crypto_symbols() returns
+    empty — a plain overwrite would blank the file, and since the screeners use
+    it to EXCLUDE crypto, the exclusion would silently switch itself off on the
+    next run. A name never stops being crypto, so the union is correct, and its
+    failure mode (a name wrongly retained as crypto is merely excluded) is the
+    safe one.
+    """
     import json
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         path = os.path.join(DATA_DIR, "crypto_symbols.json")
+        merged = set(_load_crypto_symbols()) | set(syms)
         tmp = path + ".tmp"
         with open(tmp, "w") as fh:
-            json.dump(sorted(syms), fh)
+            json.dump(sorted(merged), fh)
         os.replace(tmp, path)
-        _CRYPTO_SET_CACHE.update(ts=0.0, set=set(syms))  # invalidate cache
+        _CRYPTO_SET_CACHE.update(ts=0.0, set=merged)  # invalidate cache
     except Exception:
         pass
 

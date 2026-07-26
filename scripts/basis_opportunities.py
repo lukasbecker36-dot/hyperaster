@@ -8,21 +8,27 @@ For each name, from the capture DB (orderbook_capture.db):
     buy_hl_leg  = (aster_bid − hl_bid)/mid × 10⁴   (ENTER L-HL/S-AST · EXIT L-AST/S-HL)
     buy_ast_leg = (hl_ask − aster_ask)/mid × 10⁴   (ENTER L-AST/S-HL · EXIT L-HL/S-AST)
     sum   = p90(buy_hl) + p90(buy_ast)   — round trip if you catch both spikes
-Then, for the leading candidates, the 24h SETTLED funding is fetched from both
-venues (real settlements, correct Aster window) and the net carry per day is
-computed for each hold direction:
-    carry(L-AST/S-HL) = hl_1h·24 − ast_window·settles_per_day   (bps/day)
+Carry uses the 24h average funding from the capture DB, normalised with each
+candidate's REAL Aster settlement window (detected from settlement timestamps,
+shown as `win`):
+    carry(L-AST/S-HL) = hl_1h·24 − ast_per_window·(24/window)   (bps/day)
     carry(L-HL/S-AST) = the negative
 The displayed carry/hold is the BETTER direction — the one you'd sit in while
 waiting between entry and exit spikes. Final ranking:
-    score = sum + best_carry   (round trip + one day of carry)
+    score = sum + best_carry + min(0, floor)
 ★ marks the "might work straight away" names: sum clears round-trip fees AND
-the hold direction has positive carry.
+the hold direction has positive carry AND the floor is sound.
+
+Scope: NON_EQUITY is always excluded; BLOCKED is excluded unless --blocked (the
+capture DB keeps blocked names so they can be re-evaluated from data, but they
+must not appear in a "what should I trade" ranking); crypto is excluded when
+EQUITY_ONLY is set.
 
 Still an optimistic screener (assumes you time both spikes) — /basis SYM for
-the full pre-trade picture on one name.
+the full pre-trade picture on one name, and check book DEPTH before sizing: a
+name can clear fees on paper and have $86 at the touch.
 
-Usage: python scripts/basis_opportunities.py [N]     (default 5)
+Usage: python scripts/basis_opportunities.py [N] [--blocked]     (default 5)
 """
 
 import os
@@ -34,8 +40,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from config import (DATA_DIR, NON_EQUITY_SYMBOLS, CARRY_ROUND_TRIP_FEE,
-                    carry_round_trip_fee)
+from config import (DATA_DIR, NON_EQUITY_SYMBOLS, BLOCKED_SYMBOLS,
+                    CARRY_ROUND_TRIP_FEE, carry_round_trip_fee,
+                    aster_symbol_for, ASTER_BASE, EQUITY_ONLY, is_crypto_symbol)
 
 CAPTURE_DB = os.path.join(DATA_DIR, "orderbook_capture.db")
 DAY_MS = 24 * 3_600_000
@@ -49,6 +56,50 @@ FEE_BPS = CARRY_ROUND_TRIP_FEE * 10000   # maker-HL/taker-Ast round trip ≈ 4.8
 # Floor (sit-level round trip) below this = wide/one-sided book (a missed exit
 # spike is a loss). LLY's floor was ~-3.5 (fine); ZHIPU's ~-24 (trap).
 FLOOR_MIN_BPS = -10.0
+
+
+def _aster_windows(symbols, workers=8):
+    """{symbol: Aster funding settlement window in hours}, detected from the gaps
+    between real settlement timestamps — the same method /basis uses.
+
+    The window is NOT stored in the capture DB, and this used to assume 8h
+    (3 settlements/day). Every name checked actually settles HOURLY, which
+    understated the Aster leg 8x. That matters most where the two venues' rates
+    nearly cancel — i.e. it manufactured carry out of near-neutral funding: ACE
+    displayed +43.1bps/day against a true +2.6. Names with a genuinely one-sided
+    skew (SAGA, +89.5) were right either way, so the error quietly reordered the
+    ranking instead of breaking it visibly.
+
+    A symbol is ABSENT from the result if detection failed, so the caller shows
+    carry as unknown rather than guessing. Aster-side calls only — this does not
+    touch the HL weight budget.
+    """
+    import json as _json
+    import urllib.request
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(sym):
+        url = (f"{ASTER_BASE}/fapi/v1/fundingRate?symbol={aster_symbol_for(sym)}"
+               f"&startTime={int(time.time() * 1000) - 48 * 3_600_000}")
+        try:
+            with urllib.request.urlopen(url, timeout=10) as r:
+                rows = _json.loads(r.read())
+            times = sorted(int(x.get("fundingTime") or 0)
+                           for x in (rows or []) if isinstance(x, dict))
+            gaps = [(b - a) / 3_600_000 for a, b in zip(times, times[1:]) if b > a]
+            if not gaps:
+                return sym, None
+            gaps.sort()
+            return sym, gaps[len(gaps) // 2]        # median gap
+        except Exception:
+            return sym, None
+
+    out = {}
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for sym, win in ex.map(one, symbols):
+            if win and win > 0:
+                out[sym] = win
+    return out
 
 
 def _percentile(xs, p):
@@ -81,8 +132,11 @@ def _ensure_cover_index():
         pass
 
 
-def _load_p90s():
-    """capture DB → [(sym, p90sum, n, carry, floor)] per name.
+def _load_p90s(include_blocked: bool = False):
+    """capture DB → [(sym, p90sum, n, hl_funding_avg, aster_funding_avg, floor)]
+    per name. Carry is NOT computed here — it needs each name's real Aster
+    settlement window, which run() detects.
+
     floor = avg(buy_hl) + avg(buy_ast) = the sit-level round trip (≈ HL spread −
     Aster spread). Near 0 = tight symmetric books, so a missed exit spike bails
     ~breakeven; deep negative = wide/one-sided book (Aster book much wider), so
@@ -114,7 +168,17 @@ def _load_p90s():
     # Stream the cursor — don't fetchall — so we never hold the full result set
     # AND the per-symbol lists at once.
     for sym, hb, ha, ab, aa, hf, af in conn.execute(sql, params):
+        # NON_EQUITY is always dropped. BLOCKED is dropped unless the caller asks
+        # to re-evaluate them (the capture DB keeps them on purpose for that) —
+        # without this the screener recommended names the trader refuses to touch
+        # (observed: SPCX, in BLOCKED_SYMBOLS, ranked 11th). Crypto is dropped
+        # under EQUITY_ONLY, using the same classifier that picks the fee, so a
+        # name's inclusion and its displayed cost can never disagree.
         if sym in NON_EQUITY_SYMBOLS:
+            continue
+        if not include_blocked and sym in BLOCKED_SYMBOLS:
+            continue
+        if EQUITY_ONLY and is_crypto_symbol(sym):
             continue
         mid = (hb + ha + ab + aa) / 4
         if mid <= 0:
@@ -132,30 +196,25 @@ def _load_p90s():
             continue
         p90_hl = _percentile(hl_list, 90)
         p90_ast = _percentile(buy_ast[sym], 90)
-        # Net carry (bps/day) of holding L-AST/S-HL, from the captured rates.
-        # HL funding is per-1h; Aster per settlement window. The window isn't
-        # stored, so assume the common 8h (3 settlements/day) — the SIGN and
-        # rough size are right for ranking; /basis SYM gives the exact per-name
-        # number with the detected window. None when funding wasn't captured.
-        carry = None
-        if hl_fund.get(sym) and ast_fund.get(sym):
-            hl_avg = sum(hl_fund[sym]) / len(hl_fund[sym])
-            ast_avg = sum(ast_fund[sym]) / len(ast_fund[sym])
-            carry = (hl_avg * 24 - ast_avg * 3) * 10000
+        # Raw captured funding averages. HL is per-1h; Aster is PER SETTLEMENT
+        # WINDOW, and the window isn't stored here — so carry is computed in
+        # run(), which detects each candidate's real window (see _aster_windows).
+        hl_avg = (sum(hl_fund[sym]) / len(hl_fund[sym])) if hl_fund.get(sym) else None
+        ast_avg = (sum(ast_fund[sym]) / len(ast_fund[sym])) if ast_fund.get(sym) else None
         floor = (sum(buy_hl[sym]) / len(hl_list)
                  + sum(buy_ast[sym]) / len(buy_ast[sym]))
-        ranked.append((sym, p90_hl + p90_ast, len(hl_list), carry, floor))
+        ranked.append((sym, p90_hl + p90_ast, len(hl_list), hl_avg, ast_avg, floor))
     ranked.sort(key=lambda r: r[1], reverse=True)
     return ranked
 
 
-def run(top: int):
+def run(top: int, include_blocked: bool = False):
     if not os.path.exists(CAPTURE_DB):
         print("🎯 No capture DB yet — start scripts/capture_orderbooks.py and let "
               "it run a while first.")
         return
     try:
-        ranked = _load_p90s()
+        ranked = _load_p90s(include_blocked)
     except Exception as e:
         print(f"🎯 capture DB read failed: {e}")
         return
@@ -165,8 +224,18 @@ def run(top: int):
         return
 
     candidates = ranked[:max(top * 3, 12)]
+    # Detect each candidate's real Aster settlement window before computing carry.
+    windows = _aster_windows([c[0] for c in candidates])
     scored = []
-    for sym, s, n, c_ashl, floor in candidates:  # c_ashl = carry holding L-AST/S-HL
+    for sym, s, n, hl_avg, ast_avg, floor in candidates:
+        # carry(L-AST/S-HL) = short HL earns hl_1h*24, long Aster pays
+        # ast_per_window * settlements_per_day. Unknown (not guessed) if funding
+        # wasn't captured or the window couldn't be detected.
+        win = windows.get(sym)
+        if hl_avg is None or ast_avg is None or not win:
+            c_ashl = None
+        else:
+            c_ashl = (hl_avg * 24 - ast_avg * (24.0 / win)) * 10000
         if c_ashl is None:
             best_carry, hold = None, "?"
         elif c_ashl >= -c_ashl:   # better hold direction + its carry
@@ -180,7 +249,7 @@ def run(top: int):
         scored.append((sym, s, best_carry, hold, floor, score, n))
     scored.sort(key=lambda r: r[5], reverse=True)
 
-    hdr = f"{'#':>2} {'SYM':<7}{'sum':>6}{'floor':>7}{'c/d':>7} {'hold':<6}{'n':>6}"
+    hdr = f"{'#':>2} {'SYM':<7}{'sum':>6}{'floor':>7}{'c/d':>7} {'hold':<6}{'win':>5}{'n':>6}"
     lines = ["🎯 Top basis opportunities (bps)", hdr, "─" * len(hdr)]
     for i, (sym, s, carry, hold, floor, score, n) in enumerate(scored[:top], 1):
         # ★ = spread clears fees AND positive carry AND a sound floor (tight
@@ -193,27 +262,42 @@ def run(top: int):
         elif bad_floor:
             star = " ⚠"
         c_str = f"{carry:>+7.1f}" if carry is not None else f"{'?':>7}"
+        w = windows.get(sym)
+        w_str = f"{w:>4.0f}h" if w else f"{'?':>5}"
         lines.append(f"{i:>2} {sym:<7}{s:>+6.0f}{floor:>+7.0f}{c_str} "
-                     f"{hold:<6}{_fmt_n(n):>6}{star}")
+                     f"{hold:<6}{w_str}{_fmt_n(n):>6}{star}")
     lines.append("─" * len(hdr))
     lines.append("sum = p90 round trip (catch both spikes). floor = sit-level")
     lines.append("round trip (avg of both legs) — near 0 = tight symmetric book,")
     lines.append(f"a missed exit bails ~breakeven; ⚠ = < {FLOOR_MIN_BPS:.0f} = "
                  f"wide/one-sided")
     lines.append("book, missed exit is a LOSS (no ★). c/d = ~net carry/day of the")
-    lines.append("BETTER hold (8h Aster window assumed). Rank = sum + carry + floor.")
+    lines.append("BETTER hold, using each name's DETECTED Aster window (win).")
+    lines.append("Rank = sum + carry + floor. '?' carry = funding or window")
+    lines.append("unknown — not guessed.")
     lines.append(f"★ = sum > fees (equity {FEE_BPS:.0f}bp / crypto higher) + "
                  f"positive carry + sound floor —")
     lines.append("spread to earn, paid to wait, breakeven if the exit's slow.")
+    scope = []
+    if EQUITY_ONLY:
+        scope.append("equity only (EQUITY_ONLY)")
+    scope.append("BLOCKED shown" if include_blocked else "BLOCKED excluded")
+    lines.append("scope: " + ", ".join(scope) + ".")
     lines.append("/basis SYM for exact carry + window before trading.")
     print("\n".join(lines))
 
 
 def main():
     top = 5
-    if len(sys.argv) > 1 and sys.argv[1].isdigit():
-        top = max(1, min(int(sys.argv[1]), 20))
-    run(top)
+    args = sys.argv[1:]
+    # --blocked re-includes BLOCKED_SYMBOLS: the capture DB keeps them so they can
+    # be re-evaluated from data, but they must not show up in the normal ranking.
+    include_blocked = any(a in ("--blocked", "--include-blocked") for a in args)
+    for a in args:
+        if a.isdigit():
+            top = max(1, min(int(a), 20))
+            break
+    run(top, include_blocked)
 
 
 if __name__ == "__main__":

@@ -215,9 +215,48 @@ class ExchangeClient:
         # exist on that dex" — the two were conflated into one guessed warning.
         self._hl_429_last: dict[str, int] = {}
 
+        # Cached HL xyz (equity) universe, populated on first hl_xyz_bases() call.
+        # None = not yet fetched (vs an empty set, which would mean "no equities").
+        self._hl_xyz_bases: set[str] | None = None
+
+    async def ensure_session(self):
+        """Open the HTTP session if it isn't already. Lets a caller query the
+        venues (e.g. to narrow the universe) BEFORE paying for start()'s spec
+        load, tick inference and candle warmup."""
+        if self.session is None:
+            self.session = aiohttp.ClientSession()
+
+    async def hl_xyz_bases(self) -> set[str]:
+        """Bases listed on the HL xyz (HIP-3 equity) dex — the authoritative
+        equity list, in one cheap call. Cached for the process lifetime.
+
+        Deliberately not derived from data/crypto_symbols.json: that file is a
+        persisted cache, and using it to decide the universe would make the
+        universe depend on state the universe filter itself writes. Empty set on
+        failure so the caller can choose not to narrow rather than narrow wrongly.
+        """
+        if self._hl_xyz_bases is not None:
+            return self._hl_xyz_bases
+        await self.ensure_session()
+        try:
+            async with self.session.post(
+                HYPERLIQUID_API,
+                json={"type": "metaAndAssetCtxs", "dex": "xyz"},
+                timeout=self.timeout,
+            ) as r:
+                data = await r.json()
+            bases = {a.get("name", "").split(":")[-1]
+                     for a in data[0].get("universe", []) if a.get("name")}
+            if bases:
+                self._hl_xyz_bases = bases
+            return bases
+        except Exception as e:
+            log.error(f"HL xyz universe fetch failed ({e})")
+            return set()
+
     async def start(self, symbols: list[str]):
         """Load specs for all symbols."""
-        self.session = aiohttp.ClientSession()
+        await self.ensure_session()
         # Load xyz equity specs first so is_hl_crypto() is correct before the
         # main-dex loader (which skips names already claimed as equities), then
         # fill in any remaining names from the main (crypto) dex.
