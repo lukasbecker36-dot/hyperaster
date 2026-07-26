@@ -50,47 +50,106 @@ DAY_MS = 24 * 3_600_000
 _HL_DEX_CACHE: dict = {}
 
 
-async def _hl_dex(session, symbol):
+# Why the last HL book read failed, for the caller's message. HL returns a
+# 200-with-null-body under pressure as often as a 429, so "empty" alone is not a
+# diagnosis — and blaming rate limits when the real cause was a wrong dex cost
+# real debugging time.
+_HL_BOOK_ERR: dict = {}
+
+
+async def _hl_dex(session, symbol, retries=2):
     """Which HL dex lists this symbol: 'xyz' (HIP-3 equity) or '' (main-dex
-    crypto). Checks the xyz universe first, then main; defaults to 'xyz'."""
+    crypto). Checks the xyz universe first, then main.
+
+    Retries: a single null/429 body used to fall straight through to the 'xyz'
+    default, which is silently WRONG for a main-dex crypto name — the resulting
+    'xyz:BTC' read comes back empty and got reported as a rate limit. Returns
+    None when both dexes are genuinely unreachable so the caller can say so
+    instead of guessing.
+    """
     if symbol in _HL_DEX_CACHE:
         return _HL_DEX_CACHE[symbol]
-    for dex in ("xyz", None):
-        body = {"type": "metaAndAssetCtxs"}
-        if dex:
-            body["dex"] = dex
-        try:
-            async with session.post(HYPERLIQUID_API, json=body) as r:
-                data = await r.json(content_type=None)
-            names = {a.get("name", "").split(":")[-1]
-                     for a in data[0].get("universe", [])}
-            if symbol in names:
-                _HL_DEX_CACHE[symbol] = "xyz" if dex else ""
-                return _HL_DEX_CACHE[symbol]
-        except Exception:
-            pass
-    _HL_DEX_CACHE[symbol] = "xyz"
-    return "xyz"
+    reachable = False
+    for attempt in range(retries + 1):
+        for dex in ("xyz", None):
+            body = {"type": "metaAndAssetCtxs"}
+            if dex:
+                body["dex"] = dex
+            try:
+                async with session.post(HYPERLIQUID_API, json=body) as r:
+                    data = await r.json(content_type=None)
+                if not (isinstance(data, list) and data
+                        and isinstance(data[0], dict)):
+                    continue          # null/error body — not an answer
+                reachable = True
+                names = {a.get("name", "").split(":")[-1]
+                         for a in data[0].get("universe", [])}
+                if symbol in names:
+                    _HL_DEX_CACHE[symbol] = "xyz" if dex else ""
+                    return _HL_DEX_CACHE[symbol]
+            except Exception:
+                pass
+        if reachable:
+            break                     # both universes answered; name isn't listed
+        if attempt < retries:
+            await asyncio.sleep(0.4 * (attempt + 1))
+    if reachable:
+        # Both universes answered and neither lists it — default xyz so the
+        # caller still attempts a read (a brand-new listing can lag the meta).
+        _HL_DEX_CACHE[symbol] = "xyz"
+        return "xyz"
+    return None
 
 
 async def _hl_coin(session, symbol):
-    """HL l2Book/candle coin string for a symbol (dex-aware)."""
-    return f"xyz:{symbol}" if await _hl_dex(session, symbol) == "xyz" else symbol
-
-
-async def _hl_book(session, symbol):
-    async with session.post(HYPERLIQUID_API,
-                            json={"type": "l2Book",
-                                  "coin": await _hl_coin(session, symbol)}) as r:
-        data = await r.json(content_type=None)
-    levels = (data or {}).get("levels", [[], []])
-    bids, asks = levels[0] or [], levels[1] or []
-    if not bids or not asks:
+    """HL l2Book/candle coin string for a symbol (dex-aware). None if the dex
+    could not be determined — do NOT guess, the wrong prefix reads as empty."""
+    dex = await _hl_dex(session, symbol)
+    if dex is None:
         return None
-    b, a = float(bids[0]["px"]), float(asks[0]["px"])
-    if b > a:
-        b, a = a, b
-    return b, a
+    return f"xyz:{symbol}" if dex == "xyz" else symbol
+
+
+async def _hl_book(session, symbol, retries=2):
+    """HL top-of-book, dex-aware, with retries.
+
+    Had no retry at all: one 429 or null body returned None and /basis announced
+    'book unavailable (HL=empty)' for a name whose book was live (observed on
+    SKHX with bid/ask 1219.9/1220.1 on the venue at that moment).
+    """
+    coin = await _hl_coin(session, symbol)
+    if coin is None:
+        _HL_BOOK_ERR[symbol] = ("could not determine which HL dex lists this name "
+                                "(metaAndAssetCtxs unreachable) — not a book problem")
+        return None
+    last = "no levels returned"
+    for attempt in range(retries + 1):
+        try:
+            async with session.post(HYPERLIQUID_API,
+                                    json={"type": "l2Book", "coin": coin}) as r:
+                status = r.status
+                data = await r.json(content_type=None)
+            if status == 429:
+                last = f"HL rate-limited (429) on {coin}"
+            elif not isinstance(data, dict):
+                last = f"HL returned a {type(data).__name__} body for {coin}"
+            else:
+                levels = data.get("levels") or [[], []]
+                bids = (levels[0] if len(levels) > 0 else []) or []
+                asks = (levels[1] if len(levels) > 1 else []) or []
+                if bids and asks:
+                    b, a = float(bids[0]["px"]), float(asks[0]["px"])
+                    if b > a:
+                        b, a = a, b
+                    _HL_BOOK_ERR.pop(symbol, None)
+                    return b, a
+                last = f"{coin} has no resting {'bids' if not bids else 'asks'}"
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
+        if attempt < retries:
+            await asyncio.sleep(0.3 * (attempt + 1))
+    _HL_BOOK_ERR[symbol] = f"{last} (after {retries + 1} attempts)"
+    return None
 
 
 async def _aster_book(session, symbol):
@@ -260,13 +319,25 @@ async def main():
     symbol = sys.argv[1].upper()
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
+        # Resolve the dex ONCE, before the gather. Three of the four coroutines
+        # below call _hl_coin, and on a cold cache each raced to resolve it — up
+        # to 6 concurrent metaAndAssetCtxs (weight 20 apiece) fired at an IP
+        # already carrying the capture sweep. Any one that got throttled took the
+        # old silent 'xyz' fallback. One call up front removes the race and the
+        # burst.
+        await _hl_dex(session, symbol)
         hl, ast, (hl_fr, ast_fr), (hl_fr24, ast_fr24, ast_win_h) = await asyncio.gather(
             _hl_book(session, symbol), _aster_book(session, symbol),
             _funding(session, symbol), _funding_avg_24h(session, symbol),
         )
         if not hl or not ast:
-            print(f"📐 {symbol}: book unavailable "
-                  f"(HL={'ok' if hl else 'empty'}, Aster={'ok' if ast else 'empty'})")
+            why = []
+            if not hl:
+                why.append("HL: " + _HL_BOOK_ERR.get(symbol, "no book"))
+            if not ast:
+                why.append(f"Aster: {aster_symbol_for(symbol)} returned no "
+                           f"top-of-book")
+            print(f"📐 {symbol}: book unavailable\n  " + "\n  ".join(why))
             return
         avg = _avg_from_capture(symbol) or await _avg_from_candles(session, symbol)
 
