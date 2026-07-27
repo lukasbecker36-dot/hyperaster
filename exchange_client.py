@@ -720,11 +720,35 @@ class ExchangeClient:
             body = {"type": "metaAndAssetCtxs"}
             if dex:
                 body["dex"] = dex
+            # Retry: HL returns a null/short body under load often enough that
+            # this was failing every ~15min for 9h straight ("'NoneType' object is
+            # not subscriptable" — data[0] on a null). Each failure silently left
+            # the oracle cache STALE, which is what the fair-value correction and
+            # the staleness guard both read, so entries were being judged against
+            # hours-old oracle prices without anything saying so.
+            data = None
+            for attempt in range(3):
+                try:
+                    async with self.session.post(
+                        HYPERLIQUID_API, json=body, timeout=self.timeout,
+                    ) as r:
+                        d = await r.json(content_type=None)
+                    if isinstance(d, list) and len(d) >= 2 and isinstance(d[0], dict):
+                        data = d
+                        break
+                except Exception as e:
+                    log.debug(f"HL {dex or 'main'} ctxs attempt {attempt + 1}: {e}")
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+            if data is None:
+                newest = max((t for _, t in self._hl_oracle_cache.values()), default=0)
+                age = (f"{(now_ms() - newest) / 1000:.0f}s stale" if newest
+                       else "EMPTY — no oracle prices at all")
+                log.warning(
+                    f"HL {dex or 'main'} oracle refresh failed after 3 attempts "
+                    f"(null/short body) — cache is {age}")
+                continue
             try:
-                async with self.session.post(
-                    HYPERLIQUID_API, json=body, timeout=self.timeout,
-                ) as r:
-                    data = await r.json()
                 meta, ctxs = data[0], data[1]
                 now = now_ms()
                 for i, asset in enumerate(meta.get("universe", [])):
@@ -739,7 +763,7 @@ class ExchangeClient:
                         except (TypeError, ValueError):
                             pass
             except Exception as e:
-                log.warning(f"Failed to refresh HL {dex or 'main'} oracle prices: {e}")
+                log.warning(f"Failed to parse HL {dex or 'main'} oracle ctxs: {e}")
         log.debug(f"HL oracle prices refreshed for {len(self._hl_oracle_cache)} symbols")
 
     def get_hl_oracle(self, symbol: str) -> float:

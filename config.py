@@ -222,6 +222,22 @@ LIQUIDITY_GUARD_ENABLED = True
 MIN_TOB_NOTIONAL_USD = 20.0      # min top-of-book depth on the thinner side, each venue
 MAX_VENUE_SPREAD_BPS = 150.0     # reject if either venue's own spread exceeds this
 
+# A flat spread cap can't see a DISORDERLY book. On 2026-07-27 HL dumped ~7% in
+# ten seconds while Aster held: HL's spread went to 129bps against Aster's 0.3bps
+# — 140x SKHX's normal ~1bp HL spread — yet stayed under the 150bps cap, so the
+# entry proceeded and the post-only was rejected ("would have immediately
+# matched, bbo was 1033@1046.1") on a price computed 3s earlier. The two venues
+# track the same underlying, so a large ASYMMETRY between their spreads means one
+# book has broken down, whatever the absolute level.
+MAX_VENUE_SPREAD_RATIO = 8.0     # one venue's spread vs the other's
+SPREAD_ASYMMETRY_FLOOR_BPS = 20.0  # ...only applied once the wider one exceeds this
+
+# Entry decision -> order placement is several sequential API calls (leverage,
+# margin pre-flight, both position snapshots). In a fast market the maker price
+# computed at the start is stale by the time HL sees it. Re-fetch immediately
+# before placing and abort if the HL mid has run further than this.
+ENTRY_MAX_DRIFT_BPS = 25.0
+
 # After a symbol exits on a stop (stop_loss/adverse/timeout/funding_drag), block
 # re-entry on it for this long. Stops the fee-bleeding churn of re-entering the
 # same non-reverting dislocation over and over (observed: 3× QCOM stop_loss in a

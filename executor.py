@@ -34,6 +34,7 @@ from config import (
     EXIT_TARGET_NET_USD, EXIT_TARGET_NET_USD_BY_SYMBOL,
     MAKER_ENTRY_TIMEOUT_SEC, MAKER_REPRICE_TICK_FRAC,
     LIQUIDITY_GUARD_ENABLED, MIN_TOB_NOTIONAL_USD, MAX_VENUE_SPREAD_BPS,
+    MAX_VENUE_SPREAD_RATIO, SPREAD_ASYMMETRY_FLOOR_BPS, ENTRY_MAX_DRIFT_BPS,
     ENTRY_TAKER_ESCALATION_ENABLED, STOP_COOLDOWN_MINUTES,
     AUTO_TRADE_ONLY_CALIBRATED, HL_EXIT_IOC_BUFFER_BPS, LEVERAGE,
     aster_symbol_for,
@@ -44,6 +45,24 @@ from auth import now_ms
 log = logging.getLogger(__name__)
 
 ASTER_TERMINAL_STATUSES = {"FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}
+
+
+def _entry_basis_bps(direction: str, aster_book, hl_book):
+    """Executable ENTRY basis (bps, in your favour) — the mirror of
+    _exit_basis_bps, same maker-HL/taker-Aster convention as
+    live_monitor._carry_basis_bps(action='enter'):
+      enter L-HL/S-AST -> buy-HL leg:  (aster_bid - hl_bid)/mid
+      enter L-AST/S-HL -> buy-AST leg: (hl_ask - aster_ask)/mid
+    None when either book is incomplete."""
+    if (aster_book.bid <= 0 or aster_book.ask <= 0
+            or hl_book.bid <= 0 or hl_book.ask <= 0):
+        return None
+    mid = (aster_book.mid + hl_book.mid) / 2
+    if mid <= 0:
+        return None
+    if direction == "long_hl_short_aster":
+        return (aster_book.bid - hl_book.bid) / mid * 10000
+    return (hl_book.ask - aster_book.ask) / mid * 10000
 
 
 def _exit_basis_bps(direction: str, aster_book, hl_book):
@@ -148,7 +167,7 @@ class Executor:
         self._price_mismatch_warned.discard(symbol)
 
         # Thin-book liquidity guard: skip names too thin/unstable to trade.
-        if not self._book_liquid_enough(symbol, aster_book, hl_book, mid):
+        if not self._book_liquid_enough(symbol, aster_book, hl_book, mid, quiet=True):
             self._entry_streak.pop(symbol, None)
             return False
 
@@ -342,13 +361,22 @@ class Executor:
         log.info(f"{symbol}: convergence maker resting {alo.order_id} @ {fmt_px(hl_ref)} — hedging on fill")
         return True
 
-    def _book_liquid_enough(self, symbol, aster_book, hl_book, mid) -> bool:
-        """Reject entry when either venue's book is too thin or too wide — the
-        thin/unstable-book class (e.g. ZHIPU) that produces wild tick-to-tick
-        prices and big divergence losses. Checks top-of-book notional on the
-        thinner side and each venue's own spread. Only gates AUTO entries."""
+    def _book_liquid_enough(self, symbol, aster_book, hl_book, mid,
+                            quiet: bool = False) -> bool:
+        """Reject entry when either venue's book is too thin, too wide, or
+        DISORDERLY — the thin/unstable-book class (e.g. ZHIPU) that produces wild
+        tick-to-tick prices and big divergence losses, plus the mid-crash case
+        where one venue's book breaks down while the other holds.
+
+        Gates auto AND manual entries. It used to gate auto only, which is how a
+        manual gate fired into a collapsing HL book on 2026-07-27.
+
+        quiet=False logs at warning for manual entries (the operator is waiting
+        on an answer); auto entries keep it at debug to avoid per-tick spam.
+        """
         if not LIQUIDITY_GUARD_ENABLED or mid <= 0:
             return True
+        say = log.debug if quiet else log.warning
         # Top-of-book notional on the thinner side of each venue.
         if MIN_TOB_NOTIONAL_USD > 0:
             a_depth = min(aster_book.bid_size, aster_book.ask_size) * aster_book.mid
@@ -356,19 +384,33 @@ class Executor:
             # Only enforce where we actually have size data (>0); a zero could be
             # a missing field rather than a genuinely empty level.
             if 0 < a_depth < MIN_TOB_NOTIONAL_USD or 0 < h_depth < MIN_TOB_NOTIONAL_USD:
-                log.debug(
+                say(
                     f"{symbol}: thin book — top-of-book Aster ${a_depth:.0f} / HL ${h_depth:.0f} "
                     f"< ${MIN_TOB_NOTIONAL_USD:.0f} floor, skipping"
                 )
                 return False
         # Each venue's own bid-ask spread.
+        a_spread = (aster_book.ask - aster_book.bid) / mid * 10000
+        h_spread = (hl_book.ask - hl_book.bid) / mid * 10000
         if MAX_VENUE_SPREAD_BPS > 0:
-            a_spread = (aster_book.ask - aster_book.bid) / mid * 10000
-            h_spread = (hl_book.ask - hl_book.bid) / mid * 10000
             if a_spread > MAX_VENUE_SPREAD_BPS or h_spread > MAX_VENUE_SPREAD_BPS:
-                log.debug(
+                say(
                     f"{symbol}: wide book — Aster {a_spread:.0f}bps / HL {h_spread:.0f}bps "
                     f"> {MAX_VENUE_SPREAD_BPS:.0f}bps cap, skipping"
+                )
+                return False
+        # Asymmetry: both venues track the same underlying, so one book being
+        # far wider than the other means it has broken down — a crash, a pulled
+        # side, a liquidation sweep — even when neither breaches the flat cap.
+        if MAX_VENUE_SPREAD_RATIO > 0:
+            wide, tight = max(a_spread, h_spread), min(a_spread, h_spread)
+            if (wide > SPREAD_ASYMMETRY_FLOOR_BPS and tight > 0
+                    and wide / tight > MAX_VENUE_SPREAD_RATIO):
+                say(
+                    f"{symbol}: DISORDERLY book — Aster {a_spread:.1f}bps vs HL "
+                    f"{h_spread:.1f}bps ({wide/tight:.0f}x apart, cap "
+                    f"{MAX_VENUE_SPREAD_RATIO:.0f}x). One venue is mid-dislocation; "
+                    f"the basis this implies is not executable. Skipping."
                 )
                 return False
         return True
@@ -439,6 +481,11 @@ class Executor:
                 f"{symbol}: price mismatch {fmt_px(aster_book.mid)} (Ast) vs "
                 f"{fmt_px(hl_book.mid)} (HL), {price_ratio*100:.0f}% apart — refusing"
             )
+        # Manual entries were never liquidity-gated ("Only gates AUTO entries"),
+        # so a gate could fire into a book that had broken down.
+        if not self._book_liquid_enough(symbol, aster_book, hl_book, mid):
+            return False, (f"{symbol}: book not tradeable (thin/wide/disorderly) "
+                           f"— refusing; see log for which check failed")
 
         if direction == "long_hl_short_aster":
             hl_side, aster_side = "buy", "sell"
@@ -1323,6 +1370,7 @@ class Executor:
 
     async def force_entry_maker(
         self, symbol: str, direction: str, notional: float,
+        min_entry_basis: float | None = None,
     ) -> tuple[bool, str]:
         """
         Open a funding-carry hold maker-first: rest a post-only HL order (the
@@ -1450,6 +1498,43 @@ class Executor:
             aster_baseline_amt = float(pre_ap.get("positionAmt", 0) or 0)
         except Exception as e:
             return False, f"{symbol}: Aster pre-position snapshot failed ({e})"
+
+        # ── Re-check on FRESH books immediately before placing ──
+        # Everything above (leverage, Aster margin pre-flight, both position
+        # snapshots) is sequential API work: on 2026-07-27 that took 3s while HL
+        # fell from 1078 to 1046, and the post-only was rejected as "would have
+        # immediately matched, bbo was 1033@1046.1". The exit path has re-validated
+        # like this since the SKHX -30/-44.7 incident; entry never did.
+        try:
+            fresh_ast, fresh_hl = await self.client.get_both_books(symbol)
+        except Exception as e:
+            return False, f"{symbol}: pre-place book re-fetch failed ({e})"
+        if (fresh_ast.bid <= 0 or fresh_ast.ask <= 0
+                or fresh_hl.bid <= 0 or fresh_hl.ask <= 0):
+            return False, f"{symbol}: book went incomplete before placing — aborted"
+        fresh_mid = (fresh_ast.mid + fresh_hl.mid) / 2
+        if not self._book_liquid_enough(symbol, fresh_ast, fresh_hl, fresh_mid):
+            return False, (f"{symbol}: book not tradeable at placement time "
+                           f"(thin/wide/disorderly) — aborted, nothing placed")
+        drift_bps = abs(fresh_hl.mid - hl_book.mid) / hl_book.mid * 10000 if hl_book.mid > 0 else 0
+        if drift_bps > ENTRY_MAX_DRIFT_BPS:
+            return False, (
+                f"{symbol}: HL moved {drift_bps:.0f}bps ({fmt_px(hl_book.mid)} → "
+                f"{fmt_px(fresh_hl.mid)}) between the decision and placement, "
+                f"limit {ENTRY_MAX_DRIFT_BPS:.0f}bps — aborted rather than resting "
+                f"at a stale price")
+        if min_entry_basis is not None:
+            live_basis = _entry_basis_bps(direction, fresh_ast, fresh_hl)
+            if live_basis is None or live_basis < min_entry_basis:
+                return False, (
+                    f"{symbol}: entry basis re-validation FAILED — live "
+                    f"{live_basis if live_basis is not None else float('nan'):.1f}bps "
+                    f"< required {min_entry_basis:.1f}bps (gate fired on a transient) "
+                    f"— nothing placed")
+        # Reprice off the fresh book so the resting order reflects the live touch.
+        hl_tick = self.client.hl_specs.get(symbol, ContractSpec()).tick_size
+        hl_ref_price = ((fresh_hl.bid - hl_tick) if direction == "long_hl_short_aster"
+                        else (fresh_hl.ask + hl_tick))
 
         alo = await self.client.place_hl_alo(symbol, hl_side, qty, hl_ref_price)
         if not alo.success:

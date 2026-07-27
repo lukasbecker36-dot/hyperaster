@@ -1205,13 +1205,24 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                 gate_streaks.pop(("enter", symbol), None)
             if gate_streaks.get(("enter", symbol), 0) >= GATE_CONFIRM_TICKS:
                 gate_streaks.pop(("enter", symbol), None)
+                # Re-validate on the executor's own fresh books just before
+                # placing, same as the exit gate — the decision and the order are
+                # several API calls apart.
+                min_basis = req["target_bps"] - GATE_REVALIDATE_TOL_BPS
                 ok, msg = await executor.force_entry_maker(
-                    symbol, req["direction"], req["notional"]
+                    symbol, req["direction"], req["notional"],
+                    min_entry_basis=min_basis,
                 )
-                pending_entries.pop(symbol, None)
-                send_alert(f"/enter {symbol}: basis {basis:.0f}bps ≥ target "
-                           f"({GATE_CONFIRM_TICKS} ticks) — "
-                           f"{'OK' if ok else 'FAILED'} — {msg}")
+                if ok:
+                    pending_entries.pop(symbol, None)
+                    send_alert(f"/enter {symbol}: basis {basis:.0f}bps ≥ target "
+                               f"({GATE_CONFIRM_TICKS} ticks) — OK — {msg}")
+                else:
+                    # Keep the gate ARMED on failure. It used to be consumed
+                    # regardless, so a book that broke down for a few seconds
+                    # cost you the whole order and you had to re-arm by hand.
+                    send_alert(f"/enter {symbol}: fired at {basis:.0f}bps but did "
+                               f"NOT place — {msg}\nGate stays armed.")
 
         # Exits: close when the executable exit basis clears the target. No expiry —
         # the position's own safety stops close it if the basis stays unfavourable.
