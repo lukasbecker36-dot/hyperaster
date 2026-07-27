@@ -32,6 +32,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src import aster, history, hyperliquid as hl
 from src.fees import ROUND_TRIP_MAKER_BPS, ROUND_TRIP_TAKER_BPS
+from config import gate_is_armed
+from src import aster as _aster_mod, hyperliquid as _hl_mod
 from config import (
     ENTRY_THRESHOLD_BPS_BY_SYMBOL, ENTRY_THRESHOLD_BPS, BLOCKED_SYMBOLS,
     NOTIONAL_PER_LEG, MAX_CONCURRENT_POSITIONS,
@@ -304,7 +306,22 @@ def main() -> None:
                     help="estimated round-trip bid/offer cost bps, both legs (default 15)")
     ap.add_argument("--slots", type=int, default=MAX_CONCURRENT_POSITIONS,
                     help=f"concurrent position cap for portfolio sim (default {MAX_CONCURRENT_POSITIONS})")
+    ap.add_argument("--ignore-gate", action="store_true",
+                    help="run even while the live trader has a basis gate "
+                         "armed (it shares HL's per-IP budget — this can "
+                         "blind the gate)")
     args = ap.parse_args()
+    # Heavy multi-symbol fetch on the trading box shares HL's per-IP weight
+    # budget with the live trader. Stand down while a gate is armed —
+    # the gate goes blind and cannot fire, and nothing else stops us.
+    if not args.ignore_gate:
+        _hl_mod.set_gate_guard(True)
+        _aster_mod.set_gate_guard(True)
+        if gate_is_armed():
+            print("A live basis gate is armed — refusing to start so the "
+                  "trader keeps HL bandwidth. "
+                  "Wait for it to clear, run this off-box, or pass --ignore-gate.")
+            return
 
     cost_taker = float(ROUND_TRIP_TAKER_BPS) + args.bo_bps
     cost_maker = float(ROUND_TRIP_MAKER_BPS) + args.bo_bps

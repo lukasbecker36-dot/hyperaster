@@ -20,6 +20,33 @@ _ASTER_TO_CANON = {
 _CANON_PHANTOMS = set(_ASTER_TO_CANON.values())  # dead listings to skip
 
 
+# Opt-in live-gate guard — see src/hyperliquid.set_gate_guard. Aster has its own
+# rate limits, but the reason to stand down is the same: a heavy sweep alongside
+# a live gate is exactly when the gate needs the bandwidth.
+_GATE_GUARD = False
+_GATE_WAIT_MAX_S = 300
+
+
+def set_gate_guard(enabled: bool = True):
+    global _GATE_GUARD
+    _GATE_GUARD = enabled
+
+
+async def _await_gate_clear():
+    if not _GATE_GUARD:
+        return
+    from config import gate_is_armed
+    waited = 0
+    while gate_is_armed():
+        if waited >= _GATE_WAIT_MAX_S:
+            raise RuntimeError(
+                f"gate still armed after {_GATE_WAIT_MAX_S}s — aborting rather than "
+                f"competing with the live trader. Re-run when it clears, run off-box, "
+                f"or pass --ignore-gate.")
+        await asyncio.sleep(5)
+        waited += 5
+
+
 async def _get(
     session: aiohttp.ClientSession, path: str, params: dict | None = None,
     retries: int = 5,
@@ -29,6 +56,7 @@ async def _get(
     url = f"{ASTER_URL}{path}"
     delay = 1.0
     for attempt in range(retries + 1):
+        await _await_gate_clear()
         try:
             async with session.get(url, params=params) as resp:
                 if resp.status in (429, 418):

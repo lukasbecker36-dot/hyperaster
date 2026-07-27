@@ -56,7 +56,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import (
     HYPERLIQUID_API, ASTER_BASE, ASTER_EXCHANGE_INFO_URL, DATA_DIR, OUTPUT_DIR,
-    NON_EQUITY_SYMBOLS, ASTER_BASE_TO_CANON, aster_symbol_for, EQUITY_ONLY,
+    NON_EQUITY_SYMBOLS, ASTER_BASE_TO_CANON, aster_symbol_for, EQUITY_ONLY, gate_is_armed,
 )
 
 ASTER_BOOKTICKER_URL = f"{ASTER_BASE}/fapi/v1/ticker/bookTicker"
@@ -68,8 +68,8 @@ ASTER_DEPTH_URL = f"{ASTER_BASE}/fapi/v1/depth"
 # universe) so the gate gets a clean HL read instead of competing for the same
 # rate budget. The batch calls (ctxs/aster) are single requests — cheap — so we
 # keep capturing oracle/funding/Aster book through the pause.
-GATE_ACTIVE_FILE = os.path.join(DATA_DIR, "gate_active")
-GATE_ACTIVE_FRESH_S = 90   # ignore a stale flag (crashed trader) after this
+# Flag definition + freshness live in config so this and the offline-script
+# gate guard can't drift apart (see config.gate_is_armed).
 # HL l2Book budget for capture (calls/sec). HL's info limit is ~1200 weight/min
 # and l2Book is weight 2 → ~10 books/s total; we leave headroom for the trader,
 # so the per-cycle interval auto-stretches to keep the whole universe under this
@@ -82,10 +82,7 @@ log = logging.getLogger("capture")
 
 def _gate_active() -> bool:
     """True when the trader has a manual gate armed and the flag is recent."""
-    try:
-        return (time.time() - os.path.getmtime(GATE_ACTIVE_FILE)) < GATE_ACTIVE_FRESH_S
-    except OSError:
-        return False
+    return gate_is_armed()
 
 
 def _load_universe_csv() -> list[str]:

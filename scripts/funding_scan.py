@@ -36,6 +36,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src import aster, hyperliquid as hl
 from src.history import hl_funding_history, aster_funding_history, now_ms
+from config import gate_is_armed
+from src import aster as _aster_mod, hyperliquid as _hl_mod
 from config import (
     BLOCKED_SYMBOLS, NON_EQUITY_SYMBOLS,
     HL_MAKER_FEE, ASTER_TAKER_FEE,
@@ -242,7 +244,22 @@ def main():
     ap = argparse.ArgumentParser(description="Funding-carry opportunity scanner")
     ap.add_argument("--top", type=int, default=12, help="how many to show (default 12)")
     ap.add_argument("--hours", type=int, default=24, help="rolling funding window in hours (default 24)")
+    ap.add_argument("--ignore-gate", action="store_true",
+                    help="run even while the live trader has a basis gate "
+                         "armed (it shares HL's per-IP budget — this can "
+                         "blind the gate)")
     args = ap.parse_args()
+    # Heavy multi-symbol fetch on the trading box shares HL's per-IP weight
+    # budget with the live trader. Stand down while a gate is armed —
+    # the gate goes blind and cannot fire, and nothing else stops us.
+    if not args.ignore_gate:
+        _hl_mod.set_gate_guard(True)
+        _aster_mod.set_gate_guard(True)
+        if gate_is_armed():
+            print("A live basis gate is armed — refusing to start so the "
+                  "trader keeps HL bandwidth. "
+                  "Wait for it to clear, run this off-box, or pass --ignore-gate.")
+            return
     print(asyncio.run(scan(args.top, args.hours)))
 
 

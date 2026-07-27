@@ -11,6 +11,44 @@ from .types import BookTicker, EquityPerp
 HL_URL = "https://api.hyperliquid.xyz/info"
 
 
+# Opt-in live-gate guard. OFF by default so the trader's own use of this module
+# (warmup_book_spread -> history.hl_candles) can never be blocked by a flag the
+# trader itself writes. Heavy offline scripts turn it on.
+_GATE_GUARD = False
+_GATE_WAIT_MAX_S = 300
+
+
+def set_gate_guard(enabled: bool = True):
+    """Pause (then abort) requests while the live trader has a gate armed.
+
+    For multi-symbol analysis run on the trading box. HL rate-limits per IP, so
+    a backtest and the trader share one budget — and the loser is the gate, which
+    goes blind and cannot fire.
+    """
+    global _GATE_GUARD
+    _GATE_GUARD = enabled
+
+
+async def _await_gate_clear():
+    if not _GATE_GUARD:
+        return
+    from config import gate_is_armed
+    waited = 0
+    while gate_is_armed():
+        if waited == 0:
+            print("[gate-guard] live basis gate armed — holding HL requests so the "
+                  "trader's book read isn't starved…", flush=True)
+        if waited >= _GATE_WAIT_MAX_S:
+            raise RuntimeError(
+                f"gate still armed after {_GATE_WAIT_MAX_S}s — aborting rather than "
+                f"competing with the live trader for HL's per-IP budget. Re-run when "
+                f"the gate clears, run it off-box, or pass --ignore-gate.")
+        await asyncio.sleep(5)
+        waited += 5
+    if waited:
+        print(f"[gate-guard] gate cleared after {waited}s — resuming", flush=True)
+
+
 async def _post(session: aiohttp.ClientSession, payload: dict,
                 retries: int = 5) -> dict | list:
     """POST /info with 429 backoff.
@@ -25,6 +63,7 @@ async def _post(session: aiohttp.ClientSession, payload: dict,
     """
     delay = 1.0
     for attempt in range(retries + 1):
+        await _await_gate_clear()
         try:
             async with session.post(HL_URL, json=payload) as resp:
                 if resp.status == 429:

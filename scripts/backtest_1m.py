@@ -28,6 +28,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src import aster, hyperliquid as hl, history
 from src.fees import ROUND_TRIP_TAKER_BPS
+from config import gate_is_armed
+from src import aster as _aster_mod, hyperliquid as _hl_mod
 from config import (
     ENTRY_THRESHOLD_BPS_BY_SYMBOL, ENTRY_THRESHOLD_BPS, BLOCKED_SYMBOLS,
     NOTIONAL_PER_LEG, MAX_CONCURRENT_POSITIONS, MIN_RAW_PREMIUM_BPS,
@@ -678,7 +680,22 @@ def main():
                          "(default 0 = full baseline reclaim)")
     ap.add_argument("--per-symbol", action="store_true",
                     help="with --tp-sweep, also break the best TP down per name")
+    ap.add_argument("--ignore-gate", action="store_true",
+                    help="run even while the live trader has a basis gate "
+                         "armed (it shares HL's per-IP budget — this can "
+                         "blind the gate)")
     args = ap.parse_args()
+    # Heavy multi-symbol fetch on the trading box shares HL's per-IP weight
+    # budget with the live trader. Stand down while a gate is armed —
+    # the gate goes blind and cannot fire, and nothing else stops us.
+    if not args.ignore_gate:
+        _hl_mod.set_gate_guard(True)
+        _aster_mod.set_gate_guard(True)
+        if gate_is_armed():
+            print("A live basis gate is armed — refusing to start so the "
+                  "trader keeps HL bandwidth. "
+                  "Wait for it to clear, run this off-box, or pass --ignore-gate.")
+            return
 
     async def run():
         async with aiohttp.ClientSession() as session:

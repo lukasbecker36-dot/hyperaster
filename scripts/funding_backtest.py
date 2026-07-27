@@ -44,6 +44,8 @@ from src import aster, hyperliquid as hl
 from src.history import (
     hl_candles, aster_candles, hl_funding_history, aster_funding_history, now_ms,
 )
+from config import gate_is_armed
+from src import aster as _aster_mod, hyperliquid as _hl_mod
 from config import (
     BLOCKED_SYMBOLS, NON_EQUITY_SYMBOLS, HL_MAKER_FEE, ASTER_TAKER_FEE,
 )
@@ -220,7 +222,22 @@ def main():
     ap.add_argument("--days", type=int, default=7)
     ap.add_argument("--notional", type=float, default=1000)
     ap.add_argument("--top", type=int, default=25)
+    ap.add_argument("--ignore-gate", action="store_true",
+                    help="run even while the live trader has a basis gate "
+                         "armed (it shares HL's per-IP budget — this can "
+                         "blind the gate)")
     args = ap.parse_args()
+    # Heavy multi-symbol fetch on the trading box shares HL's per-IP weight
+    # budget with the live trader. Stand down while a gate is armed —
+    # the gate goes blind and cannot fire, and nothing else stops us.
+    if not args.ignore_gate:
+        _hl_mod.set_gate_guard(True)
+        _aster_mod.set_gate_guard(True)
+        if gate_is_armed():
+            print("A live basis gate is armed — refusing to start so the "
+                  "trader keeps HL bandwidth. "
+                  "Wait for it to clear, run this off-box, or pass --ignore-gate.")
+            return
     print(asyncio.run(run(args.days, args.notional, args.top)))
 
 

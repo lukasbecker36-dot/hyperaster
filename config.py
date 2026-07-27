@@ -421,6 +421,29 @@ def aster_symbol_for(base: str) -> str:
     return f"{ASTER_BASE_ALIAS.get(base, base)}USDT"
 
 
+# ── Live-gate guard ──
+# The trader touches this file every tick while a manual basis gate or drip is
+# armed. Anything heavy that hits Hyperliquid from the same box must stand down
+# while it's set: HL's info limit is per-IP, so an ad-hoc backtest can starve the
+# gate's own book read and the gate simply cannot fire until it clears.
+#
+# Observed: a few backtest_1m runs (33 symbols x 4800 1m candles, and
+# candleSnapshot is weight-charged per 60 candles) produced 179 HL 429s in one
+# hour against a trader that had had zero in the preceding eleven, and blinded a
+# live SKHX entry gate for ~4 minutes.
+GATE_ACTIVE_FILE = os.path.join(DATA_DIR, "gate_active")
+GATE_ACTIVE_FRESH_S = 90     # a stale flag (crashed trader) must not block forever
+
+
+def gate_is_armed() -> bool:
+    """True when the trader has a manual gate/drip armed and the flag is fresh."""
+    import time as _t
+    try:
+        return (_t.time() - os.path.getmtime(GATE_ACTIVE_FILE)) < GATE_ACTIVE_FRESH_S
+    except OSError:
+        return False
+
+
 # ── Price rendering ──
 
 def px_decimals(px) -> int:
