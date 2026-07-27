@@ -102,6 +102,15 @@ def _aster_windows(symbols, workers=8):
     return out
 
 
+def _median(xs):
+    """Median of a list, or None if empty."""
+    if not xs:
+        return None
+    ys = sorted(xs)
+    m = len(ys) // 2
+    return ys[m] if len(ys) % 2 else (ys[m - 1] + ys[m]) / 2
+
+
 def _percentile(xs, p):
     xs = sorted(xs)
     k = (len(xs) - 1) * p / 100
@@ -196,11 +205,15 @@ def _load_p90s(include_blocked: bool = False):
             continue
         p90_hl = _percentile(hl_list, 90)
         p90_ast = _percentile(buy_ast[sym], 90)
-        # Raw captured funding averages. HL is per-1h; Aster is PER SETTLEMENT
-        # WINDOW, and the window isn't stored here — so carry is computed in
-        # run(), which detects each candidate's real window (see _aster_windows).
-        hl_avg = (sum(hl_fund[sym]) / len(hl_fund[sym])) if hl_fund.get(sym) else None
-        ast_avg = (sum(ast_fund[sym]) / len(ast_fund[sym])) if ast_fund.get(sym) else None
+        # MEDIAN, not mean, of the captured rate snapshots. These are samples of
+        # lastFundingRate, so each settlement appears once per snapshot it
+        # survived — a mean lets one extreme settlement drag the whole figure
+        # (CXMT's single -2.0000% print produced a +830bps/day carry here). The
+        # median is the rate that persisted longest, which is what you'd actually
+        # accrue sitting in the position. Still per-1h for HL and PER WINDOW for
+        # Aster, so run() normalises with each name's detected window.
+        hl_avg = _median(hl_fund.get(sym))
+        ast_avg = _median(ast_fund.get(sym))
         floor = (sum(buy_hl[sym]) / len(hl_list)
                  + sum(buy_ast[sym]) / len(buy_ast[sym]))
         ranked.append((sym, p90_hl + p90_ast, len(hl_list), hl_avg, ast_avg, floor))

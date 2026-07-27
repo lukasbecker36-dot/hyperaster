@@ -171,15 +171,27 @@ def _percentile(xs, p):
     return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
 
 
-async def _funding_avg_24h(session, symbol):
-    """24h average funding from the venues' own history endpoints:
-    (avg_hl_per_1h, avg_ast_per_window, ast_window_h) — actual settled rates,
-    not predictions. The Aster funding WINDOW is detected from the gaps between
-    settlement timestamps rather than assumed 8h — some names settle every 4h
-    (e.g. SKHX). Falls back to 8h when fewer than 2 settlements are visible.
-    Rate sides are None on failure."""
+async def _funding_24h(session, symbol):
+    """Funding ACTUALLY SETTLED in the last 24h, summed per venue:
+    (hl_total, ast_total, ast_window_h, n_hl, n_ast). Fractions, not bps.
+
+    Summed, not averaged-and-rescaled. The old form returned a mean settled rate
+    and the caller multiplied it by 24/window — which broke twice on CXMT, a new
+    listing:
+      * a single -2.0000% print dominated a 6-settlement MEAN, and
+      * that print settled on an 8h schedule while the name had since switched to
+        1h, so the detected 1h median rescaled it 8x too hard.
+    Result: a displayed +657bps/day carry whose honest value was near zero.
+    A sum needs no window assumption at all — it IS the funding you'd have
+    paid or received over the period — and an outlier contributes only its own
+    one-off weight instead of being multiplied across the day.
+
+    ast_window_h is still returned, for display and for extrapolating the CURRENT
+    per-window rate; n_hl/n_ast let the caller flag a thin sample.
+    """
     start = int(time.time() * 1000) - DAY_MS
-    hl_avg = ast_avg = None
+    hl_total = ast_total = None
+    n_hl = n_ast = 0
     ast_window_h = 8.0
     try:
         async with session.post(HYPERLIQUID_API,
@@ -187,9 +199,10 @@ async def _funding_avg_24h(session, symbol):
                                       "coin": await _hl_coin(session, symbol),
                                       "startTime": start}) as r:
             rows = await r.json(content_type=None)
-        rates = [float(x.get("fundingRate") or 0) for x in (rows or [])]
+        rates = [float(x.get("fundingRate") or 0)
+                 for x in (rows or []) if isinstance(x, dict)]
         if rates:
-            hl_avg = statistics.mean(rates)
+            hl_total, n_hl = sum(rates), len(rates)
     except Exception:
         pass
     try:
@@ -198,9 +211,15 @@ async def _funding_avg_24h(session, symbol):
                                        "startTime": start}) as r:
             rows = await r.json(content_type=None)
         rows = [x for x in (rows or []) if isinstance(x, dict)]
-        rates = [float(x.get("fundingRate") or 0) for x in rows]
+        # Only settlements inside the window — Aster has returned fundingTimes
+        # outside the requested range (CXMT came back with timestamps ahead of
+        # now), and those must not be summed into a 24h total.
+        now_ms = int(time.time() * 1000)
+        in_window = [x for x in rows
+                     if start <= int(x.get("fundingTime") or 0) <= now_ms]
+        rates = [float(x.get("fundingRate") or 0) for x in in_window]
         if rates:
-            ast_avg = statistics.mean(rates)
+            ast_total, n_ast = sum(rates), len(rates)
         times = sorted(int(x.get("fundingTime") or 0) for x in rows)
         gaps = [(t2 - t1) / 3_600_000 for t1, t2 in zip(times, times[1:])
                 if t2 > t1]
@@ -208,12 +227,12 @@ async def _funding_avg_24h(session, symbol):
             ast_window_h = statistics.median(gaps)
     except Exception:
         pass
-    return hl_avg, ast_avg, ast_window_h
+    return hl_total, ast_total, ast_window_h, n_hl, n_ast
 
 
 async def _funding(session, symbol):
     """(hl_rate_per_1h, aster_rate_per_WINDOW) — positive = longs pay shorts.
-    The Aster window varies by name; _funding_avg_24h detects it."""
+    The Aster window varies by name; _funding_24h detects it."""
     hl_r = ast_r = None
     try:
         body = {"type": "metaAndAssetCtxs"}
@@ -326,10 +345,10 @@ async def main():
         # old silent 'xyz' fallback. One call up front removes the race and the
         # burst.
         await _hl_dex(session, symbol)
-        hl, ast, (hl_fr, ast_fr), (hl_fr24, ast_fr24, ast_win_h) = await asyncio.gather(
-            _hl_book(session, symbol), _aster_book(session, symbol),
-            _funding(session, symbol), _funding_avg_24h(session, symbol),
-        )
+        hl, ast, (hl_fr, ast_fr), (hl_24h, ast_24h, ast_win_h, n_hl, n_ast) =             await asyncio.gather(
+                _hl_book(session, symbol), _aster_book(session, symbol),
+                _funding(session, symbol), _funding_24h(session, symbol),
+            )
         if not hl or not ast:
             why = []
             if not hl:
@@ -385,12 +404,16 @@ async def main():
                      f"Ast {ast_1h*100:+.4f}% ({win_str})")
         lines.append(f"  net carry ≈ {carry_last:+.1f}bps/day L-AST/S-HL "
                      f"({-carry_last:+.1f} L-HL/S-AST)")
-    if hl_fr24 is not None and ast_fr24 is not None:
-        ast24_1h = ast_fr24 / ast_win_h if ast_win_h > 0 else ast_fr24 / 8
-        carry_24h = (hl_fr24 * 24 - ast_fr24 * settles_day) * 10000
-        lines.append(f"funding 24h avg, settled (per 1h)  HL {hl_fr24*100:+.4f}%  "
-                     f"Ast {ast24_1h*100:+.4f}%")
-        lines.append(f"  net carry ≈ {carry_24h:+.1f}bps/day L-AST/S-HL "
+    # 24h REALISED carry: the settlements that actually happened, summed. No
+    # window assumption and no rescaling, so a one-off outlier print can't be
+    # multiplied across the day (CXMT's -2% did exactly that, showing +657bps/day).
+    if hl_24h is not None and ast_24h is not None:
+        carry_24h = (hl_24h - ast_24h) * 10000
+        thin = " ⚠ thin sample" if min(n_hl, n_ast) < 6 else ""
+        lines.append(f"funding 24h REALISED (summed settlements)  "
+                     f"HL {hl_24h*100:+.4f}% ({n_hl}x)  "
+                     f"Ast {ast_24h*100:+.4f}% ({n_ast}x){thin}")
+        lines.append(f"  net carry {carry_24h:+.1f}bps over the last 24h L-AST/S-HL "
                      f"({-carry_24h:+.1f} L-HL/S-AST)")
 
     lines.append("")
@@ -402,8 +425,9 @@ async def main():
     # direction, and its funding carry can pay you or bleed you. Suggest the
     # positive-carry direction (settled 24h rates preferred over the live tick).
     carry_ashl = None   # net bps/day for holding L-AST/S-HL
-    if hl_fr24 is not None and ast_fr24 is not None:
-        carry_ashl = (hl_fr24 * 24 - ast_fr24 * settles_day) * 10000
+    if hl_24h is not None and ast_24h is not None:
+        # Realised over the last 24h — already a per-day figure.
+        carry_ashl = (hl_24h - ast_24h) * 10000
     elif hl_fr is not None and ast_fr is not None:
         carry_ashl = (hl_fr * 24 - ast_fr * settles_day) * 10000
     if carry_ashl is None:
