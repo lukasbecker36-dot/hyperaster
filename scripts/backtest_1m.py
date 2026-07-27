@@ -477,6 +477,167 @@ def peak_analysis(panels, tob_notional, tob_spread_bps, max_hold_min, confirm_ti
     return rows
 
 
+def tp_sweep(panels, tob_notional, tob_spread_bps, max_hold_min, confirm_ticks,
+             tp_grid_bps, reclaim_bps=0.0):
+    """Per-entry TP-level comparison on one shared set of entries.
+
+    Fills the gap between the two existing exit models. peak_analysis records
+    only max_net and stops the walk AT baseline reclaim, so it never records what
+    a trade would actually have closed at — the "peaked, then gave it back, ended
+    a loss" cohort is invisible. backtest_portfolio's --sweep does exit on a $
+    target but never on reclaim, so it holds losers to the 48h timeout instead of
+    closing them where the live bot's convergence exit would.
+
+    Here each qualifying entry is walked ONCE, recording:
+      * the first minute each candidate TP level is reached,
+      * the peak (max_net) and when,
+      * the TERMINAL net if you took no TP at all — exiting at baseline reclaim
+        (excess <= reclaim_bps) or the hold cap, whichever comes first.
+    Every TP level is then scored against that same path, so differences are the
+    TP's doing and not a different entry set.
+
+    A TP only counts as reached if it happens BEFORE the terminal exit: a level
+    first touched after the spread has already reclaimed is unreachable, because
+    the convergence exit would have closed the position first.
+
+    Funding is excluded, matching peak_analysis — it's ~2-4bps/day on these names,
+    negligible over the short holds a TP produces but material if you raise
+    --max-hold into days, so read long-horizon rows with that in mind.
+    """
+    trades = []
+    for sym, df in panels.items():
+        max_notional = tob_notional.get(sym, 0)
+        if max_notional <= 0:
+            continue
+        notional = min(NOTIONAL_PER_LEG, max_notional)
+        bo_bps = tob_spread_bps.get(sym, 0)
+        fees = notional * ROUND_TRIP_FEE
+        crossing = notional * bo_bps / 10000
+
+        base_threshold = ENTRY_THRESHOLD_BPS_BY_SYMBOL.get(sym, ENTRY_THRESHOLD_BPS)
+        cost_floor = ROUND_TRIP_FEE * 10000 + bo_bps / 2 + ENTRY_COST_MARGIN_BPS
+        threshold = max(base_threshold, cost_floor)
+
+        n = len(df)
+        ts = df["ts"].values
+        hl = df["hl_close"].values
+        ast = df["ast_close"].values
+        midv = df["mid"].values
+        a_exc = df["aster_excess"].values
+        h_exc = df["hl_excess"].values
+        spread = df["spread_bps"].values
+
+        # TP levels as dollars for this symbol's notional.
+        tp_usd = [(bps, notional * bps / 10000) for bps in tp_grid_bps]
+
+        i = 0
+        streak_dir, streak_n = "", 0
+        while i < n:
+            entered = None
+            for exc_arr, direction in [(a_exc, "long_hl_short_aster"),
+                                       (h_exc, "long_aster_short_hl")]:
+                if exc_arr[i] >= threshold and abs(spread[i]) >= MIN_RAW_PREMIUM_BPS:
+                    streak_n = streak_n + 1 if streak_dir == direction else 1
+                    streak_dir = direction
+                    if streak_n >= confirm_ticks:
+                        entered = direction
+                    break
+            else:
+                streak_dir, streak_n = "", 0
+
+            if not entered:
+                i += 1
+                continue
+
+            entry_hl, entry_ast = hl[i], ast[i]
+            qty = notional / midv[i] if midv[i] > 0 else 0
+            entry_excess = a_exc[i] if entered == "long_hl_short_aster" else h_exc[i]
+            exc_arr = a_exc if entered == "long_hl_short_aster" else h_exc
+
+            first_hit = {bps: None for bps in tp_grid_bps}
+            max_net, t_peak = -1e9, 0.0
+            terminal_net, terminal_min, terminal_reason = None, 0.0, "cap"
+            j = i + 1
+            while j < n:
+                mins = (ts[j] - ts[i]) / MIN_MS
+                if mins > max_hold_min:
+                    break
+                if entered == "long_hl_short_aster":
+                    gross = ((hl[j] - entry_hl) + (entry_ast - ast[j])) * qty
+                else:
+                    gross = ((entry_hl - hl[j]) + (ast[j] - entry_ast)) * qty
+                net = gross - fees - crossing
+                if net > max_net:
+                    max_net, t_peak = net, mins
+                for bps, usd in tp_usd:
+                    if first_hit[bps] is None and net >= usd:
+                        first_hit[bps] = mins
+                # Terminal exit: the convergence exit the live bot would take.
+                if exc_arr[j] <= reclaim_bps:
+                    terminal_net, terminal_min, terminal_reason = net, mins, "reclaim"
+                    break
+                terminal_net, terminal_min = net, mins
+                j += 1
+
+            if terminal_net is None:      # no forward bars at all
+                i += 1
+                continue
+
+            trades.append({
+                "symbol": sym, "direction": entered, "notional": notional,
+                "entry_excess_bps": entry_excess,
+                "max_net": max_net, "t_peak_min": t_peak,
+                "terminal_net": terminal_net, "terminal_min": terminal_min,
+                "terminal_reason": terminal_reason,
+                "first_hit": first_hit,
+            })
+            i = j + 1
+            streak_dir, streak_n = "", 0
+
+    return trades
+
+
+def score_tp(trades, tp_bps):
+    """Outcome of applying ONE take-profit level to the shared entry set.
+
+    tp_bps None = the no-TP baseline: hold to reclaim or the cap.
+    """
+    if not trades:
+        return None
+    nets, holds = [], []
+    hits = rescued = given_back = 0
+    forgone = 0.0
+    for t in trades:
+        notional = t["notional"]
+        tp_usd = notional * tp_bps / 10000 if tp_bps is not None else None
+        hit_min = t["first_hit"].get(tp_bps) if tp_bps is not None else None
+        # Unreachable if the level is first touched only after the terminal exit.
+        reachable = hit_min is not None and hit_min <= t["terminal_min"]
+        if reachable:
+            hits += 1
+            nets.append(tp_usd)
+            holds.append(hit_min)
+            forgone += max(0.0, t["max_net"] - tp_usd)
+            if t["terminal_net"] < 0:
+                rescued += 1        # this TP converted a loser into a winner
+        else:
+            nets.append(t["terminal_net"])
+            holds.append(t["terminal_min"])
+            # Peaked into profit but wasn't captured and ended negative.
+            if tp_bps is not None and t["max_net"] > 0 and t["terminal_net"] < 0:
+                given_back += 1
+    n = len(nets)
+    wins = sum(1 for v in nets if v > 0)
+    holds_sorted = sorted(holds)
+    return {
+        "tp_bps": tp_bps, "n": n, "hits": hits, "hit_pct": hits / n * 100,
+        "total": sum(nets), "mean": sum(nets) / n,
+        "win_pct": wins / n * 100,
+        "med_hold": holds_sorted[len(holds_sorted) // 2],
+        "rescued": rescued, "given_back": given_back, "forgone": forgone,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description="1m candle backtest with profit-target exit")
     ap.add_argument("--hours", type=int, default=48, help="lookback hours (default 48)")
@@ -490,6 +651,19 @@ def main():
                     help="sweep baseline window (30m-24h) at fixed target/slots")
     ap.add_argument("--peak-analysis", action="store_true",
                     help="measure per-name peak reversion to calibrate per-name targets")
+    ap.add_argument("--tp-sweep", action="store_true",
+                    help="compare take-profit LEVELS (bps of notional) on one shared "
+                         "entry set, incl. how many losses each TP rescues")
+    ap.add_argument("--tp-grid", default="2,4,6,8,10,12,15,20,25,30,40,50",
+                    help="TP levels in bps of notional (net of fees+crossing)")
+    ap.add_argument("--tp-max-hold", type=int, default=240,
+                    help="hold cap for --tp-sweep in minutes (default 240 = 4h; "
+                         "funding is excluded so long caps overstate)")
+    ap.add_argument("--reclaim-bps", type=float, default=0.0,
+                    help="excess level counted as reverted for the no-TP exit "
+                         "(default 0 = full baseline reclaim)")
+    ap.add_argument("--per-symbol", action="store_true",
+                    help="with --tp-sweep, also break the best TP down per name")
     args = ap.parse_args()
 
     async def run():
@@ -548,6 +722,65 @@ def main():
 
         # Apply the configured baseline window for all non-window-sweep runs
         apply_baseline(panels, args.window)
+
+        if args.tp_sweep:
+            grid = [float(x) for x in args.tp_grid.split(",") if x.strip()]
+            trades = tp_sweep(panels, tob_notional, tob_spread_bps,
+                              args.tp_max_hold, args.confirm, grid, args.reclaim_bps)
+            if not trades:
+                print("\nNo entry signals found for the TP sweep")
+                return
+            base = score_tp(trades, None)
+            print(f"\n{'='*100}")
+            print(f"TAKE-PROFIT LEVEL SWEEP: {args.hours}h | {args.window}m baseline | "
+                  f"{len(trades)} entries | hold cap {args.tp_max_hold}m")
+            print(f"no-TP exit = baseline reclaim (excess <= {args.reclaim_bps:g}bps) "
+                  f"or hold cap. Funding excluded.")
+            print(f"{'='*100}")
+            hdr = (f"  {'TP':>6}  {'hit%':>6}  {'win%':>6}  {'total$':>9}  "
+                   f"{'mean$':>8}  {'medHold':>8}  {'rescued':>8}  {'gaveBack':>9}  "
+                   f"{'forgone$':>9}")
+            print(hdr)
+            print("  " + "-" * (len(hdr) - 2))
+            rows = [base] + [score_tp(trades, tp) for tp in grid]
+            for r in rows:
+                lbl = "none" if r["tp_bps"] is None else f"{r['tp_bps']:g}bp"
+                resc = "—" if r["tp_bps"] is None else f"{r['rescued']:d}"
+                gb = f"{r['given_back']:d}" if r["tp_bps"] is not None else f"{sum(1 for t in trades if t['max_net'] > 0 and t['terminal_net'] < 0)}"
+                forg = "—" if r["tp_bps"] is None else f"{r['forgone']:.2f}"
+                print(f"  {lbl:>6}  {r['hit_pct']:>5.0f}%  {r['win_pct']:>5.0f}%  "
+                      f"${r['total']:>8.2f}  ${r['mean']:>7.3f}  {r['med_hold']:>7.0f}m  "
+                      f"{resc:>8}  {gb:>9}  {forg:>9}")
+            print("  " + "-" * (len(hdr) - 2))
+            n_gb = sum(1 for t in trades if t["max_net"] > 0 and t["terminal_net"] < 0)
+            print(f"  {n_gb}/{len(trades)} entries ({n_gb/len(trades)*100:.0f}%) went "
+                  f"POSITIVE at some point and still closed negative with no TP —")
+            print(f"  that cohort is the entire prize a take-profit is competing for.")
+            print(f"  rescued = losses this TP converts to wins | gaveBack = still "
+                  f"peaked-positive-then-lost at this TP")
+            print(f"  forgone = profit left on the table by capping at this TP")
+            best = max(rows, key=lambda r: r["total"])
+            bl = "no TP" if best["tp_bps"] is None else f"{best['tp_bps']:g}bps"
+            print(f"\n  BEST TOTAL: {bl}  ${best['total']:.2f} "
+                  f"(vs no-TP ${base['total']:.2f}, "
+                  f"{best['total'] - base['total']:+.2f})")
+            if args.per_symbol and best["tp_bps"] is not None:
+                print(f"\n  Per-name at TP={bl}:")
+                print(f"    {'SYM':<9}{'n':>4}{'hit%':>7}{'total$':>10}{'noTP$':>10}"
+                      f"{'delta$':>9}")
+                syms = sorted({t["symbol"] for t in trades})
+                per = []
+                for sym in syms:
+                    sub = [t for t in trades if t["symbol"] == sym]
+                    a = score_tp(sub, best["tp_bps"])
+                    b = score_tp(sub, None)
+                    per.append((sym, a, b))
+                per.sort(key=lambda x: x[1]["total"] - x[2]["total"], reverse=True)
+                for sym, a, b in per:
+                    print(f"    {sym:<9}{a['n']:>4}{a['hit_pct']:>6.0f}%"
+                          f"{a['total']:>10.2f}{b['total']:>10.2f}"
+                          f"{a['total']-b['total']:>+9.2f}")
+            return
 
         if args.peak_analysis:
             rows = peak_analysis(panels, tob_notional, tob_spread_bps,
