@@ -778,8 +778,14 @@ def main():
             print(f"\n  BEST TOTAL: {bl}  ${best['total']:.2f} "
                   f"(vs no-TP ${base['total']:.2f}, "
                   f"{best['total'] - base['total']:+.2f})")
+            # Per-name against the best TP LEVEL (not the baseline): even when no
+            # TP wins overall, individual names can go the other way, and that's
+            # what a per-symbol target would exploit.
+            tp_rows = [r for r in rows if r["tp_bps"] is not None]
+            best = max(tp_rows, key=lambda r: r["total"]) if tp_rows else best
+            bl = f"{best['tp_bps']:g}bps" if best["tp_bps"] is not None else "no TP"
             if args.per_symbol and best["tp_bps"] is not None:
-                print(f"\n  Per-name at TP={bl}:")
+                print(f"\n  Per-name at best TP={bl} (vs no TP), sorted by benefit:")
                 print(f"    {'SYM':<9}{'n':>4}{'hit%':>7}{'total$':>10}{'noTP$':>10}"
                       f"{'delta$':>9}")
                 syms = sorted({t["symbol"] for t in trades})
