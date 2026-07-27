@@ -35,7 +35,7 @@ import aiohttp
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import (
-    HYPERLIQUID_API, ASTER_BASE, DATA_DIR, aster_symbol_for,
+    HYPERLIQUID_API, ASTER_BASE, DATA_DIR, aster_symbol_for, load_hl_dex_map,
     fmt_px,
 )
 from src import history
@@ -57,7 +57,7 @@ _HL_DEX_CACHE: dict = {}
 _HL_BOOK_ERR: dict = {}
 
 
-async def _hl_dex(session, symbol, retries=2):
+async def _hl_dex(session, symbol, retries=4):
     """Which HL dex lists this symbol: 'xyz' (HIP-3 equity) or '' (main-dex
     crypto). Checks the xyz universe first, then main.
 
@@ -69,6 +69,13 @@ async def _hl_dex(session, symbol, retries=2):
     """
     if symbol in _HL_DEX_CACHE:
         return _HL_DEX_CACHE[symbol]
+    # Persisted map first: a name's dex is static, and metaAndAssetCtxs is the
+    # flakiest thing we touch. This is the difference between /basis working
+    # during an HL wobble and reporting "could not determine which HL dex".
+    persisted = load_hl_dex_map().get(symbol)
+    if persisted in ("xyz", ""):
+        _HL_DEX_CACHE[symbol] = persisted
+        return persisted
     reachable = False
     for attempt in range(retries + 1):
         for dex in ("xyz", None):
@@ -92,7 +99,7 @@ async def _hl_dex(session, symbol, retries=2):
         if reachable:
             break                     # both universes answered; name isn't listed
         if attempt < retries:
-            await asyncio.sleep(0.4 * (attempt + 1))
+            await asyncio.sleep(0.6 * (attempt + 1))
     if reachable:
         # Both universes answered and neither lists it — default xyz so the
         # caller still attempts a read (a brand-new listing can lag the meta).

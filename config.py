@@ -138,6 +138,52 @@ def save_crypto_symbols(syms) -> None:
         pass
 
 
+_HL_DEX_MAP_CACHE: dict = {"ts": 0.0, "map": {}}
+
+
+def load_hl_dex_map() -> dict:
+    """{symbol: 'xyz' | ''} — which HL dex lists each name, persisted by the
+    trader. Cached 60s. Empty dict if not written yet.
+
+    A name's dex never changes, but every consumer was re-deriving it from
+    metaAndAssetCtxs on each invocation — and HL returns a null body for that
+    endpoint often enough to matter (observed: every capture cycle for minutes at
+    a time, which is what made /basis report "could not determine which HL dex").
+    Reading a persisted map removes a flaky network call from the hot path.
+    """
+    import json
+    import time as _t
+    now = _t.time()
+    if now - _HL_DEX_MAP_CACHE["ts"] < 60 and _HL_DEX_MAP_CACHE["map"]:
+        return _HL_DEX_MAP_CACHE["map"]
+    try:
+        with open(os.path.join(DATA_DIR, "hl_dex_map.json")) as fh:
+            m = json.load(fh)
+    except Exception:
+        m = {}
+    _HL_DEX_MAP_CACHE.update(ts=now, map=m)
+    return m
+
+
+def save_hl_dex_map(mapping: dict) -> None:
+    """Persist {symbol: dex}. MERGES with what's on disk — the trader only knows
+    the names in its own universe, and narrowing that universe must not erase
+    entries the screeners still rely on."""
+    import json
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        merged = dict(load_hl_dex_map())
+        merged.update({k: v for k, v in mapping.items() if v in ("xyz", "")})
+        path = os.path.join(DATA_DIR, "hl_dex_map.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(merged, fh, indent=0, sort_keys=True)
+        os.replace(tmp, path)
+        _HL_DEX_MAP_CACHE.update(ts=0.0, map=merged)
+    except Exception:
+        pass
+
+
 def carry_round_trip_fee(symbol: str) -> float:
     """Per-symbol maker-HL/taker-Aster round-trip fee (fraction). Crypto pays the
     Aster standard taker; equities pay the stock-perp promo."""

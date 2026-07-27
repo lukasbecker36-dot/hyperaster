@@ -456,8 +456,11 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     # Persist the discovered crypto set so fee helpers (and client-less scripts)
     # classify main-dex crypto names correctly.
     try:
-        from config import save_crypto_symbols
+        from config import save_crypto_symbols, save_hl_dex_map
         save_crypto_symbols(client.crypto_symbols())
+        # Persist which dex lists each name so the screeners don't have to
+        # re-derive it from metaAndAssetCtxs, which HL nulls frequently.
+        save_hl_dex_map(dict(client._hl_dex))
     except Exception:
         pass
 
