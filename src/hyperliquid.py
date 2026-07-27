@@ -11,10 +11,38 @@ from .types import BookTicker, EquityPerp
 HL_URL = "https://api.hyperliquid.xyz/info"
 
 
-async def _post(session: aiohttp.ClientSession, payload: dict) -> dict | list:
-    async with session.post(HL_URL, json=payload) as resp:
-        resp.raise_for_status()
-        return await resp.json()
+async def _post(session: aiohttp.ClientSession, payload: dict,
+                retries: int = 5) -> dict | list:
+    """POST /info with 429 backoff.
+
+    Had no retry at all: raise_for_status() turned a single throttle into a hard
+    failure, and every caller here swallows exceptions into {} — so a backtest
+    either crashed on the first 429 or silently dropped the symbols that got
+    throttled (observed: "Built panels for 1 symbols, skipped 32", which looked
+    like missing history rather than rate limiting). HL's info limit is 1200
+    weight/min per IP and candleSnapshot is charged per 60 candles, so a
+    multi-symbol fetch trips it easily.
+    """
+    delay = 1.0
+    for attempt in range(retries + 1):
+        try:
+            async with session.post(HL_URL, json=payload) as resp:
+                if resp.status == 429:
+                    if attempt == retries:
+                        resp.raise_for_status()
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 20.0)
+                    continue
+                resp.raise_for_status()
+                return await resp.json()
+        except aiohttp.ClientResponseError:
+            raise
+        except Exception:
+            if attempt == retries:
+                raise
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 20.0)
+    raise RuntimeError("unreachable")
 
 
 async def get_all_equity_perps(session: aiohttp.ClientSession) -> dict[str, EquityPerp]:

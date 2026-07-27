@@ -153,15 +153,29 @@ async def fetch_1m_candles(
     print(f"Fetching top-of-book liquidity & spreads...")
     tob_notional, tob_spread_bps = await fetch_top_of_book(session, hl_perps, aster_perps, overlap)
 
+    # HL's candleSnapshot returns at most 5000 candles, so >83h of 1m bars comes
+    # back truncated — silently, because hl_candles swallows failures into {}.
+    # A 168h run reported "Built panels for 1 symbols, skipped 32", which read as
+    # missing history rather than a request that was simply too big.
+    if hours * 60 > 5000:
+        print(f"  WARNING: {hours}h = {hours*60} 1m candles exceeds HL's 5000-candle "
+              f"cap — history will be truncated. Use --hours 83 or less.")
+
     print(f"Fetching {hours}h of 1m candles for {len(overlap)} symbols...")
+
+    # Bounded concurrency: 33 symbols x 2 venues fired at once is a burst big
+    # enough to trip HL's 1200 weight/min on its own (candleSnapshot is charged
+    # per 60 candles), and the retry backoff shouldn't be doing that work.
+    sem = asyncio.Semaphore(4)
 
     async def fetch_pair(canon):
         hl_coin = hl_perps[canon].venue_symbol
         ast_sym = aster_perps[canon].venue_symbol
-        hl_data, ast_data = await asyncio.gather(
-            history.hl_candles(session, hl_coin, start_ms, end_ms, interval="1m"),
-            history.aster_candles(session, ast_sym, start_ms, end_ms, interval="1m"),
-        )
+        async with sem:
+            hl_data, ast_data = await asyncio.gather(
+                history.hl_candles(session, hl_coin, start_ms, end_ms, interval="1m"),
+                history.aster_candles(session, ast_sym, start_ms, end_ms, interval="1m"),
+            )
         return canon, hl_data, ast_data
 
     results = await asyncio.gather(*[fetch_pair(c) for c in overlap])

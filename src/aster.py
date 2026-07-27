@@ -2,6 +2,8 @@
 
 from decimal import Decimal
 
+import asyncio
+
 import aiohttp
 
 from .types import BookTicker, EquityPerp
@@ -19,12 +21,32 @@ _CANON_PHANTOMS = set(_ASTER_TO_CANON.values())  # dead listings to skip
 
 
 async def _get(
-    session: aiohttp.ClientSession, path: str, params: dict | None = None
+    session: aiohttp.ClientSession, path: str, params: dict | None = None,
+    retries: int = 5,
 ) -> dict | list:
+    """GET with 429/418 backoff — same reasoning as the HL side: without it a
+    single throttle became a silently-dropped symbol in every backtest."""
     url = f"{ASTER_URL}{path}"
-    async with session.get(url, params=params) as resp:
-        resp.raise_for_status()
-        return await resp.json()
+    delay = 1.0
+    for attempt in range(retries + 1):
+        try:
+            async with session.get(url, params=params) as resp:
+                if resp.status in (429, 418):
+                    if attempt == retries:
+                        resp.raise_for_status()
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 20.0)
+                    continue
+                resp.raise_for_status()
+                return await resp.json()
+        except aiohttp.ClientResponseError:
+            raise
+        except Exception:
+            if attempt == retries:
+                raise
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 20.0)
+    raise RuntimeError("unreachable")
 
 
 async def get_all_perps(session: aiohttp.ClientSession) -> dict[str, EquityPerp]:
