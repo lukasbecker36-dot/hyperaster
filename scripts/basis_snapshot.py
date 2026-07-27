@@ -422,14 +422,27 @@ async def main():
     ast_gate = round(avg["p90_ast"]) if avg else round(buy_ast_now) + 5
     hl_gate = round(avg["p90_hl"]) if avg else round(buy_hl_now) + 5
     # CARRY-AWARE suggestion: while you sit between entry and exit you HOLD a
-    # direction, and its funding carry can pay you or bleed you. Suggest the
-    # positive-carry direction (settled 24h rates preferred over the live tick).
-    carry_ashl = None   # net bps/day for holding L-AST/S-HL
+    # direction, and its funding carry can pay you or bleed you.
+    #
+    # The suggestion follows the LIVE rate, not the realised 24h figure. Realised
+    # is history: on CXMT it was +48bps/day L-AST/S-HL entirely because of one
+    # -2% Aster print, while the live rates said that same hold PAYS 39bps/day.
+    # You are about to hold forward, so the forward rate decides — and when the
+    # two disagree in sign, say so rather than quietly picking one.
+    carry_live = None    # net bps/day for holding L-AST/S-HL, from live rates
+    carry_real = None    # net bps realised over the last 24h, same direction
+    if hl_fr is not None and ast_fr is not None:
+        carry_live = (hl_fr * 24 - ast_fr * settles_day) * 10000
     if hl_24h is not None and ast_24h is not None:
-        # Realised over the last 24h — already a per-day figure.
-        carry_ashl = (hl_24h - ast_24h) * 10000
-    elif hl_fr is not None and ast_fr is not None:
-        carry_ashl = (hl_fr * 24 - ast_fr * settles_day) * 10000
+        carry_real = (hl_24h - ast_24h) * 10000
+    carry_ashl = carry_live if carry_live is not None else carry_real
+    basis_lbl = "live rate" if carry_live is not None else "realised 24h"
+    if (carry_live is not None and carry_real is not None
+            and (carry_live >= 0) != (carry_real >= 0)):
+        lines.append(f"⚠ carry direction DISAGREES: live {carry_live:+.1f}bp/day vs "
+                     f"realised {carry_real:+.1f}bp/day (L-AST/S-HL).")
+        lines.append("  Following the live rate below. A big realised-only number "
+                     "is usually one outlier settlement, not income.")
     if carry_ashl is None:
         lines.append(f"e.g. /enter {symbol} buy_aster 1000 {ast_gate}")
         lines.append(f"     /close {symbol} {hl_gate}")
@@ -438,14 +451,16 @@ async def main():
         # Hold L-AST/S-HL: enter on the buy-AST leg, exit on the buy-HL leg.
         lines.append(f"e.g. /enter {symbol} buy_aster 1000 {ast_gate}")
         lines.append(f"     /close {symbol} {hl_gate}")
-        lines.append(f"→ holds L-AST/S-HL earning {carry_ashl:+.1f}bp/day while you wait")
+        lines.append(f"→ holds L-AST/S-HL earning {carry_ashl:+.1f}bp/day while you "
+                     f"wait ({basis_lbl})")
         if carry_ashl > 0:
             lines.append(f"  (the other direction PAYS {-carry_ashl:+.1f}bp/day — avoid)")
     else:
         # Hold L-HL/S-AST: enter on the buy-HL leg, exit on the buy-AST leg.
         lines.append(f"e.g. /enter {symbol} buy_hl 1000 {hl_gate}")
         lines.append(f"     /close {symbol} {ast_gate}")
-        lines.append(f"→ holds L-HL/S-AST earning {-carry_ashl:+.1f}bp/day while you wait")
+        lines.append(f"→ holds L-HL/S-AST earning {-carry_ashl:+.1f}bp/day while you "
+                     f"wait ({basis_lbl})")
         lines.append(f"  (the other direction PAYS {carry_ashl:+.1f}bp/day — avoid)")
     print("\n".join(lines))
 
