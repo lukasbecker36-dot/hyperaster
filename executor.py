@@ -32,7 +32,7 @@ from config import (
     ENTRY_CONFIRM_TICKS, ENTRY_COST_MARGIN_BPS, ROUND_TRIP_FEE, CARRY_ROUND_TRIP_FEE,
     carry_round_trip_fee, round_trip_fee,
     EXIT_TARGET_NET_USD, EXIT_TARGET_NET_USD_BY_SYMBOL,
-    MAKER_ENTRY_TIMEOUT_SEC, MAKER_REPRICE_TICK_FRAC,
+    MAKER_ENTRY_TIMEOUT_SEC, MAKER_REPRICE_TICK_FRAC, MIN_TRADEABLE_NOTIONAL_USD,
     LIQUIDITY_GUARD_ENABLED, MIN_TOB_NOTIONAL_USD, MAX_VENUE_SPREAD_BPS,
     MAX_VENUE_SPREAD_RATIO, SPREAD_ASYMMETRY_FLOOR_BPS, ENTRY_MAX_DRIFT_BPS,
     ENTRY_TAKER_ESCALATION_ENABLED, STOP_COOLDOWN_MINUTES,
@@ -1700,10 +1700,35 @@ class Executor:
                     return  # don't advance until the fill is hedged
 
         # Fully filled and hedged → open.
-        if hl_filled >= pos.qty * 0.999 and pos.aster_hedged_qty >= hl_filled * 0.999:
+        #
+        # The test used to be `hl_filled >= pos.qty*0.999 and hedged >=
+        # hl_filled*0.999`. A 0.1% tolerance is FINER THAN THE VENUES' OWN LOT
+        # SIZES, so a residual nobody can trade kept the entry unfinished forever:
+        # SKHX filled 0.204 of a 0.205 target with 0.203 hedged, missing the gate
+        # by 0.0008, where the last 0.001 (~$1) is under Aster's min lot AND under
+        # HL's ~$10 min order value. A hold_for_funding entry has no timeout, so it
+        # stayed 'entering' until a manual /cancel — and the paired exit gate only
+        # considers 'open' positions, so the armed exit sat dormant the whole time.
+        # Completion is now judged against what is actually tradeable.
+        ref_px = pos.hl_entry_price or 0.0
+        unfilled = pos.qty - hl_filled
+        unhedged = hl_filled - pos.aster_hedged_qty
+        final_qty = min(hl_filled, pos.aster_hedged_qty)
+        if (final_qty > 0
+                and self._residual_untradeable(symbol, unfilled, ref_px)
+                and self._residual_untradeable(symbol, unhedged, ref_px)):
             if pos.hl_entry_order_id:
                 await self.client.cancel_hl_order(symbol, pos.hl_entry_order_id)
-            self.pm.confirm_hl_maker_open(symbol, hl_filled, pos.hl_entry_price, pos.aster_entry_price)
+            if unhedged > 1e-12:
+                # Open delta-neutral at the hedged qty. The unhedged remainder is
+                # untradeable dust, not a naked leg worth alarming about.
+                log.warning(
+                    f"{symbol}: opening at hedged qty {final_qty} — {unhedged:.4f} HL "
+                    f"dust (~${unhedged * ref_px:.2f}) is below both venues' minimums, "
+                    f"cannot be hedged or unwound"
+                )
+            self.pm.confirm_hl_maker_open(
+                symbol, final_qty, pos.hl_entry_price, pos.aster_entry_price)
             return
 
         if pos.hold_for_funding:
@@ -1724,6 +1749,25 @@ class Executor:
         # chase a moving market on a partially-filled order.
         if hl_filled <= 0:
             await self._reprice_hl_maker(pos, hl_side, hl_filled)
+
+    def _residual_untradeable(self, symbol: str, qty: float, ref_price: float) -> bool:
+        """True when `qty` is too small for either venue to act on, so it can be
+        neither hedged on Aster nor unwound on HL.
+
+        Two independent floors, either of which makes the qty untradeable:
+          * Aster's per-symbol min lot / step size (snap_aster_qty returns 0), and
+          * a min notional, since HL rejects orders below ~$10 of value.
+
+        Used both to decide a maker entry is complete and to tell real naked
+        exposure apart from dust that no order can clear.
+        """
+        if qty <= 1e-12:
+            return True
+        if self.client.snap_aster_qty(symbol, qty) <= 0:
+            return True
+        if ref_price > 0 and qty * ref_price < MIN_TRADEABLE_NOTIONAL_USD:
+            return True
+        return False
 
     async def _finalize_partial_entry(self, pos, long_hl, aster_hedge_side, reason):
         """Cancel the resting HL maker, re-check szi for a last fill, hedge any
@@ -1773,7 +1817,17 @@ class Executor:
             else:
                 self.pm.drop_entering(symbol, "maker_entry_unhedged")
             return
-        log.warning(f"{symbol}: maker entry partial {final_qty}/{pos.qty} ({reason}) — opening")
+        # Only call it "partial" when the shortfall is actually tradeable. Reporting
+        # 0.203/0.205 as a partial fill reads as "you are under-hedged", when the
+        # 0.001 gap is dust neither venue will accept an order for — the position
+        # IS delta-neutral at final_qty.
+        shortfall = pos.qty - final_qty
+        if self._residual_untradeable(symbol, shortfall, pos.hl_entry_price or 0.0):
+            log.warning(f"{symbol}: maker entry complete {final_qty}/{pos.qty} "
+                        f"({reason}) — remainder is sub-minimum dust — opening")
+        else:
+            log.warning(f"{symbol}: maker entry partial {final_qty}/{pos.qty} "
+                        f"({reason}) — opening")
         self.pm.confirm_hl_maker_open(symbol, final_qty, pos.hl_entry_price, pos.aster_entry_price)
 
     async def _aster_can_afford(self, symbol: str, notional: float) -> tuple[bool, str]:
@@ -1825,7 +1879,29 @@ class Executor:
         except Exception as e:
             log.error(f"{symbol}: naked-HL unwind errored ({e})")
         still_naked = naked_hl - unwound
-        if still_naked > naked_hl * 0.01 + 1e-9:
+        ref_px = pos.hl_entry_price or 0.0
+        cleared = still_naked <= naked_hl * 0.01 + 1e-9
+        if cleared:
+            log.warning(
+                f"{symbol}: entry hedge failed — unwound {unwound:.4f} HL back to "
+                f"flat (no exposure taken)"
+            )
+            self.pm._trade_alert(
+                f"⚠️ {symbol}: entry hedge failed — unwound the HL leg back to flat, "
+                f"no position taken (nothing to do)."
+            )
+        elif self._residual_untradeable(symbol, still_naked, ref_px):
+            # Dust, not exposure. Nothing can clear a residual below the venues'
+            # minimums, so CRITICAL "CHECK VENUE NOW" is unactionable — and firing
+            # it over ~$1 (observed on SKHX: 0.0010 units at ~$970, where HL
+            # rejects the unwind for being under its ~$10 min order value) trains
+            # you to ignore the alert on the day it means something.
+            log.warning(
+                f"{symbol}: {still_naked:.4f} HL dust left over "
+                f"(~${still_naked * ref_px:.2f}) — below both venues' minimums, "
+                f"cannot be hedged or unwound. Not naked exposure worth acting on."
+            )
+        else:
             log.critical(
                 f"{symbol}: {still_naked:.4f} HL NAKED — hedge AND unwind FAILED "
                 f"(filled {hl_filled}, hedged {pos.aster_hedged_qty}, "
@@ -1834,15 +1910,6 @@ class Executor:
             self.pm._trade_alert(
                 f"⚠️ {symbol}: {still_naked:.4f} HL NAKED — hedge AND unwind both "
                 f"failed. CHECK VENUE NOW."
-            )
-        else:
-            log.warning(
-                f"{symbol}: entry hedge failed — unwound {unwound:.4f} HL back to "
-                f"flat (no exposure taken)"
-            )
-            self.pm._trade_alert(
-                f"⚠️ {symbol}: entry hedge failed — unwound the HL leg back to flat, "
-                f"no position taken (nothing to do)."
             )
         return still_naked
 

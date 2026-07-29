@@ -42,7 +42,7 @@ from config import (
     EXIT_TARGET_NET_USD_BY_SYMBOL, MAX_FUNDING_DRAG_USD,
     BASIS_ADVERSE_STOP_USD,
     MANUAL_ENTRY_GATE_TIMEOUT_MIN, aster_symbol_for, ASTER_BASE_TO_CANON,
-    EQUITY_ONLY, CRYPTO_TRADING_ENABLED,
+    EQUITY_ONLY, CRYPTO_TRADING_ENABLED, ENTERING_STALL_WARN_MIN,
     fmt_px,
 )
 
@@ -550,6 +550,14 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
     #   pending_exits:   symbol -> {target_bps}
     pending_entries: dict[str, dict] = {}
     pending_exits: dict[str, dict] = {}
+    # symbol -> last observed position status, so the entering→open transition can
+    # be announced. That transition had NO notification of any kind: a paired exit
+    # gate is armed with "fires once the entry is filled", and nothing told you when
+    # the fill happened, so an overnight entry that had gone live looked exactly
+    # like one that hadn't. The only way to find out was /cancel.
+    last_status: dict[str, str] = {}
+    # symbols already warned about a stalled 'entering' — one alert each, not per tick
+    stall_warned: set[str] = set()
     # Restore waiting gates from disk — they live only in memory otherwise, so a
     # restart (crash/OOM/deploy) silently dropped every armed gate while the
     # position stayed open (observed: an overnight SKHX exit gate vanished).
@@ -1459,6 +1467,50 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                         for s, r in zip(poll_syms, results):
                             if isinstance(r, Exception):
                                 log.error(f"poll for {s} errored: {r}", exc_info=r)
+
+            # ── 1a-ii. Announce entry completion (entering → open) ──
+            # Placed outside the paper_mode/poll branch so every route to 'open'
+            # is covered, not just the HL-maker poll.
+            for _s, _p in list(pm.positions.items()):
+                _prev = last_status.get(_s)
+                last_status[_s] = _p.status
+                if _prev == "entering" and _p.status == "open":
+                    _ex = pending_exits.get(_s)
+                    _armed = ""
+                    if _ex:
+                        _armed = (f"\n🎯 exit gate is now LIVE at "
+                                  f"≥ {float(_ex['target_bps']):+.0f}bps")
+                    send_alert(
+                        f"✅ {_s} entry FILLED — position is live\n"
+                        f"   qty {_p.qty} | HL @ {fmt_px(_p.hl_entry_price)} | "
+                        f"Aster @ {fmt_px(_p.aster_entry_price)}{_armed}"
+                    )
+            for _s in [x for x in last_status if x not in pm.positions]:
+                last_status.pop(_s, None)
+                stall_warned.discard(_s)
+
+            # ── 1a-iii. Warn once if an entry stalls in 'entering' ──
+            # The general case of the dust bug: a hold_for_funding maker rests
+            # indefinitely by design, and a paired exit gate only evaluates 'open'
+            # positions, so a genuinely half-filled entry can sit for hours with its
+            # exit dormant and nothing said. Dust no longer causes this, but a real
+            # partial fill still can — so say so rather than stay silent.
+            for _s, _p in list(pm.positions.items()):
+                if _p.status != "entering" or _s in stall_warned:
+                    continue
+                _age_min = (now_ms() - (_p.entry_time or now_ms())) / 60000.0
+                if _age_min >= ENTERING_STALL_WARN_MIN:
+                    stall_warned.add(_s)
+                    _ex = pending_exits.get(_s)
+                    _note = (f"\n🎯 its exit gate ({float(_ex['target_bps']):+.0f}bps) "
+                             f"stays DORMANT until this opens"
+                             if _ex else "")
+                    send_alert(
+                        f"⏳ {_s} still ENTERING after {_age_min:.0f}m — HL maker "
+                        f"hedged {_p.aster_hedged_qty}/{_p.qty}.\n"
+                        f"   It rests until filled (no timeout on a carry hold). "
+                        f"/cancel keeps the hedged part and opens it.{_note}"
+                    )
 
             # ── 1b. Drip entries: one taker-taker bite per active drip per tick ──
             drip_syms = list(executor._drips.keys())

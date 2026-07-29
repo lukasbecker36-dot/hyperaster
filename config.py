@@ -373,6 +373,25 @@ FUNDING_ADVERSE_STOP_USD = 0.0       # disabled (no mark-to-market safety stop)
 # portion is kept, already hedged on Aster).
 MAKER_ENTRY_TIMEOUT_SEC = 300         # 5 min to fill the resting HL maker, else give up the rest
 MAKER_REPRICE_TICK_FRAC = 0.5         # reprice the HL maker if it drifts > this×tick from the touch
+
+# Smallest residual worth acting on, in USD notional. HL rejects orders under
+# ~$10 of notional, and Aster has a per-symbol min lot, so a remainder below this
+# can be neither hedged nor unwound — it is physically untradeable, not an error.
+#
+# Sized off a real incident: an SKHX entry filled 0.204 of a 0.205 target with
+# 0.203 hedged. The leftover 0.001 (~$1) failed the old `hl_filled >= qty*0.999`
+# completion test by 0.0008, and because a hold_for_funding entry has NO timeout
+# the position sat in 'entering' indefinitely — which also means its paired exit
+# gate never became eligible to fire, since that gate only looks at 'open'
+# positions. Treating sub-minimum residuals as complete is what lets the entry
+# finish. Keep this at or just above HL's minimum order value.
+MIN_TRADEABLE_NOTIONAL_USD = 11.0
+
+# Warn on Telegram once a position has sat in 'entering' this long. A carry-hold
+# maker rests indefinitely by design and a paired exit gate only evaluates 'open'
+# positions, so a half-filled entry can sit for hours with its exit dormant and
+# no notification at all. This makes the stall audible instead of silent.
+ENTERING_STALL_WARN_MIN = 10.0
 # Carry exits also run maker-first (HL post-only sell/buy, Aster IOC taker hedge).
 # If the resting HL exit maker hasn't fully filled within this long, cross the
 # unfilled remainder as a taker to complete the exit (we asked to get out).
