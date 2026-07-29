@@ -965,25 +965,32 @@ def cmd_notional(chat_id: str, arg: str):
 def cmd_enter(chat_id: str, arg: str):
     """Manually open ONE delta-neutral funding-carry hold via the monitor.
 
-    Usage: /enter SYMBOL DIRECTION NOTIONAL [BASIS_TARGET_BPS]
+    Usage: /enter SYMBOL DIRECTION NOTIONAL [ENTRY_BPS [EXIT_BPS]]
       DIRECTION: long_hl_short_aster | long_aster_short_hl
                  (aliases: buy_hl / buy_aster / L-HL/S-AST / L-AST/S-HL)
       NOTIONAL : USD per leg
-      BASIS_TARGET_BPS (optional): only fill once the executable entry basis is
-                 at or better than this (bps, in your favour). Omit = enter now.
+      ENTRY_BPS (optional): only fill once the executable entry basis is at or
+                 better than this (bps, in your favour). Omit, or 'now', =
+                 enter immediately.
+      EXIT_BPS (optional): arm a /close gate at this exit basis AS SOON AS the
+                 entry fills. Set both and the whole round trip runs unattended —
+                 the point being you're asleep while an Asian session prints the
+                 exit level.
 
-    Held for funding carry — the bot NEVER auto-closes it: no basis-convergence
-    exit, no mark-to-market safety stop, no timeout. It closes ONLY on a manual
-    /close, so you own the exit (and the risk) entirely.
+    Held for funding carry — the bot NEVER auto-closes it on convergence, a
+    mark-to-market stop or a timeout. With EXIT_BPS it closes on that basis gate;
+    otherwise only on a manual /close.
     Leverage 5x + isolated margin are applied automatically on entry.
     In live mode this places REAL orders and requires a typed YES.
     """
     toks = arg.split()
-    if len(toks) not in (3, 4):
+    if len(toks) not in (3, 4, 5):
         send(chat_id,
-             "Usage: /enter SYMBOL DIRECTION NOTIONAL [BASIS_TARGET_BPS]\n"
+             "Usage: /enter SYMBOL DIRECTION NOTIONAL [ENTRY_BPS [EXIT_BPS]]\n"
              "e.g. /enter SMSN long_hl_short_aster 1000\n"
-             "     /enter SMSN buy_hl 1000 -10   (wait until entry basis ≥ -10bps)\n"
+             "     /enter SMSN buy_hl 1000 -10        (wait until entry basis ≥ -10bps)\n"
+             "     /enter SKHX hl 1000 100 -20        (enter ≥100bps, then auto-arm exit ≥-20bps)\n"
+             "     /enter SKHX hl 1000 now -20        (enter now, arm exit ≥-20bps)\n"
              "DIRECTION aliases: buy_hl / buy_aster / L-HL/S-AST / L-AST/S-HL\n"
              "Check /basis SYM first — it shows the live level each gate compares against.")
         return
@@ -1001,16 +1008,26 @@ def cmd_enter(chat_id: str, arg: str):
         send(chat_id, f"Bad notional {toks[2]!r} — must be a positive number of USD.")
         return
     target_bps = None
-    if len(toks) == 4:
+    if len(toks) >= 4 and toks[3].lower() not in ("now", "-", "market"):
         try:
             target_bps = float(toks[3])
         except ValueError:
-            send(chat_id, f"Bad basis target {toks[3]!r} — must be a number (bps).")
+            send(chat_id, f"Bad entry basis target {toks[3]!r} — must be a number (bps), "
+                          "or 'now' to enter immediately.")
+            return
+    exit_bps = None
+    if len(toks) == 5:
+        try:
+            exit_bps = float(toks[4])
+        except ValueError:
+            send(chat_id, f"Bad exit basis target {toks[4]!r} — must be a number (bps).")
             return
 
     req = {"action": "enter", "symbol": symbol, "direction": direction, "notional": notional}
     if target_bps is not None:
         req["target_bps"] = target_bps
+    if exit_bps is not None:
+        req["exit_target_bps"] = exit_bps
     rc, active = run(["systemctl", "is-active", SERVICE], timeout=10)
     if active.strip() != "active":
         send(chat_id, f"⚠️ trader service is {active.strip()} — start it first (/start), "
@@ -1018,17 +1035,43 @@ def cmd_enter(chat_id: str, arg: str):
         return
 
     short = "L-HL/S-AST" if direction == "long_hl_short_aster" else "L-AST/S-HL"
-    gate = f" once basis ≥ {target_bps:.0f}bps" if target_bps is not None else ""
+    gate = f" once basis ≥ {target_bps:.0f}bps" if target_bps is not None else " NOW"
+
+    # Show the implied round trip. entry + exit basis IS the gross round trip, so
+    # a typo'd pair that can never cover fees is visible before you commit rather
+    # than after the entry has filled and the exit sits unreachable all night.
+    econ = ""
+    if exit_bps is not None:
+        try:
+            from config import carry_round_trip_fee
+            fee_bps = carry_round_trip_fee(symbol) * 10000
+        except Exception:
+            fee_bps = 4.8
+        if target_bps is not None:
+            rt = target_bps + exit_bps
+            net = rt - fee_bps
+            flag = "" if net > 0 else "  ⚠️ NEGATIVE — this pair cannot cover fees"
+            econ = (f"\nimplied round trip: {target_bps:+.0f} + {exit_bps:+.0f} = "
+                    f"{rt:+.0f}bps gross, {net:+.0f}bps net of {fee_bps:.1f}bps fees{flag}")
+        else:
+            econ = (f"\nexit gate at {exit_bps:+.0f}bps; entry is at market so the round "
+                    f"trip depends on your fill (fees {fee_bps:.1f}bps)")
+    exit_note = (f"\nOn fill it auto-arms a /close gate at exit basis ≥ {exit_bps:+.0f}bps."
+                 if exit_bps is not None else "")
+
     if read_mode() == "live":
         _PENDING_ENTER[chat_id] = (req, time.time() + _CONFIRM_TTL)
+        hold = ("Closes on that exit gate (or a manual /close)." if exit_bps is not None
+                else "Held indefinitely — NO auto-stop or timeout, closes only on /close.")
         send(chat_id,
-             f"⚠️ LIVE order: enter {symbol} {short} ${notional:.0f}/leg as a funding hold{gate}.\n"
-             "5x isolated. Held indefinitely — NO auto-stop or timeout, closes only on /close.\n"
+             f"⚠️ LIVE order: enter {symbol} {short} ${notional:.0f}/leg as a funding "
+             f"hold{gate}.{exit_note}{econ}\n"
+             f"5x isolated. {hold}\n"
              "This places REAL orders. Reply YES within 60s to confirm.")
         return
     _enqueue_manual(req)
-    send(chat_id, f"📩 queued [PAPER] entry: {symbol} {short} ${notional:.0f}{gate}. "
-                  "You'll get an alert when it's placed.")
+    send(chat_id, f"📩 queued [PAPER] entry: {symbol} {short} ${notional:.0f}{gate}."
+                  f"{exit_note}{econ}\nYou'll get an alert when it's placed.")
 
 
 def cmd_close(chat_id: str, arg: str):
@@ -1388,7 +1431,7 @@ def cmd_help(chat_id: str, _arg: str):
          "/opps [N] — top basis opportunities by 24h p90 round-trip\n"
          "/funding [n] — top funding-carry opportunities\n"
          "/backtest [hours] [SYM] — backtest convergence on recent candles\n"
-         "/enter SYM DIR NOTIONAL [basis_bps] — open a funding hold; basis_bps waits for a fill level\n"
+         "/enter SYM DIR NOTIONAL [entry_bps [exit_bps]] — funding hold; entry_bps waits for a fill level, exit_bps auto-arms the close on fill\n"
          "/close SYM [bps] [hl|aster] [USD] — close full or partial\n"
          "/cancel SYM — cancel a pending gate/drip, or abort an in-progress entry/close\n"
          "/drip SYM DIR NOTIONAL MIN_BPS BITE_QTY — taker-taker drip entry\n"

@@ -154,7 +154,8 @@ def _write_pending_gates(pending_entries: dict, pending_exits: dict,
             "entries": {
                 s: {"direction": r["direction"], "notional": r["notional"],
                     "orig_notional": r.get("orig_notional", r["notional"]),
-                    "target_bps": r["target_bps"]}
+                    "target_bps": r["target_bps"],
+                    "exit_target_bps": r.get("exit_target_bps")}
                 for s, r in pending_entries.items()
             },
             "exits": {
@@ -221,19 +222,27 @@ def _restore_pending_gates(pending_entries: dict, pending_exits: dict, pm, alert
         try:
             expires_ms = (now_ms() + MANUAL_ENTRY_GATE_TIMEOUT_MIN * 60_000
                           if MANUAL_ENTRY_GATE_TIMEOUT_MIN > 0 else 0)
+            ex_t = r.get("exit_target_bps")
             pending_entries[sym] = {
                 "direction": r["direction"],
                 "notional": float(r["notional"]),
                 "orig_notional": float(r.get("orig_notional", r["notional"])),
                 "target_bps": float(r["target_bps"]),
                 "expires_ms": expires_ms,
+                "exit_target_bps": (float(ex_t) if ex_t is not None else None),
             }
-            restored.append(f"ENTER {sym} ≥{float(r['target_bps']):.0f}bps")
+            ex_note = (f" → exit ≥{float(ex_t):+.0f}bps" if ex_t is not None else "")
+            restored.append(f"ENTER {sym} ≥{float(r['target_bps']):.0f}bps{ex_note}")
         except Exception:
             continue
     for sym, r in (data.get("exits") or {}).items():
         pos = pm.get(sym)
-        if not pos or pos.status != "open":   # only re-arm exits on a live position
+        # Any live position, not just 'open'. A paired /enter arms its exit gate
+        # while the maker is still resting ('entering'), and requiring 'open' here
+        # silently dropped that gate on a restart — precisely the overnight case
+        # the pairing exists for. evaluate_gated_orders still won't act until the
+        # position is actually open, so re-arming early is safe.
+        if not pos:
             continue
         try:
             pe = {"target_bps": float(r["target_bps"])}
@@ -242,7 +251,8 @@ def _restore_pending_gates(pending_entries: dict, pending_exits: dict, pm, alert
             if r.get("close_notional"):
                 pe["close_notional"] = float(r["close_notional"])
             pending_exits[sym] = pe
-            restored.append(f"CLOSE {sym} ≥{float(r['target_bps']):.0f}bps")
+            note = "" if pos.status == "open" else f" (position {pos.status})"
+            restored.append(f"CLOSE {sym} ≥{float(r['target_bps']):.0f}bps{note}")
         except Exception:
             continue
     if restored:
@@ -877,6 +887,9 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                             "orig_notional": notional,
                             "target_bps": float(target),
                             "expires_ms": expires_ms,
+                            # Armed as a /close gate the moment the entry fills,
+                            # so an overnight round trip needs no attendance.
+                            "exit_target_bps": cmd.get("exit_target_bps"),
                         }
                         exp_str = (f"expires {MANUAL_ENTRY_GATE_TIMEOUT_MIN}min"
                                    if MANUAL_ENTRY_GATE_TIMEOUT_MIN > 0 else "no expiry")
@@ -887,10 +900,17 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                             f"Aster {aster_symbol_for(symbol)}"
                         )
                     else:
+                        # Immediate entry (`/enter SYM DIR NOTIONAL [now] [EXIT]`).
                         ok, msg = await executor.force_entry_maker(
                             symbol, direction, notional
                         )
-                        send_alert(f"/enter {symbol}: {'OK' if ok else 'FAILED'} — {msg}")
+                        armed = ""
+                        ex_t = cmd.get("exit_target_bps")
+                        if ok and ex_t is not None:
+                            pending_exits[symbol] = {"target_bps": float(ex_t)}
+                            armed = (f"\n🎯 exit gate ARMED at ≥ {float(ex_t):+.0f}bps "
+                                     f"(fires once the entry is filled)")
+                        send_alert(f"/enter {symbol}: {'OK' if ok else 'FAILED'} — {msg}{armed}")
                 elif action == "close":
                     pos = pm.get(symbol)
                     if not pos:
@@ -1217,9 +1237,19 @@ async def run_monitor(paper_mode: bool, symbol_filter: list[str] | None):
                     min_entry_basis=min_basis,
                 )
                 if ok:
+                    ex_t = req.get("exit_target_bps")
                     pending_entries.pop(symbol, None)
+                    armed = ""
+                    if ex_t is not None:
+                        # Arm immediately, while the position is still 'entering'.
+                        # evaluate_gated_orders' exit loop already skips anything
+                        # not 'open', so it simply waits for the maker to fill —
+                        # no need to hook the several finalisation branches.
+                        pending_exits[symbol] = {"target_bps": float(ex_t)}
+                        armed = (f"\n🎯 exit gate ARMED at ≥ {float(ex_t):+.0f}bps "
+                                 f"(fires once the entry is filled)")
                     send_alert(f"/enter {symbol}: basis {basis:.0f}bps ≥ target "
-                               f"({GATE_CONFIRM_TICKS} ticks) — OK — {msg}")
+                               f"({GATE_CONFIRM_TICKS} ticks) — OK — {msg}{armed}")
                 else:
                     # Keep the gate ARMED on failure. It used to be consumed
                     # regardless, so a book that broke down for a few seconds
