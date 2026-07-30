@@ -1157,10 +1157,18 @@ class ExchangeClient:
 
     def format_hl_price(self, symbol: str, price: float) -> str:
         spec = self.hl_specs.get(symbol, ContractSpec())
-        # Snap to tick boundary first, then format for the wire.
-        tick = spec.tick_size
-        snapped = round(round(price / tick) * tick, spec.price_precision)
-        return self._to_wire(f"{snapped:.{spec.price_precision}f}")
+        # HL enforces BOTH a tick AND a 5-significant-figure cap. A stored/inferred
+        # tick FINER than the sig-fig grid (e.g. 0.01 for SKHX ~1055, whose grid is
+        # 0.1) produces a 6-sig-fig price HL rejects: "Price must be divisible by
+        # tick size". A real tick is never finer than the sig-fig grid, so snap to
+        # the COARSER of the two — always HL-valid, at worst resting one grid step
+        # away. Belt-and-suspenders against a bad book probe.
+        sig_tick = _hl_sigfig_tick(price) if price > 0 else 0.0
+        tick = max(spec.tick_size, sig_tick) or spec.tick_size or 0.01
+        snapped = round(price / tick) * tick
+        tick_str = f"{tick:.10f}".rstrip("0")
+        dec = len(tick_str.split(".")[1]) if "." in tick_str else 0
+        return self._to_wire(f"{round(snapped, dec):.{dec}f}")
 
     def format_hl_qty(self, symbol: str, qty: float) -> str:
         spec = self.hl_specs.get(symbol, ContractSpec())
