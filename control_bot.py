@@ -1421,6 +1421,25 @@ def cmd_opps(chat_id: str, arg: str):
     send_pre(chat_id, out, code)
 
 
+def cmd_revert(chat_id: str, arg: str):
+    """Rank names whose CURRENT basis has flipped sign vs its 24h average — the
+    spread is stretched away from its mean, so a revert-to-mean round trip is on.
+
+    Score = (|hl now|+|hl avg| + |ast now|+|ast avg|)/2. Reads the capture DB,
+    no network. Usage: /revert [N]  (default 5)
+    """
+    n = arg.strip().split()[0] if arg.strip() else "5"
+    if not n.isdigit():
+        n = "5"
+    script = BASE_DIR / "scripts" / "basis_reversion.py"
+    send(chat_id, "⏳ scanning for sign-flip reversions…")
+    code, out = run([PYTHON, str(script), n], timeout=180)
+    if code == 124:
+        out = (out + " — first run builds a fast index over the capture DB; "
+               "re-run /revert and it'll be quick.")
+    send_pre(chat_id, out, code)
+
+
 def cmd_help(chat_id: str, _arg: str):
     send(chat_id,
          "Commands:\n"
@@ -1429,6 +1448,7 @@ def cmd_help(chat_id: str, _arg: str):
          "/book SYM — top-5 order book on both venues\n"
          "/basis SYM — live entry/exit basis + 24h avg (gate reference)\n"
          "/opps [N] — top basis opportunities by 24h p90 round-trip\n"
+         "/revert [N] — names whose basis flipped sign vs 24h avg (reversion)\n"
          "/funding [n] — top funding-carry opportunities\n"
          "/backtest [hours] [SYM] — backtest convergence on recent candles\n"
          "/enter SYM DIR NOTIONAL [entry_bps [exit_bps]] — funding hold; entry_bps waits for a fill level, exit_bps auto-arms the close on fill\n"
@@ -1460,6 +1480,7 @@ HANDLERS = {
     "/pnl": cmd_pnl, "/trades": cmd_trades,
     "/balance": cmd_balance, "/balances": cmd_balance,
     "/book": cmd_book, "/basis": cmd_basis, "/opps": cmd_opps,
+    "/revert": cmd_revert, "/flip": cmd_revert,
     "/backtest": cmd_backtest, "/bt": cmd_backtest,
     "/funding": cmd_funding, "/carry": cmd_funding,
     "/enter": cmd_enter, "/close": cmd_close, "/cancel": cmd_cancel,
@@ -1536,6 +1557,7 @@ def main():
             {"command": "book", "description": "Top-5 order book on both venues: SYM"},
             {"command": "basis", "description": "Live entry/exit basis + 24h avg: SYM"},
             {"command": "opps", "description": "Top basis opportunities (24h p90): [N]"},
+            {"command": "revert", "description": "Basis flipped sign vs 24h avg — reversion: [N]"},
             {"command": "funding", "description": "Top funding-carry opportunities"},
             {"command": "backtest", "description": "Backtest convergence: [hours] [SYM]"},
             {"command": "positions", "description": "Open positions + pending basis gates"},
