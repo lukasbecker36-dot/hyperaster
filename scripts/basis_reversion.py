@@ -20,8 +20,10 @@ This ≈ the revert-to-mean round trip you could capture: enter now on the leg
 that's currently favourable, exit when it reverts through its average.
 
 `enter` = the direction whose leg is favourable NOW (positive) — the one you'd
-open here and hold for the reversion. `/basis SYM` for the exact levels, carry
-and book depth before trading.
+open here and hold for the reversion. `fund24h` = the net funding actually
+SETTLED over the last 24h for that enter direction (+ = you'd have been paid to
+hold, − = you'd have paid), fetched from both venues for the displayed names.
+`/basis SYM` for the exact levels, live-vs-realised carry and book depth.
 
 Scope mirrors /opps: NON_EQUITY always excluded; BLOCKED excluded unless
 --blocked; crypto excluded under EQUITY_ONLY.
@@ -39,7 +41,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import (DATA_DIR, NON_EQUITY_SYMBOLS, BLOCKED_SYMBOLS,
-                    EQUITY_ONLY, is_crypto_symbol)
+                    EQUITY_ONLY, is_crypto_symbol, HYPERLIQUID_API, ASTER_BASE,
+                    aster_symbol_for, load_hl_dex_map)
 
 CAPTURE_DB = os.path.join(DATA_DIR, "orderbook_capture.db")
 DAY_MS = 24 * 3_600_000
@@ -68,6 +71,66 @@ def _ensure_cover_index():
 
 def _fmt_n(n):
     return f"{n/1000:.1f}k" if n >= 1000 else str(n)
+
+
+def _realised_funding(symbols, workers=8):
+    """{sym: (hl_sum, ast_sum)} — funding ACTUALLY SETTLED over the last 24h,
+    summed per venue (fractions). Same source + method /basis uses: HL
+    fundingHistory + Aster fundingRate, summed (no window rescaling, so a one-off
+    print can't be multiplied across the day). Network, but bounded to the names
+    being displayed and run in a thread pool. A venue is None if its fetch failed
+    → the caller shows the funding column as unknown rather than guessing.
+
+    Net realised carry for a direction (bps):
+        L-AST/S-HL = (hl_sum - ast_sum) * 1e4   (short HL receives, long Aster pays)
+        L-HL/S-AST = the negative.
+    """
+    import json as _json
+    import urllib.request
+    from concurrent.futures import ThreadPoolExecutor
+
+    dex_map = load_hl_dex_map()
+    start = int(time.time() * 1000) - DAY_MS
+    now = int(time.time() * 1000)
+
+    def one(sym):
+        hl_sum = ast_sum = None
+        # HL fundingHistory (POST, dex-aware coin from the persisted map).
+        try:
+            coin = sym if dex_map.get(sym, "xyz") == "" else f"xyz:{sym}"
+            body = _json.dumps({"type": "fundingHistory", "coin": coin,
+                                "startTime": start}).encode()
+            req = urllib.request.Request(
+                HYPERLIQUID_API, data=body,
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                rows = _json.loads(r.read())
+            rates = [float(x.get("fundingRate") or 0)
+                     for x in (rows or []) if isinstance(x, dict)]
+            if rates:
+                hl_sum = sum(rates)
+        except Exception:
+            pass
+        # Aster fundingRate (GET), only settlements inside the 24h window.
+        try:
+            url = (f"{ASTER_BASE}/fapi/v1/fundingRate?"
+                   f"symbol={aster_symbol_for(sym)}&startTime={start}")
+            with urllib.request.urlopen(url, timeout=10) as r:
+                rows = _json.loads(r.read())
+            rates = [float(x.get("fundingRate") or 0)
+                     for x in (rows or []) if isinstance(x, dict)
+                     and start <= int(x.get("fundingTime") or 0) <= now]
+            if rates:
+                ast_sum = sum(rates)
+        except Exception:
+            pass
+        return sym, (hl_sum, ast_sum)
+
+    out = {}
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for sym, val in ex.map(one, symbols):
+            out[sym] = val
+    return out
 
 
 def _load_reversion(include_blocked: bool = False):
@@ -150,15 +213,26 @@ def run(top: int, include_blocked: bool = False):
               f"signs, both ≥{MIN_FLIP_BPS:.0f}bp). Nothing stretched right now.")
         return
 
+    shown = ranked[:top]
+    # 24h realised funding for the names we'll display, for their enter direction.
+    funds = _realised_funding([r[0] for r in shown])
+
     hdr = (f"{'#':>2} {'SYM':<7}{'hl n/avg':>13}{'ast n/avg':>13}"
-           f"{'score':>7} {'enter':<6}{'n':>6}")
+           f"{'score':>7} {'enter':<6}{'fund24h':>8}{'n':>6}")
     lines = ["🔁 Basis reversion — now flipped vs 24h avg (bps)", hdr,
              "─" * len(hdr)]
-    for i, (sym, hn, ha, an, aa, score, enter, n) in enumerate(ranked[:top], 1):
+    for i, (sym, hn, ha, an, aa, score, enter, n) in enumerate(shown, 1):
         hl_str = f"{hn:+.0f}/{ha:+.0f}"
         ast_str = f"{an:+.0f}/{aa:+.0f}"
+        hl_sum, ast_sum = funds.get(sym, (None, None))
+        if hl_sum is None or ast_sum is None:
+            f_str = f"{'?':>8}"
+        else:
+            ashl = (hl_sum - ast_sum) * 10000            # L-AST/S-HL realised
+            fund = ashl if enter == "L-AST" else -ashl   # for THIS enter dir
+            f_str = f"{fund:>+8.1f}"
         lines.append(f"{i:>2} {sym:<7}{hl_str:>13}{ast_str:>13}"
-                     f"{score:>7.0f} {enter:<6}{_fmt_n(n):>6}")
+                     f"{score:>7.0f} {enter:<6}{f_str}{_fmt_n(n):>6}")
     lines.append("─" * len(hdr))
     lines.append("Shows names whose CURRENT basis sits on the OPPOSITE side of")
     lines.append("its 24h average — stretched, so a revert-to-mean round trip is")
@@ -166,6 +240,9 @@ def run(top: int, include_blocked: bool = False):
     lines.append("(|hl now|+|hl avg| + |ast now|+|ast avg|)/2 ≈ the reversion")
     lines.append("round trip available. enter = the leg favourable NOW (the")
     lines.append("direction you'd open here and hold for the revert).")
+    lines.append("fund24h = net funding actually SETTLED over the last 24h for")
+    lines.append("the enter direction (+ paid you / − you paid); realised, so a")
+    lines.append("one-off print can skew it — /basis SYM for live vs realised.")
     scope = []
     if EQUITY_ONLY:
         scope.append("equity only (EQUITY_ONLY)")
