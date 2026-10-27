@@ -206,8 +206,10 @@ def tg(text: str):
 
 
 def arb_holds(name: str) -> bool:
-    """True if the arb bot has a live, non-closed position in this symbol ('error'
-    rows count: they may still hold a venue leg)."""
+    """True if the arb bot is actively working a live position in this symbol.
+    'error' rows are left out: they are failed exits the arb no longer tracks (its
+    /forget can't clear them), and any HL leg one did leave behind is caught anyway
+    by the venue check in move_to, which parks a name whose HL position we didn't open."""
     try:
         from config import DB_PATH
         db = DB_PATH
@@ -215,8 +217,8 @@ def arb_holds(name: str) -> bool:
         db = str(DATA / "positions.db")
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
-        n = con.execute("SELECT COUNT(*) FROM positions WHERE symbol=? AND status != 'closed' AND paper=0",
-                        (name,)).fetchone()[0]
+        n = con.execute("SELECT COUNT(*) FROM positions WHERE symbol=? AND paper=0 "
+                        "AND status IN ('entering', 'open', 'exiting')", (name,)).fetchone()[0]
         con.close()
         return n > 0
     except Exception as e:

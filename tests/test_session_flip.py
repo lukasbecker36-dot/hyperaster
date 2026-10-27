@@ -203,11 +203,12 @@ def test_arb_holds_reads_live_rows_only(tmp_path, monkeypatch):
     con = sqlite3.connect(db)
     con.execute("CREATE TABLE positions (symbol TEXT, status TEXT, paper INT)")
     con.executemany("INSERT INTO positions VALUES (?,?,?)",
-                    [("SKHX", "open", 1), ("EWY", "closed", 0), ("SMSN", "error", 0)])
+                    [("SKHX", "open", 1), ("EWY", "closed", 0), ("SMSN", "error", 0), ("ZHIPU", "exiting", 0)])
     con.commit(); con.close()
     import config
     monkeypatch.setattr(config, "DB_PATH", str(db))
-    assert not sf.arb_holds("SKHX") and not sf.arb_holds("EWY") and sf.arb_holds("SMSN")
+    assert not sf.arb_holds("SKHX") and not sf.arb_holds("EWY")      # paper / closed
+    assert not sf.arb_holds("SMSN") and sf.arb_holds("ZHIPU")         # stale error row / live exit
 
 
 def test_flip_reserve_only_when_live(tmp_path, monkeypatch):
