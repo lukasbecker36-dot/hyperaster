@@ -263,3 +263,12 @@ def test_replay_trades_separates_modes_and_counts_legs():
     assert live["total"]["first"].startswith("2026-10-27T01:42")
     paper = sf.replay_trades(rows, "paper")
     assert paper["total"]["realised"] == pytest.approx(-1.0) and paper["total"]["wins"] == 0
+
+
+def test_retimed_boundaries():
+    assert sf.target_side("SKHX", utc(2026, 10, 27, 5, 59)) == -1     # still short
+    assert sf.target_side("SKHX", utc(2026, 10, 27, 6, 0)) == +1      # long from 06:00
+    assert sf.target_side("ZHIPU", utc(2026, 10, 27, 1, 14)) == +1    # still long
+    assert sf.target_side("ZHIPU", utc(2026, 10, 27, 1, 15)) == -1    # short from 01:15
+    assert sf.next_boundary("EWY", utc(2026, 10, 27, 3, 0)) == utc(2026, 10, 27, 6, 0)
+    assert sf.next_boundary("MINIMAX", utc(2026, 10, 27, 9, 0)) == utc(2026, 10, 28, 1, 15)

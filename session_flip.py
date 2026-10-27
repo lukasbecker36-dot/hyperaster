@@ -16,12 +16,12 @@ THE EDGE (scratchpad flip_pnl.py / asia_cal.py, 2026-10-27)
   months, and the Korean names' edge has shrunk since July. Hence paper first.
 
 THE RULE (UTC, Mon-Fri; weekends hold the overnight side from Friday to Monday)
-  KR  (KRX 09:00-15:30 KST)   long 07:00 -> 00:00, short 00:00 -> 07:00
-  HK  (HKEX 09:30-16:00 HKT)  long 08:00 -> 01:00, short 01:00 -> 08:00
+  KR  (KRX 09:00-15:30 KST)   long 06:00 -> 00:00, short 00:00 -> 06:00
+  HK  (HKEX 09:30-16:00 HKT)  long 08:00 -> 01:15, short 01:15 -> 08:00
   CN  (SSE 09:30-15:00 CST)   short 07:00 -> 01:00, long 01:00 -> 07:00   (reversed)
   Each flip trades the whole move at once (2x notional) with an IOC at the touch,
   `lead_seconds` before the boundary, so the overnight leg is out before the open
-  prints. Same hours the backtest used.
+  prints. The backtest used 00/07 (KR) and 01/08 (HK); see GROUPS for the retiming.
 
 CONTROL
   data/sessionflip.json          config, written by control_bot (/sf ...)
@@ -66,10 +66,18 @@ CMD_DIR = DATA / "sessionflip_cmd"
 
 log = logging.getLogger("sessionflip")
 
-# Session windows in UTC minutes-of-day, and which side is held OUTSIDE the session.
+# Flip windows in UTC minutes-of-day, and which side is held OUTSIDE the window.
+# Tuned 2026-10-27 (scratchpad flip_timing.py, 15m sweep over ~35 days + hourly halves):
+#   KR flips long at 06:00, 30 min before the 06:30 close: the session's fall is done
+#      by then and the run into the closing auction tends to rise (+17bp/day on the 15m
+#      grid; better in the recent hourly half, flat in the earlier one).
+#   HK flips short at 01:15, 15 min before the 01:30 open: the drop is AT the open, so
+#      shorting after it gives most of the edge away (01:15 +269 vs 01:00 +239bp/day).
+#   KR still shorts at the 00:00 open less the lead: flipping 2h early (22:00) only won
+#   in Apr-Jul, and the first trade at 00:00 itself prints badly (-28 vs +13 at 23:45).
 GROUPS = {
-    "KR": {"open": 0, "close": 7 * 60, "off_side": +1},
-    "HK": {"open": 1 * 60, "close": 8 * 60, "off_side": +1},
+    "KR": {"open": 0, "close": 6 * 60, "off_side": +1},
+    "HK": {"open": 1 * 60 + 15, "close": 8 * 60, "off_side": +1},
     "CN": {"open": 1 * 60, "close": 7 * 60, "off_side": -1},
 }
 NAME_GROUP = {
