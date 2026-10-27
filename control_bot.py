@@ -1621,7 +1621,14 @@ def cmd_sf(chat_id: str, arg: str):
 
 def cmd_help(chat_id: str, _arg: str):
     send(chat_id,
-         "Commands:\n"
+         "SESSION FLIP (Korea/HK long overnight, short in session):\n"
+         "/sf — positions, P&L, next flips\n"
+         "/sf_trades · /sf_pause · /sf_resume · /sf_on · /sf_off (closes all)\n"
+         "/sf_live (asks YES) · /sf_paper\n"
+         "/sf notional [SYM] USD · /sf lev [SYM] N · /sf names SKHX,EWY,MINIMAX,ZHIPU\n"
+         "/sf close · /sf reset SYM\n"
+         "/balance — balances on both venues · /restart — pull + restart everything\n"
+         "\nARB (idle — not in the menu, still typeable):\n"
          "/status — service state + spreads + positions\n"
          "/spreads — current spread vs threshold detail\n"
          "/book SYM — top-5 order book on both venues\n"
@@ -1651,10 +1658,7 @@ def cmd_help(chat_id: str, _arg: str):
          "/start — start trader\n"
          "/stop YES — stop trader (positions left open!)\n"
          "/restart — git pull + restart trader, capture, session flip & control bot\n"
-         "/flatten YES — emergency close ALL positions\n"
-         "\nSession flip (Korea/HK overnight long, short in session; separate service):\n"
-         "/sf — status + P&L · /sf on|off|pause|resume · /sf paper · /sf live\n"
-         "/sf notional [SYM] USD · /sf lev [SYM] N · /sf names SKHX,EWY,MINIMAX,ZHIPU · /sf close · /sf reset SYM · /sf trades [n]")
+         "/flatten YES — emergency close ALL arb positions")
 
 
 HANDLERS = {
@@ -1677,6 +1681,9 @@ HANDLERS = {
     "/flatten": cmd_flatten, "/help": cmd_help,
     "/sf": cmd_sf, "/sessionflip": cmd_sf,
 }
+# One-tap menu shortcuts: /sf_trades -> /sf trades, etc. Any arguments pass through.
+for _sub in ("trades", "pause", "resume", "off", "on", "live", "paper", "close", "status"):
+    HANDLERS[f"/sf_{_sub}"] = (lambda s: lambda chat_id, arg: cmd_sf(chat_id, f"{s} {arg}".strip()))(_sub)
 
 
 def handle_message(msg: dict):
@@ -1738,39 +1745,20 @@ def main():
     print(f"Control bot up. service={SERVICE} allowed={ALLOWED} python={PYTHON}", flush=True)
 
     try:
+        # Menu = the session-flip workflow only. The arb is idle (auto-entry off), so its
+        # commands are left out of the menu but still work when typed (see /help).
         _api("setMyCommands", {"commands": json.dumps([
-            {"command": "status", "description": "Service state + spreads + positions"},
-            {"command": "spreads", "description": "Current spread vs threshold"},
-            {"command": "book", "description": "Top-5 order book on both venues: SYM"},
-            {"command": "basis", "description": "Live entry/exit basis + 24h avg: SYM"},
-            {"command": "opps", "description": "Top basis opportunities (24h p90): [N]"},
-            {"command": "revert", "description": "Basis flipped sign vs 24h avg — reversion: [N]"},
-            {"command": "funding", "description": "Top funding-carry opportunities"},
-            {"command": "backtest", "description": "Backtest convergence: [hours] [SYM]"},
-            {"command": "positions", "description": "Open positions + pending basis gates"},
-            {"command": "enter", "description": "Open a funding hold: SYM DIR NOTIONAL [basis_bps]"},
-            {"command": "close", "description": "Close position: SYM [bps] [hl|aster] [USD]"},
-            {"command": "cancel", "description": "Cancel a pending basis-gated order: SYM"},
-            {"command": "drip", "description": "Taker-taker drip: SYM DIR NOTIONAL MIN_BPS BITE_QTY"},
-            {"command": "drip_exit", "description": "Drip exit: SYM MAX_BPS BITE_QTY [NOTIONAL]"},
-            {"command": "import", "description": "Adopt existing venue positions: [SYM]"},
-            {"command": "forget", "description": "Drop a position already closed on the venue: SYM"},
-            {"command": "autoentry", "description": "Toggle auto basis-arb entry: on|off"},
-            {"command": "autoexit", "description": "Toggle auto convergence/target exit: on|off"},
-            {"command": "notional", "description": "Set auto-entry size per leg: USD|reset"},
-            {"command": "trades", "description": "Last N closed trades with P&L"},
-            {"command": "pnl", "description": "Realised P&L today + all-time"},
+            {"command": "sf", "description": "Session flip: positions, P&L, next flips"},
+            {"command": "sf_trades", "description": "Last session-flip fills"},
+            {"command": "sf_pause", "description": "Hold positions, stop flipping"},
+            {"command": "sf_resume", "description": "Resume flipping"},
+            {"command": "sf_off", "description": "Close all session-flip positions and stop"},
+            {"command": "sf_on", "description": "Start session flip"},
+            {"command": "sf_live", "description": "Switch session flip to LIVE (asks YES)"},
+            {"command": "sf_paper", "description": "Switch session flip to paper"},
             {"command": "balance", "description": "USDC/USDT balances on both venues"},
-            {"command": "log", "description": "Last n journal lines"},
-            {"command": "mode", "description": "Show configured mode"},
-            {"command": "paper", "description": "Switch to paper mode"},
-            {"command": "live", "description": "Switch to live mode (YES to confirm)"},
-            {"command": "start", "description": "Start trader"},
-            {"command": "stop", "description": "Stop trader (YES to confirm)"},
-            {"command": "restart", "description": "Git pull + restart trader & bot"},
-            {"command": "flatten", "description": "Emergency close ALL positions"},
-            {"command": "sf", "description": "Session flip: status|on|off|pause|paper|live|notional|names|close"},
-            {"command": "help", "description": "Command list"},
+            {"command": "restart", "description": "Git pull + restart all services"},
+            {"command": "help", "description": "All commands"},
         ])}, timeout=10)
     except Exception as e:
         print(f"setMyCommands failed: {e}", flush=True)
