@@ -706,6 +706,15 @@ def cmd_restart(chat_id: str, _arg: str):
                  f"manually to pick up the HL backoff + prune. Set "
                  f"CAPTURE_SERVICE_NAME to silence this.")
 
+    # 1c. The session-flip service (its own unit). It persists state after every
+    #     fill and reconciles on boot, so a restart between flips is harmless.
+    _, flip_load = run(["systemctl", "show", FLIP_SERVICE, "--property=LoadState", "--value"], timeout=10)
+    if flip_load.strip() == "loaded":
+        rc_f, out_f = run(["systemctl", "restart", FLIP_SERVICE], timeout=30)
+        time.sleep(2)
+        _, flip_active = run(["systemctl", "is-active", FLIP_SERVICE], timeout=10)
+        send(chat_id, f"session-flip restart: {'ok' if rc_f == 0 else 'FAILED'} — now {flip_active}\n{out_f}".strip())
+
     # 2. Restart the control bot itself LAST — this tears down THIS process, so it
     #    must be the final step and can't confirm afterwards. Skip if it's the same
     #    unit as the trader (already restarted above). Verify the unit exists first
@@ -1440,6 +1449,168 @@ def cmd_revert(chat_id: str, arg: str):
     send_pre(chat_id, out, code)
 
 
+# ── Session flip (session_flip.py, its own service) ──
+# The strategy reads data/sessionflip.json every 10s, so config changes here take
+# effect without a restart. One-shot actions (close, reset) go through a request dir.
+SF_CONFIG = BASE_DIR / "data" / "sessionflip.json"
+SF_STATE = BASE_DIR / "data" / "sessionflip_state.json"
+SF_TRADES = BASE_DIR / "data" / "sessionflip_trades.csv"
+SF_CMD_DIR = BASE_DIR / "data" / "sessionflip_cmd"
+FLIP_SERVICE = os.getenv("FLIP_SERVICE_NAME", f"{SERVICE}-flip")
+# chat_id -> (subcommand args, expires_at) for /sf actions that need a YES
+_PENDING_SF: dict[str, tuple[str, float]] = {}
+
+
+def _sf_cfg() -> dict:
+    from session_flip import DEFAULT_CONFIG
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        cfg.update(json.loads(SF_CONFIG.read_text()))
+    except Exception:
+        pass
+    return cfg
+
+
+def _sf_write(cfg: dict):
+    tmp = SF_CONFIG.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cfg, indent=1))
+    tmp.replace(SF_CONFIG)
+
+
+def _sf_request(action: str, **kw):
+    SF_CMD_DIR.mkdir(parents=True, exist_ok=True)
+    (SF_CMD_DIR / f"{time.time_ns()}.json").write_text(json.dumps({"action": action, **kw}))
+
+
+def _sf_live_open() -> list[str]:
+    try:
+        st = json.loads(SF_STATE.read_text())
+    except Exception:
+        return []
+    return [n for n, p in st.get("pos", {}).items() if p.get("qty") and p.get("mode") == "live"]
+
+
+def _sf_status() -> str:
+    from datetime import datetime, timezone
+    from session_flip import next_boundary, target_side
+    cfg = _sf_cfg()
+    try:
+        st = json.loads(SF_STATE.read_text())
+    except Exception:
+        st = {"pos": {}}
+    try:
+        req = urllib.request.Request("https://api.hyperliquid.xyz/info",
+                                     data=json.dumps({"type": "allMids", "dex": "xyz"}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        mids = {k.split(":")[-1]: float(v) for k, v in json.loads(urllib.request.urlopen(req, timeout=10).read()).items()}
+    except Exception:
+        mids = {}
+    _, active = run(["systemctl", "is-active", FLIP_SERVICE], timeout=10)
+    now = datetime.now(timezone.utc)
+    state = ("OFF" if not cfg["enabled"] else "PAUSED" if cfg.get("paused") else "ON")
+    lines = [f"Session flip — {state}, {cfg['mode'].upper()}, service {active.strip()}",
+             f"${cfg['notional']:.0f}/name @ {cfg['leverage']}x · flip {cfg['lead_seconds']}s before each boundary",
+             ""]
+    tot = 0.0
+    for n in sorted(set(cfg["names"]) | {k for k, p in st.get("pos", {}).items() if p.get("qty")}):
+        p = st.get("pos", {}).get(n, {})
+        q, avg = p.get("qty", 0.0), p.get("avg", 0.0)
+        mark = mids.get(n, avg)
+        unreal = q * (mark - avg) if q else 0.0
+        net = p.get("realised", 0.0) + unreal - p.get("fees", 0.0) + p.get("funding", 0.0)
+        tot += net
+        side = "LONG" if q > 0 else "SHORT" if q < 0 else "flat"
+        nxt = ""
+        if n in cfg["names"]:
+            b = next_boundary(n, now)
+            nxt = f" · next: {'LONG' if target_side(n, b) > 0 else 'SHORT'} {b:%a %H:%M}"
+        flag = "" if p.get("status", "ok") == "ok" else f" ⚠️ {p['status']}"
+        lines.append(f"{n:8s} {side:5s} {abs(q):.4g} @ {fmt_px(avg) if q else '-'} | net ${net:+.2f} "
+                     f"(real {p.get('realised', 0):+.2f} unreal {unreal:+.2f} fees -{p.get('fees', 0):.2f} "
+                     f"fund {p.get('funding', 0):+.2f}){nxt}{flag}")
+    lines.append(f"\nTOTAL ${tot:+.2f} (since state began; paper funding is estimated hourly)")
+    return "\n".join(lines)
+
+
+def cmd_sf(chat_id: str, arg: str):
+    parts = arg.split()
+    sub = parts[0].lower() if parts else "status"
+    rest = parts[1:]
+    confirmed = bool(rest) and rest[-1].upper() == "YES"
+    if confirmed:
+        rest = rest[:-1]
+    cfg = _sf_cfg()
+
+    def need_yes(what: str):
+        _PENDING_SF[chat_id] = (" ".join([sub] + rest), time.time() + _CONFIRM_TTL)
+        send(chat_id, f"⚠️ {what}\nReply YES within {_CONFIRM_TTL}s to confirm.")
+
+    if sub == "status":
+        send_pre(chat_id, _sf_status())
+    elif sub == "on":
+        cfg.update(enabled=True, paused=False); _sf_write(cfg)
+        send(chat_id, f"session flip ON ({cfg['mode']}). It joins the current side within ~10s.")
+    elif sub == "off":
+        live = _sf_live_open()
+        if live and not confirmed:
+            return need_yes(f"OFF closes the LIVE positions in {', '.join(live)} at market.")
+        cfg["enabled"] = False; _sf_write(cfg)
+        send(chat_id, "session flip OFF — open positions are being closed.")
+    elif sub == "pause":
+        cfg["paused"] = True; _sf_write(cfg)
+        send(chat_id, "session flip PAUSED — positions held, no flips. /sf resume to continue.")
+    elif sub == "resume":
+        cfg["paused"] = False; _sf_write(cfg)
+        send(chat_id, "session flip resumed.")
+    elif sub == "paper":
+        live = _sf_live_open()
+        if live and not confirmed:
+            return need_yes(f"Switching to paper closes the LIVE positions in {', '.join(live)} at market.")
+        cfg["mode"] = "paper"; _sf_write(cfg)
+        send(chat_id, "session flip → PAPER.")
+    elif sub == "live":
+        if not confirmed:
+            return need_yes(f"Go LIVE: real IOC orders on Hyperliquid, ${cfg['notional']:.0f} per name in "
+                            f"{', '.join(cfg['names'])}, flipping 4x/day. Paper positions are closed first. "
+                            f"The arb bot stops auto-entering these names.")
+        cfg["mode"] = "live"; _sf_write(cfg)
+        send(chat_id, "session flip → LIVE. Watch for the first flip message.")
+    elif sub == "notional" and rest:
+        cfg["notional"] = max(10.0, float(rest[0])); _sf_write(cfg)
+        send(chat_id, f"notional ${cfg['notional']:.0f}/name — applied from the next flip.")
+    elif sub == "lev" and rest:
+        cfg["leverage"] = max(1, min(10, int(rest[0]))); _sf_write(cfg)
+        send(chat_id, f"leverage {cfg['leverage']}x (cross) — set on each name's next live trade "
+                      f"(restart the flip service to re-apply to names already set).")
+    elif sub == "names" and rest:
+        from session_flip import NAME_GROUP
+        names = [n.upper() for n in " ".join(rest).replace(",", " ").split()]
+        bad = [n for n in names if n not in NAME_GROUP]
+        if bad:
+            return send(chat_id, f"unknown: {', '.join(bad)}. Supported: {', '.join(sorted(NAME_GROUP))}")
+        cfg["names"] = names; _sf_write(cfg)
+        send(chat_id, f"names: {', '.join(names)} (anything removed is closed).")
+    elif sub == "close":
+        if _sf_live_open() and not confirmed:
+            return need_yes("Close ALL session-flip positions now (LIVE ones at market)? Flipping resumes at "
+                            "the next boundary unless you also /sf pause or /sf off.")
+        _sf_request("flatten")
+        send(chat_id, "close requested — confirmation follows from the flip service.")
+    elif sub == "reset" and rest:
+        _sf_request("reset", name=rest[0].upper())
+        send(chat_id, f"reset requested for {rest[0].upper()}.")
+    elif sub == "trades":
+        n = int(rest[0]) if rest and rest[0].isdigit() else 15
+        try:
+            rows = SF_TRADES.read_text().strip().splitlines()[1:]
+        except Exception:
+            rows = []
+        send_pre(chat_id, "\n".join(rows[-n:]) or "no trades yet")
+    else:
+        send(chat_id, "/sf [status] · on · off · pause · resume · paper · live · notional USD · lev N · "
+                      "names SKHX,EWY,… · close · reset SYM · trades [n]")
+
+
 def cmd_help(chat_id: str, _arg: str):
     send(chat_id,
          "Commands:\n"
@@ -1471,8 +1642,11 @@ def cmd_help(chat_id: str, _arg: str):
          "/live YES — switch to live mode (restarts)\n"
          "/start — start trader\n"
          "/stop YES — stop trader (positions left open!)\n"
-         "/restart — git pull + restart trader, capture & control bot\n"
-         "/flatten YES — emergency close ALL positions")
+         "/restart — git pull + restart trader, capture, session flip & control bot\n"
+         "/flatten YES — emergency close ALL positions\n"
+         "\nSession flip (Korea/HK overnight long, short in session; separate service):\n"
+         "/sf — status + P&L · /sf on|off|pause|resume · /sf paper · /sf live\n"
+         "/sf notional USD · /sf lev N · /sf names SKHX,EWY,MINIMAX,ZHIPU · /sf close · /sf reset SYM · /sf trades [n]")
 
 
 HANDLERS = {
@@ -1493,6 +1667,7 @@ HANDLERS = {
     "/mode": cmd_mode, "/paper": cmd_paper, "/live": cmd_live,
     "/start": cmd_start, "/stop": cmd_stop, "/restart": cmd_restart,
     "/flatten": cmd_flatten, "/help": cmd_help,
+    "/sf": cmd_sf, "/sessionflip": cmd_sf,
 }
 
 
@@ -1523,6 +1698,10 @@ def handle_message(msg: dict):
             send(chat_id,
                  f"📩 queued LIVE entry: {req['symbol']} {short} ${req['notional']:.0f}. "
                  "You'll get an alert when it's placed.")
+            return
+        pend_sf = _PENDING_SF.pop(chat_id, None)
+        if pend_sf and pend_sf[1] > time.time():
+            cmd_sf(chat_id, pend_sf[0] + " YES")
             return
         pend = _PENDING.pop(chat_id, None)
         if pend and pend[1] > time.time():
@@ -1582,6 +1761,7 @@ def main():
             {"command": "stop", "description": "Stop trader (YES to confirm)"},
             {"command": "restart", "description": "Git pull + restart trader & bot"},
             {"command": "flatten", "description": "Emergency close ALL positions"},
+            {"command": "sf", "description": "Session flip: status|on|off|pause|paper|live|notional|names|close"},
             {"command": "help", "description": "Command list"},
         ])}, timeout=10)
     except Exception as e:

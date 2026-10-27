@@ -1,0 +1,18 @@
+[Unit]
+Description=Hyperaster session flip (Korea/HK overnight long, short in session) on Hyperliquid
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hyperaster
+# Keys and Telegram come from /opt/hyperaster/.env (python-dotenv), as for the trader.
+# Paper vs live, size and names live in data/sessionflip.json, set from Telegram (/sf).
+ExecStart=/opt/hyperaster/.venv/bin/python session_flip.py
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

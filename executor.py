@@ -25,6 +25,7 @@ import logging
 from exchange_client import ExchangeClient, OrderBook, OrderResult, ContractSpec
 from position_manager import PositionManager
 from intents import record_intent, complete_intent
+from flip_reserve import reserved_symbols
 from config import (
     ENTRY_THRESHOLD_BPS, ENTRY_THRESHOLD_BPS_BY_SYMBOL, EXIT_THRESHOLD_BPS,
     NOTIONAL_PER_LEG, ENTRY_TIMEOUT_MINUTES, EXIT_TIMEOUT_MINUTES,
@@ -124,6 +125,10 @@ class Executor:
         Returns True if entry orders were placed.
         """
         if symbol in BLOCKED_SYMBOLS:
+            return False
+
+        # Live session-flip names: an arb leg would net into that HL position.
+        if symbol in reserved_symbols():
             return False
 
         # Only auto-trade calibrated names. Auto-discovered names are watched but
