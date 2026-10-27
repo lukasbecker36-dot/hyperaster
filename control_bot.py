@@ -1607,7 +1607,7 @@ def _sf_status() -> str:
         nxt = ""
         if n in cfg["names"]:
             b = next_boundary(n, now)
-            nxt = f" · next {'LONG' if target_side(n, b) > 0 else 'SHORT'} {b:%a %H:%M}"
+            nxt = f" · next {({1: 'LONG', -1: 'SHORT', 0: 'FLAT (holiday)'})[target_side(n, b)]} {b:%a %H:%M}"
         flag = "" if p.get("status", "ok") == "ok" else f" ⚠️ {p['status']}"
         lines.append(f"{n:8s} {side:5s} {abs(q):.4g} @ {fmt_px(avg) if q else '-'} → {fmt_px(mark) if q else '-'}"
                      f"  ${unreal:+.2f}{nxt}{flag}")

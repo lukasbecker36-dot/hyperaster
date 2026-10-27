@@ -113,10 +113,46 @@ IOC_BUFFER_BPS = 15                  # cap on how far through the touch an IOC m
 MAX_ATTEMPTS = 3
 
 
-# ---------------------------------------------------------------- pure schedule logic
-def target_side(name: str, now: datetime) -> int:
-    """+1 long / -1 short that `name` should hold at UTC time `now`."""
+# Home-exchange holidays (weekdays only). With the cash market shut there is nothing
+# for the perp to converge to: on the 10 KRX holidays Apr-Oct 2026 the session short
+# made -35bp and the overnight long into it -33bp, against +45 / +65bp on normal days,
+# while the overnight long into the first day back stayed positive (+39bp). So the bot
+# is FLAT from the flip before a holiday until that holiday's close-time flip.
+# Generated from python-holidays' exchange calendars (XKRX / XHKG / XSHG), which matched
+# every closure observed Apr-Oct 2026. Extend before HOLIDAYS_THROUGH; the bot warns
+# on Telegram from 30 days out.
+HOLIDAYS = {
+    "KR": {"2026-12-25", "2026-12-31", "2027-01-01", "2027-02-08", "2027-02-09", "2027-03-01",
+           "2027-05-03", "2027-05-05", "2027-05-13", "2027-07-19", "2027-08-16", "2027-09-14",
+           "2027-09-15", "2027-09-16", "2027-10-04", "2027-10-11", "2027-12-27", "2027-12-31"},
+    "HK": {"2026-12-25", "2027-01-01", "2027-02-08", "2027-02-09", "2027-03-26", "2027-03-29",
+           "2027-04-05", "2027-05-13", "2027-06-09", "2027-07-01", "2027-09-16", "2027-10-01",
+           "2027-10-08", "2027-12-27"},
+    "CN": {"2027-01-01", "2027-02-05", "2027-02-08", "2027-02-09", "2027-02-10", "2027-04-05",
+           "2027-05-03", "2027-05-04", "2027-06-09", "2027-09-15", "2027-10-01", "2027-10-04",
+           "2027-10-05"},
+}
+HOLIDAYS_THROUGH = "2027-12-31"
+
+
+def session_day(name: str, now: datetime) -> datetime:
+    """The home session `now` belongs to: today's if before today's close, else the
+    next weekday's (the overnight leg runs INTO that session)."""
     g = GROUPS[NAME_GROUP[name]]
+    d = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if now.weekday() >= 5 or now.hour * 60 + now.minute >= g["close"]:
+        d += timedelta(days=1)
+        while d.weekday() >= 5:
+            d += timedelta(days=1)
+    return d
+
+
+def target_side(name: str, now: datetime) -> int:
+    """+1 long / -1 short / 0 flat that `name` should hold at UTC time `now`."""
+    grp = NAME_GROUP[name]
+    g = GROUPS[grp]
+    if session_day(name, now).strftime("%Y-%m-%d") in HOLIDAYS.get(grp, ()):
+        return 0
     if now.weekday() >= 5:
         return g["off_side"]
     m = now.hour * 60 + now.minute
@@ -410,7 +446,18 @@ class SessionFlip:
             f.unlink(missing_ok=True)
         return out
 
+    def calendar_check(self):
+        """Warn once a day from 30 days before the holiday calendar runs out."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        left = (datetime.fromisoformat(HOLIDAYS_THROUGH) - datetime.fromisoformat(today)).days
+        if left <= 30 and self.st.get("calendar_warned") != today:
+            self.st["calendar_warned"] = today
+            save_state(self.st)
+            tg(f"⚠️ holiday calendar ends {HOLIDAYS_THROUGH} ({left} days) — extend HOLIDAYS in "
+               f"session_flip.py, or holidays after it will be traded as normal days")
+
     async def step(self):
+        self.calendar_check()
         cfg = load_config()
         for req in self.requests():
             if req.get("action") == "flatten":
@@ -451,7 +498,8 @@ class SessionFlip:
             have = 0 if not p.get("qty") else (1 if p["qty"] > 0 else -1)
             if want != have or p.get("status", "ok").startswith("partial"):
                 try:
-                    lines.append(await self.move_to(n, want, cfg, "flip"))
+                    msg = await self.move_to(n, want, cfg, "holiday" if want == 0 else "flip")
+                    lines.append(msg + " (home exchange holiday)" if msg and want == 0 else msg)
                 except Exception as e:
                     log.exception(f"{n} flip failed")
                     self.st["pos"].setdefault(n, {})["status"] = f"error: {e}"

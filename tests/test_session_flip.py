@@ -272,3 +272,40 @@ def test_retimed_boundaries():
     assert sf.target_side("ZHIPU", utc(2026, 10, 27, 1, 15)) == -1    # short from 01:15
     assert sf.next_boundary("EWY", utc(2026, 10, 27, 3, 0)) == utc(2026, 10, 27, 6, 0)
     assert sf.next_boundary("MINIMAX", utc(2026, 10, 27, 9, 0)) == utc(2026, 10, 28, 1, 15)
+
+
+def test_flat_through_a_krx_holiday():
+    # Fri 2026-12-25 is a KRX holiday
+    assert sf.target_side("SKHX", utc(2026, 12, 24, 3, 0)) == -1      # Thu session: normal short
+    assert sf.target_side("SKHX", utc(2026, 12, 24, 6, 0)) == 0       # Thu close flip -> flat (overnight into holiday)
+    assert sf.target_side("SKHX", utc(2026, 12, 25, 3, 0)) == 0       # holiday "session"
+    assert sf.target_side("SKHX", utc(2026, 12, 25, 6, 0)) == +1      # holiday close -> long into Mon
+    assert sf.target_side("SKHX", utc(2026, 12, 26, 12, 0)) == +1     # weekend
+
+
+def test_flat_across_a_weekend_into_multi_day_holiday():
+    # Mon-Tue 2027-02-08/09 Lunar New Year
+    assert sf.target_side("EWY", utc(2027, 2, 5, 6, 0)) == 0          # Fri close -> flat
+    assert sf.target_side("EWY", utc(2027, 2, 6, 12, 0)) == 0         # weekend stays flat
+    assert sf.target_side("EWY", utc(2027, 2, 8, 6, 0)) == 0          # Mon close, Tue also shut
+    assert sf.target_side("EWY", utc(2027, 2, 9, 6, 0)) == +1         # Tue close -> long into Wed
+    assert sf.next_boundary("EWY", utc(2027, 2, 5, 7, 0)) == utc(2027, 2, 9, 6, 0)
+
+
+def test_hk_holiday_uses_hk_calendar_only():
+    assert sf.target_side("ZHIPU", utc(2027, 3, 26, 3, 0)) == 0       # Good Friday: HKEX shut
+    assert sf.target_side("SKHX", utc(2027, 3, 26, 3, 0)) == -1       # KRX open as normal
+
+
+def test_paper_goes_flat_for_holiday(sandbox, monkeypatch):
+    tmp, sent = sandbox
+    write_cfg(tmp, names=["SKHX"], notional=1000)
+    c = FakeClient()
+    bot = make_bot(c)
+    freeze(monkeypatch, utc(2026, 12, 24, 3, 0))
+    asyncio.run(bot.step())                                            # short
+    freeze(monkeypatch, utc(2026, 12, 24, 5, 59, 30))                  # lead crosses 06:00 -> flat
+    asyncio.run(bot.step())
+    assert bot.st["pos"]["SKHX"]["qty"] == 0 and "holiday" in sent[-1]
+    asyncio.run(bot.step())                                            # no repeat message
+    assert sum("holiday" in s for s in sent) == 1
