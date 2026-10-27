@@ -1490,6 +1490,90 @@ def _sf_live_open() -> list[str]:
     return [n for n, p in st.get("pos", {}).items() if p.get("qty") and p.get("mode") == "live"]
 
 
+def _hl_info(body: dict):
+    req = urllib.request.Request("https://api.hyperliquid.xyz/info", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    return json.loads(urllib.request.urlopen(req, timeout=15).read())
+
+
+def _sf_pnl() -> str:
+    """Lifetime + open P&L. LIVE comes from Hyperliquid itself (fills' closedPnl and
+    fee, userFunding, open positions' unrealizedPnl) for the flip names since the first
+    live fill in the trade log. PAPER is replayed from the trade log."""
+    from datetime import datetime, timezone
+    from session_flip import read_trades, replay_trades
+    rows = read_trades()
+    lines = ["Session flip P&L"]
+
+    live = replay_trades(rows, "live")
+    first = live["total"]["first"]
+    if first:
+        since = int(datetime.fromisoformat(first).timestamp() * 1000) - 60_000
+        names = set(live["names"]) | set(_sf_cfg()["names"])
+        addr = os.getenv("HL_ACCOUNT_ADDRESS") or os.getenv("HL_WALLET_ADDRESS", "")
+        try:
+            fills = _hl_info({"type": "userFillsByTime", "user": addr, "startTime": since})
+            fund = _hl_info({"type": "userFunding", "user": addr, "startTime": since, "dex": "xyz"})
+            state = _hl_info({"type": "clearinghouseState", "user": addr, "dex": "xyz"})
+        except Exception as e:
+            return f"couldn't read Hyperliquid: {e}"
+        base = lambda coin: coin.split(":")[-1]
+        per = {n: {"closed": 0.0, "fees": 0.0, "fund": 0.0, "unreal": 0.0} for n in names}
+        for f in fills:
+            n = base(f.get("coin", ""))
+            if n in per:
+                per[n]["closed"] += float(f.get("closedPnl") or 0)
+                per[n]["fees"] += float(f.get("fee") or 0)
+        for f in fund:
+            d = f.get("delta", {})
+            n = base(d.get("coin", ""))
+            if n in per:
+                per[n]["fund"] += float(d.get("usdc") or 0)        # + received, - paid
+        open_lines = []
+        for ap in state.get("assetPositions", []):
+            p = ap.get("position", {})
+            n = base(p.get("coin", ""))
+            if n in per and float(p.get("szi") or 0):
+                szi, entry = float(p["szi"]), float(p.get("entryPx") or 0)
+                u = float(p.get("unrealizedPnl") or 0)
+                per[n]["unreal"] = u
+                mark = entry + u / szi if szi else entry
+                open_lines.append(f"  {n:8s} {'LONG ' if szi > 0 else 'SHORT'} {abs(szi):.4g} "
+                                  f"@ {fmt_px(entry)} → {fmt_px(mark)}  ${u:+.2f} "
+                                  f"({u / (abs(szi) * entry) * 100 if entry else 0:+.1f}%)")
+        closed = sum(v["closed"] for v in per.values())
+        fees = sum(v["fees"] for v in per.values())
+        fnd = sum(v["fund"] for v in per.values())
+        unreal = sum(v["unreal"] for v in per.values())
+        lt = live["total"]
+        ms = state.get("marginSummary", {})
+        lines += [f"\nLIVE since {first[5:16].replace('T', ' ')} UTC",
+                  f"Closed  ${closed - fees + fnd:+.2f}  (trades {closed:+.2f}, fees -{fees:.2f}, "
+                  f"funding {fnd:+.2f})",
+                  f"        {lt['legs']} legs closed, {lt['wins']} winners"
+                  + (f" ({lt['wins'] / lt['legs']:.0%})" if lt["legs"] else ""),
+                  f"Open    ${unreal:+.2f} unrealised"] + open_lines + [
+                  f"LIFETIME ${closed - fees + fnd + unreal:+.2f}",
+                  f"\nper name (closed+open, net of fees/funding):"]
+        for n in sorted(per):
+            v = per[n]
+            if any(v.values()):
+                lines.append(f"  {n:8s} ${v['closed'] - v['fees'] + v['fund'] + v['unreal']:+.2f}")
+        if ms:
+            lines.append(f"\nHL equity dex: account ${float(ms.get('accountValue', 0)):,.2f}, "
+                         f"positions ${float(ms.get('totalNtlPos', 0)):,.0f}, "
+                         f"margin used ${float(ms.get('totalMarginUsed', 0)):,.2f}")
+    else:
+        lines.append("\nLIVE: no live trades yet")
+
+    paper = replay_trades(rows, "paper")
+    pt = paper["total"]
+    if pt["first"]:
+        lines.append(f"\nPAPER (from {pt['first'][5:10]}): ${pt['realised'] - pt['fees']:+.2f} closed, "
+                     f"{pt['legs']} legs, {pt['wins']} winners (funding not included)")
+    return "\n".join(lines)
+
+
 def _sf_status() -> str:
     from datetime import datetime, timezone
     from session_flip import leverage_for, next_boundary, notional_for, target_side
@@ -1518,18 +1602,16 @@ def _sf_status() -> str:
         q, avg = p.get("qty", 0.0), p.get("avg", 0.0)
         mark = mids.get(n, avg)
         unreal = q * (mark - avg) if q else 0.0
-        net = p.get("realised", 0.0) + unreal - p.get("fees", 0.0) + p.get("funding", 0.0)
-        tot += net
+        tot += unreal
         side = "LONG" if q > 0 else "SHORT" if q < 0 else "flat"
         nxt = ""
         if n in cfg["names"]:
             b = next_boundary(n, now)
-            nxt = f" · next: {'LONG' if target_side(n, b) > 0 else 'SHORT'} {b:%a %H:%M}"
+            nxt = f" · next {'LONG' if target_side(n, b) > 0 else 'SHORT'} {b:%a %H:%M}"
         flag = "" if p.get("status", "ok") == "ok" else f" ⚠️ {p['status']}"
-        lines.append(f"{n:8s} {side:5s} {abs(q):.4g} @ {fmt_px(avg) if q else '-'} | net ${net:+.2f} "
-                     f"(real {p.get('realised', 0):+.2f} unreal {unreal:+.2f} fees -{p.get('fees', 0):.2f} "
-                     f"fund {p.get('funding', 0):+.2f}){nxt}{flag}")
-    lines.append(f"\nTOTAL ${tot:+.2f} (since state began; paper funding is estimated hourly)")
+        lines.append(f"{n:8s} {side:5s} {abs(q):.4g} @ {fmt_px(avg) if q else '-'} → {fmt_px(mark) if q else '-'}"
+                     f"  ${unreal:+.2f}{nxt}{flag}")
+    lines.append(f"\nOpen P&L ${tot:+.2f} · lifetime and fees/funding: /sf_pnl")
     return "\n".join(lines)
 
 
@@ -1548,6 +1630,8 @@ def cmd_sf(chat_id: str, arg: str):
 
     if sub == "status":
         send_pre(chat_id, _sf_status())
+    elif sub == "pnl":
+        send_pre(chat_id, _sf_pnl())
     elif sub == "on":
         cfg.update(enabled=True, paused=False); _sf_write(cfg)
         send(chat_id, f"session flip ON ({cfg['mode']}). It joins the current side within ~10s.")
@@ -1622,7 +1706,8 @@ def cmd_sf(chat_id: str, arg: str):
 def cmd_help(chat_id: str, _arg: str):
     send(chat_id,
          "SESSION FLIP (Korea/HK long overnight, short in session):\n"
-         "/sf — positions, P&L, next flips\n"
+         "/sf — positions, open P&L, next flips\n"
+         "/sf_pnl — lifetime P&L (closed trades, fees, funding) + open P&L, live from Hyperliquid\n"
          "/sf_trades · /sf_pause · /sf_resume · /sf_on · /sf_off (closes all)\n"
          "/sf_live (asks YES) · /sf_paper\n"
          "/sf notional [SYM] USD · /sf lev [SYM] N · /sf names SKHX,EWY,MINIMAX,ZHIPU\n"
@@ -1682,7 +1767,7 @@ HANDLERS = {
     "/sf": cmd_sf, "/sessionflip": cmd_sf,
 }
 # One-tap menu shortcuts: /sf_trades -> /sf trades, etc. Any arguments pass through.
-for _sub in ("trades", "pause", "resume", "off", "on", "live", "paper", "close", "status"):
+for _sub in ("pnl", "trades", "pause", "resume", "off", "on", "live", "paper", "close", "status"):
     HANDLERS[f"/sf_{_sub}"] = (lambda s: lambda chat_id, arg: cmd_sf(chat_id, f"{s} {arg}".strip()))(_sub)
 
 
@@ -1748,7 +1833,8 @@ def main():
         # Menu = the session-flip workflow only. The arb is idle (auto-entry off), so its
         # commands are left out of the menu but still work when typed (see /help).
         _api("setMyCommands", {"commands": json.dumps([
-            {"command": "sf", "description": "Session flip: positions, P&L, next flips"},
+            {"command": "sf", "description": "Session flip: positions, open P&L, next flips"},
+            {"command": "sf_pnl", "description": "Lifetime + open P&L (live from Hyperliquid)"},
             {"command": "sf_trades", "description": "Last session-flip fills"},
             {"command": "sf_pause", "description": "Hold positions, stop flipping"},
             {"command": "sf_resume", "description": "Resume flipping"},

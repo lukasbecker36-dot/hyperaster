@@ -169,6 +169,36 @@ def record_trade(row: dict):
         w.writerow(row)
 
 
+def replay_trades(rows: list[dict], mode: str) -> dict:
+    """Rebuild one mode's book from the trade log: per name and overall, realised P&L,
+    fees, and the legs closed (each flip closes the previous side). The state file's
+    running totals are not used for reporting: they straddle mode switches."""
+    books: dict[str, dict] = {}
+    for r in rows:
+        if r.get("mode") != mode:
+            continue
+        b = books.setdefault(r["name"], {"qty": 0.0, "avg": 0.0, "realised": 0.0, "fees": 0.0,
+                                         "legs": 0, "wins": 0, "first": r["ts"]})
+        q = float(r["qty"]) * (1 if r["side"] == "buy" else -1)
+        before = b["realised"]
+        reducing = b["qty"] and (b["qty"] > 0) != (q > 0)
+        apply_fill(b, q, float(r["px"]), float(r["fee"]))
+        if reducing:
+            b["legs"] += 1
+            b["wins"] += b["realised"] > before
+    tot = {k: sum(b[k] for b in books.values()) for k in ("realised", "fees", "legs", "wins")}
+    tot["first"] = min((b["first"] for b in books.values()), default=None)
+    return {"names": books, "total": tot}
+
+
+def read_trades() -> list[dict]:
+    try:
+        with TRADES_FILE.open() as f:
+            return list(csv.DictReader(f))
+    except FileNotFoundError:
+        return []
+
+
 def apply_fill(p: dict, signed_qty: float, px: float, fee: float):
     """Average-cost accounting on a signed position. Realises P&L on the part of the
     fill that reduces the position; a flip through zero opens the rest at `px`."""
@@ -302,6 +332,8 @@ class SessionFlip:
         p = self.st["pos"].setdefault(name, {"qty": 0.0, "avg": 0.0, "realised": 0.0, "fees": 0.0,
                                              "funding": 0.0, "status": "ok", "mode": cfg["mode"]})
         if not p.get("qty"):
+            if p.get("mode") != cfg["mode"]:
+                p.update(realised=0.0, fees=0.0, funding=0.0)   # new mode, new book
             p["mode"] = cfg["mode"]
         mode = p["mode"]            # an open position is always worked in the mode it was opened in
         b = await self.book(name)

@@ -245,3 +245,21 @@ def test_refused_leverage_blocks_the_trade(sandbox, monkeypatch):
     assert c.orders == [] and "NOT TRADED" in sent[-1]
     asyncio.run(bot.step())                                            # parked until /sf reset
     assert c.orders == []
+
+
+def test_replay_trades_separates_modes_and_counts_legs():
+    rows = [
+        {"ts": "2026-10-27T01:22:00+00:00", "mode": "paper", "name": "SKHX", "side": "sell", "qty": "1", "px": "100", "fee": "0.01"},
+        {"ts": "2026-10-27T01:38:00+00:00", "mode": "paper", "name": "SKHX", "side": "buy", "qty": "1", "px": "101", "fee": "0.01"},
+        {"ts": "2026-10-27T01:42:00+00:00", "mode": "live", "name": "SKHX", "side": "sell", "qty": "1", "px": "105", "fee": "0.02"},
+        {"ts": "2026-10-27T06:59:00+00:00", "mode": "live", "name": "SKHX", "side": "buy", "qty": "2", "px": "100", "fee": "0.04"},
+        {"ts": "2026-10-27T07:59:00+00:00", "mode": "live", "name": "EWY", "side": "buy", "qty": "1", "px": "50", "fee": "0.01"},
+    ]
+    live = sf.replay_trades(rows, "live")
+    assert live["names"]["SKHX"]["realised"] == pytest.approx(5.0)       # short 105 -> covered 100
+    assert live["names"]["SKHX"]["qty"] == pytest.approx(1.0)            # flipped long 1
+    assert live["total"]["legs"] == 1 and live["total"]["wins"] == 1
+    assert live["total"]["fees"] == pytest.approx(0.07)
+    assert live["total"]["first"].startswith("2026-10-27T01:42")
+    paper = sf.replay_trades(rows, "paper")
+    assert paper["total"]["realised"] == pytest.approx(-1.0) and paper["total"]["wins"] == 0
