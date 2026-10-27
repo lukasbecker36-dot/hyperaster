@@ -82,10 +82,24 @@ DEFAULT_CONFIG = {
     "mode": "paper",                 # paper | live
     "notional": 250.0,               # USD per name, held long or short
     "leverage": 3,
+    "notional_by_name": {},          # overrides, e.g. {"ZHIPU": 150}
+    # Most of these names are isolated-only on HL, so a position can lose only its own
+    # margin: liquidation sits ~1/lev - 5% away. Worst adverse move inside one hold
+    # (Apr-Oct 2026): SKHX 25%, EWY 11%, MINIMAX 27.5%, ZHIPU 37.5% (3 of 183 holds
+    # beyond 3x's ~28%). Hence 2x for the HK IPOs.
+    "leverage_by_name": {"MINIMAX": 2, "ZHIPU": 2},
     "names": ["SKHX", "EWY", "MINIMAX", "ZHIPU"],
     "lead_seconds": 60,              # flip this long before each boundary
     "paused": False,                 # True: hold positions, no flips
 }
+
+
+def notional_for(cfg: dict, name: str) -> float:
+    return float(cfg.get("notional_by_name", {}).get(name, cfg["notional"]))
+
+
+def leverage_for(cfg: dict, name: str) -> int:
+    return int(cfg.get("leverage_by_name", {}).get(name, cfg["leverage"]))
 TAKER_FEE = 0.00009                  # HL growth-mode taker (~0.9bp) for paper fills
 IOC_BUFFER_BPS = 15                  # cap on how far through the touch an IOC may fill
 MAX_ATTEMPTS = 3
@@ -216,7 +230,8 @@ class SessionFlip:
         self.client = client
         self.st = load_state()
         self.loaded: set[str] = set()
-        self.lev_set: set[str] = set()
+        self.lev_set: dict[str, int] = {}          # name -> leverage confirmed by the venue
+        self.only_isolated: dict[str, bool] = {}
 
     # -- venue helpers
     async def ensure(self, name: str) -> bool:
@@ -227,6 +242,14 @@ class SessionFlip:
         if name not in self.client._hl_asset_index:
             return False
         await self.client._infer_hl_tick_sizes([name])
+        if not self.only_isolated:
+            # One meta read covers every name; asking for cross on an isolated-only
+            # market fails, which would leave HL's default (up to 10x) in place.
+            async with self.client.session.post(
+                    "https://api.hyperliquid.xyz/info", json={"type": "meta", "dex": "xyz"}) as r:
+                meta = await r.json(content_type=None)
+            self.only_isolated = {u["name"].split(":")[-1]: bool(u.get("onlyIsolated"))
+                                  for u in meta.get("universe", [])}
         self.loaded.add(name)
         return True
 
@@ -280,7 +303,7 @@ class SessionFlip:
             p["mode"] = cfg["mode"]
         mode = p["mode"]            # an open position is always worked in the mode it was opened in
         b = await self.book(name)
-        target = side * cfg["notional"] / b.mid if side else 0.0
+        target = side * notional_for(cfg, name) / b.mid if side else 0.0
         target = float(self.client.format_hl_qty(name, abs(target))) * (1 if target >= 0 else -1)
         if mode == "live":
             if arb_holds(name):
@@ -290,9 +313,13 @@ class SessionFlip:
             if abs(venue - p["qty"]) > max(1e-9, 0.02 * abs(p["qty"]) + 1e-6):
                 p["status"] = f"venue {venue:+.4f} != state {p['qty']:+.4f}"
                 return f"{name}: PARKED — venue shows {venue:+.4f}, state {p['qty']:+.4f}. Fix by hand, then /sf reset {name}"
-            if name not in self.lev_set:
-                await self.client.set_hl_leverage(name, int(cfg["leverage"]), cross=True)
-                self.lev_set.add(name)
+            lev = leverage_for(cfg, name)
+            if side and self.lev_set.get(name) != lev:
+                cross = not self.only_isolated.get(name, True)
+                if not await self.client.set_hl_leverage(name, lev, cross=cross):
+                    p["status"] = f"could not set {lev}x {'cross' if cross else 'isolated'}"
+                    return f"{name}: NOT TRADED — HL refused {lev}x leverage; check margin, then /sf reset {name}"
+                self.lev_set[name] = lev
         delta = target - p["qty"]
         if abs(delta) * b.mid < 10:
             return ""
@@ -394,8 +421,8 @@ class SessionFlip:
 
     async def run(self):
         cfg = load_config()
-        tg(f"up — {cfg['mode']}, {'enabled' if cfg['enabled'] else 'disabled'}, ${cfg['notional']:.0f}/name, "
-           f"{', '.join(cfg['names'])}")
+        tg(f"up — {cfg['mode']}, {'enabled' if cfg['enabled'] else 'disabled'}: "
+           + ", ".join(f"{n} ${notional_for(cfg, n):.0f}@{leverage_for(cfg, n)}x" for n in cfg["names"]))
         # Startup reconcile for live names: never adopt or fight an unknown venue position.
         for n, p in self.st["pos"].items():
             if p.get("mode") == "live" and await self.ensure(n):

@@ -1492,7 +1492,7 @@ def _sf_live_open() -> list[str]:
 
 def _sf_status() -> str:
     from datetime import datetime, timezone
-    from session_flip import next_boundary, target_side
+    from session_flip import leverage_for, next_boundary, notional_for, target_side
     cfg = _sf_cfg()
     try:
         st = json.loads(SF_STATE.read_text())
@@ -1509,7 +1509,8 @@ def _sf_status() -> str:
     now = datetime.now(timezone.utc)
     state = ("OFF" if not cfg["enabled"] else "PAUSED" if cfg.get("paused") else "ON")
     lines = [f"Session flip — {state}, {cfg['mode'].upper()}, service {active.strip()}",
-             f"${cfg['notional']:.0f}/name @ {cfg['leverage']}x · flip {cfg['lead_seconds']}s before each boundary",
+             ", ".join(f"{n} ${notional_for(cfg, n):.0f}@{leverage_for(cfg, n)}x" for n in cfg["names"])
+             + f" · flip {cfg['lead_seconds']}s before each boundary",
              ""]
     tot = 0.0
     for n in sorted(set(cfg["names"]) | {k for k, p in st.get("pos", {}).items() if p.get("qty")}):
@@ -1570,18 +1571,25 @@ def cmd_sf(chat_id: str, arg: str):
         send(chat_id, "session flip → PAPER.")
     elif sub == "live":
         if not confirmed:
-            return need_yes(f"Go LIVE: real IOC orders on Hyperliquid, ${cfg['notional']:.0f} per name in "
-                            f"{', '.join(cfg['names'])}, flipping 4x/day. Paper positions are closed first. "
-                            f"The arb bot stops auto-entering these names.")
+            from session_flip import leverage_for, notional_for
+            return need_yes("Go LIVE: real IOC orders on Hyperliquid — " + ", ".join(
+                f"{n} ${notional_for(cfg, n):.0f}@{leverage_for(cfg, n)}x" for n in cfg["names"])
+                + ". Flips ~4x/day; paper positions are closed first; the arb bot stops "
+                  "auto-entering these names.")
         cfg["mode"] = "live"; _sf_write(cfg)
         send(chat_id, "session flip → LIVE. Watch for the first flip message.")
-    elif sub == "notional" and rest:
-        cfg["notional"] = max(10.0, float(rest[0])); _sf_write(cfg)
-        send(chat_id, f"notional ${cfg['notional']:.0f}/name — applied from the next flip.")
-    elif sub == "lev" and rest:
-        cfg["leverage"] = max(1, min(10, int(rest[0]))); _sf_write(cfg)
-        send(chat_id, f"leverage {cfg['leverage']}x (cross) — set on each name's next live trade "
-                      f"(restart the flip service to re-apply to names already set).")
+    elif sub in ("notional", "lev") and rest:
+        # /sf notional 200 (default for all) · /sf notional ZHIPU 150 (one name)
+        key, by = ("notional", "notional_by_name") if sub == "notional" else ("leverage", "leverage_by_name")
+        conv = (lambda v: max(10.0, float(v))) if sub == "notional" else (lambda v: max(1, min(10, int(v))))
+        if len(rest) >= 2:
+            cfg.setdefault(by, {})[rest[0].upper()] = conv(rest[1])
+        else:
+            cfg[key] = conv(rest[0])
+        _sf_write(cfg)
+        from session_flip import leverage_for, notional_for
+        send(chat_id, "applied from the next flip: " + ", ".join(
+            f"{n} ${notional_for(cfg, n):.0f}@{leverage_for(cfg, n)}x" for n in cfg["names"]))
     elif sub == "names" and rest:
         from session_flip import NAME_GROUP
         names = [n.upper() for n in " ".join(rest).replace(",", " ").split()]
@@ -1646,7 +1654,7 @@ def cmd_help(chat_id: str, _arg: str):
          "/flatten YES — emergency close ALL positions\n"
          "\nSession flip (Korea/HK overnight long, short in session; separate service):\n"
          "/sf — status + P&L · /sf on|off|pause|resume · /sf paper · /sf live\n"
-         "/sf notional USD · /sf lev N · /sf names SKHX,EWY,MINIMAX,ZHIPU · /sf close · /sf reset SYM · /sf trades [n]")
+         "/sf notional [SYM] USD · /sf lev [SYM] N · /sf names SKHX,EWY,MINIMAX,ZHIPU · /sf close · /sf reset SYM · /sf trades [n]")
 
 
 HANDLERS = {

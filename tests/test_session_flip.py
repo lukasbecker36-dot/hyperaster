@@ -65,7 +65,8 @@ class FakeClient:
         return SimpleNamespace(bid=self.mid - 0.05, ask=self.mid + 0.05, mid=self.mid)
     def format_hl_qty(self, n, q): return f"{q:.3f}"
     async def get_hl_position(self, n): return {"szi": str(self.venue.get(n, 0.0))}
-    async def set_hl_leverage(self, n, lev, cross=True): self.lev.append((n, lev)); return True
+    lev_ok = True
+    async def set_hl_leverage(self, n, lev, cross=True): self.lev.append((n, lev, cross)); return self.lev_ok
     async def place_hl_ioc(self, n, side, qty, ref, buffer_bps=None):
         q = qty * self.fill_frac
         self.venue[n] = self.venue.get(n, 0.0) + (q if side == "buy" else -q)
@@ -88,6 +89,12 @@ def sandbox(tmp_path, monkeypatch):
     return tmp_path, sent
 
 
+def make_bot(c, isolated=("EWY", "MINIMAX", "ZHIPU")):
+    bot = sf.SessionFlip(c)
+    bot.only_isolated = {n: n in isolated for n in sf.NAME_GROUP}   # skip the meta read
+    return bot
+
+
 def write_cfg(tmp, **kw):
     cfg = dict(sf.DEFAULT_CONFIG, **kw)
     (tmp / "cfg.json").write_text(json.dumps(cfg))
@@ -104,7 +111,7 @@ def test_paper_joins_side_and_flips(sandbox, monkeypatch):
     tmp, sent = sandbox
     write_cfg(tmp, names=["SKHX"], notional=1000)
     c = FakeClient()
-    bot = sf.SessionFlip(c)
+    bot = make_bot(c)
     freeze(monkeypatch, utc(2026, 10, 27, 3, 0))                      # in session -> short
     asyncio.run(bot.step())
     assert bot.st["pos"]["SKHX"]["qty"] == pytest.approx(-10.0)
@@ -119,20 +126,20 @@ def test_live_flip_trades_double_and_sets_leverage(sandbox, monkeypatch):
     tmp, sent = sandbox
     write_cfg(tmp, names=["SKHX"], notional=1000, mode="live", leverage=3)
     c = FakeClient()
-    bot = sf.SessionFlip(c)
+    bot = make_bot(c)
     freeze(monkeypatch, utc(2026, 10, 27, 3, 0))
     asyncio.run(bot.step())
     freeze(monkeypatch, utc(2026, 10, 27, 7, 0))
     asyncio.run(bot.step())
     assert c.orders == [("SKHX", "sell", pytest.approx(10.0)), ("SKHX", "buy", pytest.approx(20.0))]
-    assert c.venue["SKHX"] == pytest.approx(10.0) and c.lev == [("SKHX", 3)]
+    assert c.venue["SKHX"] == pytest.approx(10.0) and c.lev == [("SKHX", 3, True)]   # SKHX allows cross
 
 
 def test_live_parks_on_foreign_position(sandbox, monkeypatch):
     tmp, sent = sandbox
     write_cfg(tmp, names=["SKHX"], mode="live")
     c = FakeClient(venue={"SKHX": 3.0})                                 # someone else's position
-    bot = sf.SessionFlip(c)
+    bot = make_bot(c)
     freeze(monkeypatch, utc(2026, 10, 27, 3, 0))
     asyncio.run(bot.step())
     assert c.orders == [] and "PARKED" in sent[-1]
@@ -145,7 +152,7 @@ def test_live_skips_when_arb_holds(sandbox, monkeypatch):
     write_cfg(tmp, names=["SKHX"], mode="live")
     monkeypatch.setattr(sf, "arb_holds", lambda n: True)
     c = FakeClient()
-    bot = sf.SessionFlip(c)
+    bot = make_bot(c)
     freeze(monkeypatch, utc(2026, 10, 27, 3, 0))
     asyncio.run(bot.step())
     assert c.orders == [] and "arb bot" in sent[-1]
@@ -155,7 +162,7 @@ def test_switch_to_live_closes_paper_book_first(sandbox, monkeypatch):
     tmp, sent = sandbox
     write_cfg(tmp, names=["SKHX"], notional=1000)
     c = FakeClient()
-    bot = sf.SessionFlip(c)
+    bot = make_bot(c)
     freeze(monkeypatch, utc(2026, 10, 27, 3, 0))
     asyncio.run(bot.step())                                            # paper short
     write_cfg(tmp, names=["SKHX"], notional=1000, mode="live")
@@ -169,7 +176,7 @@ def test_disable_flattens_live(sandbox, monkeypatch):
     tmp, sent = sandbox
     write_cfg(tmp, names=["SKHX"], notional=1000, mode="live")
     c = FakeClient()
-    bot = sf.SessionFlip(c)
+    bot = make_bot(c)
     freeze(monkeypatch, utc(2026, 10, 27, 3, 0))
     asyncio.run(bot.step())
     write_cfg(tmp, names=["SKHX"], notional=1000, mode="live", enabled=False)
@@ -181,7 +188,7 @@ def test_partial_fill_is_retried_next_step(sandbox, monkeypatch):
     tmp, sent = sandbox
     write_cfg(tmp, names=["SKHX"], notional=1000, mode="live")
     c = FakeClient(fill_frac=0.5)
-    bot = sf.SessionFlip(c)
+    bot = make_bot(c)
     freeze(monkeypatch, utc(2026, 10, 27, 3, 0))
     asyncio.run(bot.step())                                            # 3 IOCs at 50%: 87.5% filled
     assert bot.st["pos"]["SKHX"]["status"].startswith("partial")
@@ -213,3 +220,27 @@ def test_flip_reserve_only_when_live(tmp_path, monkeypatch):
     f.write_text(json.dumps({"enabled": True, "mode": "live", "names": ["skhx"]}))
     monkeypatch.setattr(fr, "_cache", (0.0, frozenset()))
     assert fr.reserved_symbols() == {"SKHX"}
+
+
+def test_isolated_names_get_isolated_and_per_name_size(sandbox, monkeypatch):
+    tmp, sent = sandbox
+    write_cfg(tmp, names=["ZHIPU"], mode="live", notional=1000, notional_by_name={"ZHIPU": 500})
+    c = FakeClient()
+    bot = make_bot(c)
+    freeze(monkeypatch, utc(2026, 10, 27, 3, 0))
+    asyncio.run(bot.step())
+    assert c.lev == [("ZHIPU", 2, False)]                              # default 2x override, isolated
+    assert c.venue["ZHIPU"] == pytest.approx(-5.0)                     # $500 / 100
+
+
+def test_refused_leverage_blocks_the_trade(sandbox, monkeypatch):
+    tmp, sent = sandbox
+    write_cfg(tmp, names=["EWY"], mode="live")
+    c = FakeClient()
+    c.lev_ok = False
+    bot = make_bot(c)
+    freeze(monkeypatch, utc(2026, 10, 27, 3, 0))
+    asyncio.run(bot.step())
+    assert c.orders == [] and "NOT TRADED" in sent[-1]
+    asyncio.run(bot.step())                                            # parked until /sf reset
+    assert c.orders == []
