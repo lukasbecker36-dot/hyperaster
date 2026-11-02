@@ -1578,6 +1578,7 @@ def _sf_status() -> str:
     from datetime import datetime, timezone
     from session_flip import leverage_for, next_boundary, notional_for, target_side
     cfg = _sf_cfg()
+    hold = {n.upper(): v for n, v in (cfg.get("hold") or {}).items()}
     try:
         st = json.loads(SF_STATE.read_text())
     except Exception:
@@ -1605,7 +1606,9 @@ def _sf_status() -> str:
         tot += unreal
         side = "LONG" if q > 0 else "SHORT" if q < 0 else "flat"
         nxt = ""
-        if n in cfg["names"]:
+        if n in hold:
+            nxt = f" · HELD {'LONG' if hold[n] > 0 else 'SHORT'} (manual — /sf auto {n} to resume flipping)"
+        elif n in cfg["names"]:
             b = next_boundary(n, now)
             nxt = f" · next {({1: 'LONG', -1: 'SHORT', 0: 'FLAT (holiday)'})[target_side(n, b)]} {b:%a %H:%M}"
         flag = "" if p.get("status", "ok") == "ok" else f" ⚠️ {p['status']}"
@@ -1688,6 +1691,38 @@ def cmd_sf(chat_id: str, arg: str):
                             "the next boundary unless you also /sf pause or /sf off.")
         _sf_request("flatten")
         send(chat_id, "close requested — confirmation follows from the flip service.")
+    elif sub in ("long", "short"):
+        # /sf long (all names) · /sf short SKHX EWY — hold one side, no session flips, until /sf auto
+        from session_flip import NAME_GROUP
+        names = [n.upper() for n in " ".join(rest).replace(",", " ").split()] or list(cfg["names"])
+        bad = [n for n in names if n not in NAME_GROUP]
+        if bad or not names:
+            return send(chat_id, f"unknown: {', '.join(bad) or '(no names)'}. Supported: {', '.join(sorted(NAME_GROUP))}")
+        side = 1 if sub == "long" else -1
+        if cfg["mode"] == "live" and not confirmed:
+            from session_flip import leverage_for, notional_for
+            return need_yes(f"Hold {sub.upper()} with REAL orders now: " + ", ".join(
+                f"{n} ${notional_for(cfg, n):.0f}@{leverage_for(cfg, n)}x" for n in names)
+                + ". No session flips (or holiday flats) for these until /sf auto.")
+        hold = {n.upper(): v for n, v in (cfg.get("hold") or {}).items()}
+        hold.update({n: side for n in names})
+        added = [n for n in names if n not in cfg["names"]]
+        cfg.update(hold=hold, names=cfg["names"] + added, enabled=True, paused=False)
+        _sf_write(cfg)
+        send(chat_id, f"{', '.join(names)} → held {sub.upper()} ({cfg['mode']}) within ~10s, ignoring sessions and "
+                      f"holidays." + (f" Added to the list: {', '.join(added)}." if added else "")
+                      + " /sf auto to go back to session flipping, /sf off to close and stop.")
+    elif sub == "auto":
+        hold = {n.upper(): v for n, v in (cfg.get("hold") or {}).items()}
+        names = [n.upper() for n in " ".join(rest).replace(",", " ").split()] or list(hold)
+        if not hold:
+            return send(chat_id, "nothing is held — all names already follow the session rule.")
+        for n in names:
+            hold.pop(n, None)
+        cfg["hold"] = hold
+        _sf_write(cfg)
+        send(chat_id, f"{', '.join(names)} back to session flipping — they move to the current session's side "
+                      f"within ~10s." + (f" Still held: {', '.join(hold)}." if hold else ""))
     elif sub == "reset" and rest:
         _sf_request("reset", name=rest[0].upper())
         send(chat_id, f"reset requested for {rest[0].upper()}.")
@@ -1700,7 +1735,7 @@ def cmd_sf(chat_id: str, arg: str):
         send_pre(chat_id, "\n".join(rows[-n:]) or "no trades yet")
     else:
         send(chat_id, "/sf [status] · on · off · pause · resume · paper · live · notional USD · lev N · "
-                      "names SKHX,EWY,… · close · reset SYM · trades [n]")
+                      "names SKHX,EWY,… · long|short [SYM …] · auto [SYM …] · close · reset SYM · trades [n]")
 
 
 def cmd_help(chat_id: str, _arg: str):
@@ -1712,6 +1747,8 @@ def cmd_help(chat_id: str, _arg: str):
          "/sf_live (asks YES) · /sf_paper\n"
          "/sf notional [SYM] USD · /sf lev [SYM] N · /sf names SKHX,EWY,MINIMAX,ZHIPU\n"
          "/sf close · /sf reset SYM\n"
+         "/sf_long · /sf_short [SYM …] — hold one side, no session flips (all names if none given)\n"
+         "/sf_auto [SYM …] — back to session flipping\n"
          "/balance — balances on both venues · /restart — pull + restart everything\n"
          "\nARB (idle — not in the menu, still typeable):\n"
          "/status — service state + spreads + positions\n"
@@ -1767,7 +1804,8 @@ HANDLERS = {
     "/sf": cmd_sf, "/sessionflip": cmd_sf,
 }
 # One-tap menu shortcuts: /sf_trades -> /sf trades, etc. Any arguments pass through.
-for _sub in ("pnl", "trades", "pause", "resume", "off", "on", "live", "paper", "close", "status"):
+for _sub in ("pnl", "trades", "pause", "resume", "off", "on", "live", "paper", "close", "status",
+             "long", "short", "auto"):
     HANDLERS[f"/sf_{_sub}"] = (lambda s: lambda chat_id, arg: cmd_sf(chat_id, f"{s} {arg}".strip()))(_sub)
 
 
@@ -1840,6 +1878,9 @@ def main():
             {"command": "sf_resume", "description": "Resume flipping"},
             {"command": "sf_off", "description": "Close all session-flip positions and stop"},
             {"command": "sf_on", "description": "Start session flip"},
+            {"command": "sf_long", "description": "Hold all names LONG, no flips (or /sf_long SKHX)"},
+            {"command": "sf_short", "description": "Hold all names SHORT, no flips (or /sf_short SKHX)"},
+            {"command": "sf_auto", "description": "Back to session flipping"},
             {"command": "sf_live", "description": "Switch session flip to LIVE (asks YES)"},
             {"command": "sf_paper", "description": "Switch session flip to paper"},
             {"command": "balance", "description": "USDC/USDT balances on both venues"},

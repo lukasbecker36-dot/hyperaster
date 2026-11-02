@@ -23,6 +23,10 @@ THE RULE (UTC, Mon-Fri; weekends hold the overnight side from Friday to Monday)
   `lead_seconds` before the boundary, so the overnight leg is out before the open
   prints. The backtest used 00/07 (KR) and 01/08 (HK); see GROUPS for the retiming.
 
+MANUAL HOLD
+  /sf long|short [names] holds those names on one side, ignoring sessions and holidays, until
+  /sf auto [names] hands them back to the session rule (config "hold": {"SKHX": 1, "EWY": -1}).
+
 CONTROL
   data/sessionflip.json          config, written by control_bot (/sf ...)
   data/sessionflip_cmd/*.json    one-shot requests (flatten)
@@ -99,6 +103,7 @@ DEFAULT_CONFIG = {
     "names": ["SKHX", "EWY", "MINIMAX", "ZHIPU"],
     "lead_seconds": 60,              # flip this long before each boundary
     "paused": False,                 # True: hold positions, no flips
+    "hold": {},                      # manual override per name: 1 = long, -1 = short (/sf long|short|auto)
 }
 
 
@@ -160,6 +165,12 @@ def target_side(name: str, now: datetime) -> int:
     return -g["off_side"] if in_session else g["off_side"]
 
 
+def wanted_side(cfg: dict, name: str, now: datetime) -> int:
+    """The side to hold: a manual hold if one is set, else the session rule."""
+    h = cfg.get("hold", {}).get(name)
+    return h if h in (1, -1) else target_side(name, now)
+
+
 def next_boundary(name: str, now: datetime) -> datetime:
     """The next time target_side(name) changes (weekend-aware)."""
     t = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
@@ -187,6 +198,8 @@ def load_config() -> dict:
     except Exception as e:
         log.error(f"bad {CONFIG_FILE.name} ({e}); using defaults")
     cfg["names"] = [n.upper() for n in cfg.get("names", []) if n.upper() in NAME_GROUP]
+    cfg["hold"] = {n.upper(): int(v) for n, v in (cfg.get("hold") or {}).items()
+                   if n.upper() in NAME_GROUP and v in (1, -1)}
     return cfg
 
 
@@ -494,11 +507,13 @@ class SessionFlip:
             if not await self.ensure(n):
                 lines.append(f"{n}: not an HL xyz market")
                 continue
-            want = target_side(n, when)
+            want = wanted_side(cfg, n, when)
+            held = n in cfg["hold"]
             have = 0 if not p.get("qty") else (1 if p["qty"] > 0 else -1)
             if want != have or p.get("status", "ok").startswith("partial"):
                 try:
-                    msg = await self.move_to(n, want, cfg, "holiday" if want == 0 else "flip")
+                    reason = ("manual long" if want > 0 else "manual short") if held else "holiday" if want == 0 else "flip"
+                    msg = await self.move_to(n, want, cfg, reason)
                     lines.append(msg + " (home exchange holiday)" if msg and want == 0 else msg)
                 except Exception as e:
                     log.exception(f"{n} flip failed")

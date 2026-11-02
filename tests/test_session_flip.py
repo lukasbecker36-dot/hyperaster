@@ -309,3 +309,32 @@ def test_paper_goes_flat_for_holiday(sandbox, monkeypatch):
     assert bot.st["pos"]["SKHX"]["qty"] == 0 and "holiday" in sent[-1]
     asyncio.run(bot.step())                                            # no repeat message
     assert sum("holiday" in s for s in sent) == 1
+
+
+def test_manual_hold_ignores_sessions_and_holidays_then_auto_resumes(sandbox, monkeypatch):
+    tmp, sent = sandbox
+    write_cfg(tmp, names=["SKHX", "EWY"], notional=1000, hold={"SKHX": 1, "EWY": -1})
+    c = FakeClient()
+    bot = make_bot(c)
+    freeze(monkeypatch, utc(2026, 10, 27, 3, 0))                      # KR in session: the rule says short
+    asyncio.run(bot.step())
+    assert bot.st["pos"]["SKHX"]["qty"] == pytest.approx(10.0)         # held long anyway
+    assert bot.st["pos"]["EWY"]["qty"] == pytest.approx(-10.0)
+    assert "manual long" in (tmp / "trades.csv").read_text()
+    freeze(monkeypatch, utc(2026, 10, 27, 5, 59, 30))                  # boundary passes: no flip
+    asyncio.run(bot.step())
+    assert bot.st["pos"]["SKHX"]["qty"] == pytest.approx(10.0)
+    freeze(monkeypatch, utc(2026, 12, 24, 5, 59, 30))                  # into a KRX holiday: still held
+    asyncio.run(bot.step())
+    assert bot.st["pos"]["SKHX"]["qty"] == pytest.approx(10.0)
+    write_cfg(tmp, names=["SKHX", "EWY"], notional=1000, hold={"EWY": -1})   # /sf auto SKHX
+    freeze(monkeypatch, utc(2026, 10, 28, 3, 0))                      # in session -> SKHX follows the rule
+    asyncio.run(bot.step())
+    assert bot.st["pos"]["SKHX"]["qty"] == pytest.approx(-10.0)
+    assert bot.st["pos"]["EWY"]["qty"] == pytest.approx(-10.0)
+
+
+def test_bad_hold_entries_are_dropped(sandbox):
+    tmp, _ = sandbox
+    write_cfg(tmp, hold={"skhx": 1, "AAPL": 1, "EWY": 2})
+    assert sf.load_config()["hold"] == {"SKHX": 1}
