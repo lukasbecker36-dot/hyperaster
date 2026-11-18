@@ -1,0 +1,18 @@
+[Unit]
+Description=Hyperaster stock carry (short high-funding / long low-funding xyz stock perps) on Hyperliquid
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hyperaster
+# Keys and Telegram come from /opt/hyperaster/.env (python-dotenv), as for the trader.
+# Paper vs live, size and leverage live in data/stockcarry.json, set from Telegram (/sc).
+ExecStart=/opt/hyperaster/.venv/bin/python stock_carry.py
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -715,6 +715,14 @@ def cmd_restart(chat_id: str, _arg: str):
         _, flip_active = run(["systemctl", "is-active", FLIP_SERVICE], timeout=10)
         send(chat_id, f"session-flip restart: {'ok' if rc_f == 0 else 'FAILED'} — now {flip_active}\n{out_f}".strip())
 
+    # 1d. The stock-carry service (its own unit; state persists after every fill, reconciles on boot).
+    _, carry_load = run(["systemctl", "show", CARRY_SERVICE, "--property=LoadState", "--value"], timeout=10)
+    if carry_load.strip() == "loaded":
+        rc_k, out_k = run(["systemctl", "restart", CARRY_SERVICE], timeout=30)
+        time.sleep(2)
+        _, carry_active = run(["systemctl", "is-active", CARRY_SERVICE], timeout=10)
+        send(chat_id, f"stock-carry restart: {'ok' if rc_k == 0 else 'FAILED'} — now {carry_active}\n{out_k}".strip())
+
     # 2. Restart the control bot itself LAST — this tears down THIS process, so it
     #    must be the final step and can't confirm afterwards. Skip if it's the same
     #    unit as the trader (already restarted above). Verify the unit exists first
@@ -1738,8 +1746,221 @@ def cmd_sf(chat_id: str, arg: str):
                       "names SKHX,EWY,… · long|short [SYM …] · auto [SYM …] · close · reset SYM · trades [n]")
 
 
+# ---------------------------------------------------------------- stock carry (/sc)
+SC_CONFIG = BASE_DIR / "data" / "stockcarry.json"
+SC_STATE = BASE_DIR / "data" / "stockcarry_state.json"
+SC_TRADES = BASE_DIR / "data" / "stockcarry_trades.csv"
+SC_CMD_DIR = BASE_DIR / "data" / "stockcarry_cmd"
+CARRY_SERVICE = os.getenv("CARRY_SERVICE_NAME", f"{SERVICE}-carry")
+_PENDING_SC: dict[str, tuple[str, float]] = {}
+
+
+def _sc_cfg() -> dict:
+    from stock_carry import DEFAULT_CONFIG
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        cfg.update(json.loads(SC_CONFIG.read_text()))
+    except Exception:
+        pass
+    return cfg
+
+
+def _sc_write(cfg: dict):
+    SC_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SC_CONFIG.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cfg, indent=1))
+    tmp.replace(SC_CONFIG)
+
+
+def _sc_request(action: str, **kw):
+    SC_CMD_DIR.mkdir(parents=True, exist_ok=True)
+    (SC_CMD_DIR / f"{time.time_ns()}.json").write_text(json.dumps({"action": action, **kw}))
+
+
+def _sc_state() -> dict:
+    try:
+        return json.loads(SC_STATE.read_text())
+    except Exception:
+        return {"pos": {}, "cohorts": []}
+
+
+def _sc_live_open() -> list[str]:
+    return [n for n, p in _sc_state().get("pos", {}).items() if p.get("qty") and p.get("mode") == "live"]
+
+
+def _xyz_mids() -> dict:
+    try:
+        return {k.split(":")[-1]: float(v) for k, v in _hl_info({"type": "allMids", "dex": "xyz"}).items()}
+    except Exception:
+        return {}
+
+
+def _sc_status() -> str:
+    cfg, st, mids = _sc_cfg(), _sc_state(), _xyz_mids()
+    _, active = run(["systemctl", "is-active", CARRY_SERVICE], timeout=10)
+    state = "OFF" if not cfg["enabled"] else "PAUSED" if cfg.get("paused") else "ON"
+    rows, lu, su, unreal = [], 0.0, 0.0, 0.0
+    for n, p in st.get("pos", {}).items():
+        q = p.get("qty", 0.0)
+        if not q:
+            if p.get("status", "ok") != "ok":
+                rows.append((0.0, f"{n:8s} flat ⚠️ {p['status']}"))
+            continue
+        m = mids.get(n, p.get("avg", 0.0))
+        usd, u = q * m, q * (m - p.get("avg", 0.0))
+        lu += max(usd, 0.0)
+        su += max(-usd, 0.0)
+        unreal += u
+        flag = "" if p.get("status", "ok") == "ok" else f" ⚠️ {p['status']}"
+        rows.append((usd, f"{n:8s} {'LONG ' if q > 0 else 'SHORT'} ${abs(usd):6,.0f}  ${u:+7.2f}{flag}"))
+    rows.sort(key=lambda r: -r[0])
+    lines = [f"Stock carry — {state}, {cfg['mode'].upper()}, service {active.strip()}",
+             f"${cfg['side_usd']:,.0f} a side · {cfg['leverage']}x isolated · max {cfg['cap']:.0%} a name · "
+             f"rebalance {cfg['rebalance_utc']} UTC (last {st.get('last_rebalance') or 'never'}, "
+             f"{len(st.get('cohorts', []))}/{cfg['hold_d']} cohorts)",
+             f"book: long ${lu:,.0f} / short ${su:,.0f} · margin ~${(lu + su) / cfg['leverage']:,.0f} · "
+             f"open P&L ${unreal:+.2f}", ""]
+    lines += [r[1] for r in rows] or ["no positions yet — the first cohort goes on at the next rebalance"]
+    lines.append("\nlifetime P&L incl. fees and funding: /sc_pnl")
+    return "\n".join(lines)
+
+
+def _sc_pnl() -> str:
+    from datetime import datetime
+    from stock_carry import read_trades
+    from session_flip import replay_trades
+    rows = read_trades()
+    st = _sc_state()
+    lines = ["Stock carry P&L"]
+    live = replay_trades(rows, "live")
+    first = live["total"]["first"]
+    if first:
+        since = int(datetime.fromisoformat(first).timestamp() * 1000) - 60_000
+        names = set(live["names"])
+        addr = os.getenv("HL_ACCOUNT_ADDRESS") or os.getenv("HL_WALLET_ADDRESS", "")
+        try:
+            fills = _hl_info({"type": "userFillsByTime", "user": addr, "startTime": since})
+            fund = _hl_info({"type": "userFunding", "user": addr, "startTime": since, "dex": "xyz"})
+            state = _hl_info({"type": "clearinghouseState", "user": addr, "dex": "xyz"})
+        except Exception as e:
+            return f"couldn't read Hyperliquid: {e}"
+        base = lambda coin: coin.split(":")[-1]
+        closed = sum(float(f.get("closedPnl") or 0) for f in fills if base(f.get("coin", "")) in names)
+        fees = sum(float(f.get("fee") or 0) for f in fills if base(f.get("coin", "")) in names)
+        fnd = sum(float(f.get("delta", {}).get("usdc") or 0) for f in fund
+                  if base(f.get("delta", {}).get("coin", "")) in names)
+        unreal = sum(float(ap["position"].get("unrealizedPnl") or 0) for ap in state.get("assetPositions", [])
+                     if base(ap.get("position", {}).get("coin", "")) in names)
+        ms = state.get("marginSummary", {})
+        lines += [f"\nLIVE since {first[5:16].replace('T', ' ')} UTC",
+                  f"Closed ${closed - fees + fnd:+.2f} (trades {closed:+.2f}, fees -{fees:.2f}, funding {fnd:+.2f})",
+                  f"Open   ${unreal:+.2f} unrealised",
+                  f"LIFETIME ${closed - fees + fnd + unreal:+.2f}"]
+        if ms:
+            lines.append(f"HL xyz: account ${float(ms.get('accountValue', 0)):,.2f}, margin used "
+                         f"${float(ms.get('totalMarginUsed', 0)):,.2f}")
+    else:
+        lines.append("\nLIVE: no live trades yet")
+    paper = replay_trades(rows, "paper")
+    pt = paper["total"]
+    if pt["first"]:
+        mids = _xyz_mids()
+        unreal = sum(p["qty"] * (mids.get(n, p["avg"]) - p["avg"]) for n, p in st.get("pos", {}).items()
+                     if p.get("qty") and p.get("mode") == "paper")
+        fnd = sum(p.get("funding", 0.0) for p in st.get("pos", {}).values() if p.get("mode") == "paper")
+        liqs = st.get("liqs", [])
+        lines.append(f"\nPAPER (from {pt['first'][5:10]}): closed ${pt['realised'] - pt['fees']:+.2f}, funding "
+                     f"${fnd:+.2f}, open ${unreal:+.2f} → ${pt['realised'] - pt['fees'] + fnd + unreal:+.2f} · "
+                     f"liquidations {len(liqs)} (${sum(x['loss'] for x in liqs):+.2f})")
+    return "\n".join(lines)
+
+
+def cmd_sc(chat_id: str, arg: str):
+    parts = arg.split()
+    sub = parts[0].lower() if parts else "status"
+    rest = parts[1:]
+    confirmed = bool(rest) and rest[-1].upper() == "YES"
+    if confirmed:
+        rest = rest[:-1]
+    cfg = _sc_cfg()
+
+    def need_yes(what: str):
+        _PENDING_SC[chat_id] = (" ".join([sub] + rest), time.time() + _CONFIRM_TTL)
+        send(chat_id, f"⚠️ {what}\nReply YES within {_CONFIRM_TTL}s to confirm.")
+
+    if sub == "status":
+        send_pre(chat_id, _sc_status())
+    elif sub == "pnl":
+        send_pre(chat_id, _sc_pnl())
+    elif sub == "on":
+        cfg.update(enabled=True, paused=False); _sc_write(cfg)
+        send(chat_id, f"stock carry ON ({cfg['mode']}). First/next cohort at {cfg['rebalance_utc']} UTC, or /sc rebalance now.")
+    elif sub == "off":
+        live = _sc_live_open()
+        if live and not confirmed:
+            return need_yes(f"OFF closes {len(live)} LIVE positions at market.")
+        cfg["enabled"] = False; _sc_write(cfg)
+        send(chat_id, "stock carry OFF — open positions are being closed.")
+    elif sub == "pause":
+        cfg["paused"] = True; _sc_write(cfg)
+        send(chat_id, "stock carry PAUSED — positions held, no rebalances. /sc resume to continue.")
+    elif sub == "resume":
+        cfg["paused"] = False; _sc_write(cfg)
+        send(chat_id, "stock carry resumed.")
+    elif sub == "paper":
+        live = _sc_live_open()
+        if live and not confirmed:
+            return need_yes(f"Switching to paper closes {len(live)} LIVE positions at market.")
+        cfg["mode"] = "paper"; _sc_write(cfg)
+        send(chat_id, "stock carry → PAPER.")
+    elif sub == "live":
+        if not confirmed:
+            m = 2 * cfg["side_usd"] / cfg["leverage"]
+            return need_yes(f"Go LIVE: real IOC orders on Hyperliquid xyz — ${cfg['side_usd']:,.0f} long / "
+                            f"${cfg['side_usd']:,.0f} short across ~30-40 names at {cfg['leverage']}x isolated, "
+                            f"max {cfg['cap']:.0%} a name. Full book needs ~${m:,.0f} margin (keep ~${m * 1.25:,.0f} "
+                            f"in the xyz account); it builds up over 3 daily rebalances. Paper positions are closed first.")
+        cfg["mode"] = "live"; _sc_write(cfg)
+        send(chat_id, f"stock carry → LIVE. First live cohort at {cfg['rebalance_utc']} UTC — or /sc rebalance to start now.")
+    elif sub == "size" and rest:
+        cfg["side_usd"] = max(100.0, float(rest[0])); _sc_write(cfg)
+        send(chat_id, f"${cfg['side_usd']:,.0f} a side from the next rebalance.")
+    elif sub == "lev" and rest:
+        cfg["leverage"] = max(1, min(10, int(rest[0]))); _sc_write(cfg)
+        send(chat_id, f"{cfg['leverage']}x for positions opened or added from the next rebalance "
+                      f"(liquidation ~{1 / cfg['leverage'] - 0.05:.0%} against entry).")
+    elif sub == "close":
+        if _sc_live_open() and not confirmed:
+            return need_yes("Close ALL stock-carry positions now (LIVE ones at market)? It rebuilds from the next "
+                            "rebalance unless you also /sc pause or /sc off.")
+        _sc_request("flatten")
+        send(chat_id, "close requested — confirmation follows from the carry service.")
+    elif sub == "rebalance":
+        if cfg["mode"] == "live" and not confirmed:
+            return need_yes("Rebalance the LIVE book now (real orders)?")
+        _sc_request("rebalance")
+        send(chat_id, "rebalance requested — takes a few minutes (it reads funding for every name).")
+    elif sub == "reset" and rest:
+        _sc_request("reset", name=rest[0].upper())
+        send(chat_id, f"reset requested for {rest[0].upper()} (adopts the venue position if live).")
+    elif sub == "trades":
+        n = int(rest[0]) if rest and rest[0].isdigit() else 20
+        try:
+            rows = SC_TRADES.read_text().strip().splitlines()[1:]
+        except Exception:
+            rows = []
+        send_pre(chat_id, "\n".join(rows[-n:]) or "no trades yet")
+    else:
+        send(chat_id, "/sc [status] · pnl · trades [n] · on · off · pause · resume · paper · live · size USD · "
+                      "lev N · rebalance · close · reset SYM")
+
+
 def cmd_help(chat_id: str, _arg: str):
     send(chat_id,
+         "STOCK CARRY (short high-funding / long low-funding xyz stock perps, 4x isolated):\n"
+         "/sc — positions, margin, open P&L · /sc_pnl — lifetime P&L (live from Hyperliquid)\n"
+         "/sc_trades · /sc_pause · /sc_resume · /sc_on · /sc_off (closes all)\n"
+         "/sc_live (asks YES) · /sc_paper · /sc size USD · /sc lev N · /sc rebalance · /sc close · /sc reset SYM\n\n"
          "SESSION FLIP (Korea/HK long overnight, short in session):\n"
          "/sf — positions, open P&L, next flips\n"
          "/sf_pnl — lifetime P&L (closed trades, fees, funding) + open P&L, live from Hyperliquid\n"
@@ -1802,11 +2023,14 @@ HANDLERS = {
     "/start": cmd_start, "/stop": cmd_stop, "/restart": cmd_restart,
     "/flatten": cmd_flatten, "/help": cmd_help,
     "/sf": cmd_sf, "/sessionflip": cmd_sf,
+    "/sc": cmd_sc, "/stockcarry": cmd_sc,
 }
 # One-tap menu shortcuts: /sf_trades -> /sf trades, etc. Any arguments pass through.
 for _sub in ("pnl", "trades", "pause", "resume", "off", "on", "live", "paper", "close", "status",
              "long", "short", "auto"):
     HANDLERS[f"/sf_{_sub}"] = (lambda s: lambda chat_id, arg: cmd_sf(chat_id, f"{s} {arg}".strip()))(_sub)
+for _sub in ("pnl", "trades", "pause", "resume", "off", "on", "live", "paper", "close", "status", "rebalance"):
+    HANDLERS[f"/sc_{_sub}"] = (lambda s: lambda chat_id, arg: cmd_sc(chat_id, f"{s} {arg}".strip()))(_sub)
 
 
 def handle_message(msg: dict):
@@ -1841,6 +2065,10 @@ def handle_message(msg: dict):
         if pend_sf and pend_sf[1] > time.time():
             cmd_sf(chat_id, pend_sf[0] + " YES")
             return
+        pend_sc = _PENDING_SC.pop(chat_id, None)
+        if pend_sc and pend_sc[1] > time.time():
+            cmd_sc(chat_id, pend_sc[0] + " YES")
+            return
         pend = _PENDING.pop(chat_id, None)
         if pend and pend[1] > time.time():
             action = pend[0]  # 'stop' | 'flatten'
@@ -1871,6 +2099,11 @@ def main():
         # Menu = the session-flip workflow only. The arb is idle (auto-entry off), so its
         # commands are left out of the menu but still work when typed (see /help).
         _api("setMyCommands", {"commands": json.dumps([
+            {"command": "sc", "description": "Stock carry: positions, margin, open P&L"},
+            {"command": "sc_pnl", "description": "Stock carry lifetime P&L"},
+            {"command": "sc_live", "description": "Switch stock carry to LIVE (asks YES)"},
+            {"command": "sc_paper", "description": "Switch stock carry to paper"},
+            {"command": "sc_off", "description": "Close all stock-carry positions and stop"},
             {"command": "sf", "description": "Session flip: positions, open P&L, next flips"},
             {"command": "sf_pnl", "description": "Lifetime + open P&L (live from Hyperliquid)"},
             {"command": "sf_trades", "description": "Last session-flip fills"},

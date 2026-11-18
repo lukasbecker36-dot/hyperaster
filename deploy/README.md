@@ -94,3 +94,20 @@ You can still pin a mode in the unit by adding `--paper` or `--live` to
 
 `/stop` and `/flatten` require the `YES` confirmation (typed inline or as a
 bare `YES` reply within 60s). The bot ignores any chat id not in the allowlist.
+
+## Stock carry (`hyperaster-carry`)
+
+`stock_carry.py` runs a market-neutral funding book on the xyz stock perps: daily at 00:05 UTC it shorts
+the top-20% 24h funding names and buys the bottom 20%, $1,000 a side by default, 4x isolated, max 10% a
+name, each daily cohort held 3 days. Paper by default; `/sc live` (asks YES) switches it to real orders.
+It skips the session-flip names and anything the arb bot holds; while live, the arb skips its names.
+
+```bash
+sudo cp /opt/hyperaster/deploy/hyperaster-carry.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now hyperaster-carry
+journalctl -u hyperaster-carry -f
+```
+
+`/restart` restarts it with the other services once the unit is installed. Full book margin is about
+2 x side / leverage ($500 at $1,000 a side and 4x); keep ~25% more free in the xyz account.
