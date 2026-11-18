@@ -135,6 +135,23 @@ def test_live_short_of_margin_only_reduces(sandbox):
     assert any("only reductions" in s for s in sent)
 
 
+def test_unified_account_counts_spot_usdc(sandbox):
+    tmp, sent = sandbox
+    cfg = cfg_with(tmp, mode="live")
+    c = FakeClient({"A": 10.0, "B": 20.0}, withdrawable=0.0)          # unified: the xyz dex shows $0
+    c.api_keys = {"hl_account_address": "0xabc"}
+    bot = make_bot(c, {"A": 300.0, "B": -300.0})
+
+    async def info(body, pace=False):
+        assert body == {"type": "spotClearinghouseState", "user": "0xabc"}
+        return {"balances": [{"coin": "USDC", "total": "480.98", "hold": "0.0"}, {"coin": "HYPE", "total": "1"}]}
+
+    bot.info = info
+    assert asyncio.run(bot.free_margin()) == pytest.approx(480.98)
+    asyncio.run(bot.rebalance(cfg))
+    assert c.venue == pytest.approx({"A": 10.0, "B": -5.0}) and not any("only reductions" in s for s in sent)
+
+
 def test_venue_mismatch_parks_the_name(sandbox):
     tmp, sent = sandbox
     cfg = cfg_with(tmp, mode="live")

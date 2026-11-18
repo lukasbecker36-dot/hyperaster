@@ -110,4 +110,5 @@ journalctl -u hyperaster-carry -f
 ```
 
 `/restart` restarts it with the other services once the unit is installed. Full book margin is about
-2 x side / leverage ($500 at $1,000 a side and 4x); keep ~25% more free in the xyz account.
+2 x side / leverage ($500 at $1,000 a side and 4x); keep ~25% more free — on the xyz dex, or as spot USDC if the account is a unified account (HL backs every
+dex from spot then, and the xyz dex itself shows $0).

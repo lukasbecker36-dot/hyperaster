@@ -20,8 +20,9 @@ THE RULE (daily at REBALANCE UTC)
 
 SAFETY
   - Paper by default; live only after `/sc live YES`.
-  - Before anything that adds margin it checks the xyz account's withdrawable balance; short of it, only
-    reductions are traded and Telegram says so.
+  - Before anything that adds margin it checks the free collateral (the xyz dex's withdrawable, or for a
+    unified account the spot USDC less margin in use); short of it, only reductions are traded and Telegram
+    says so.
   - Never trades a name the session flip is configured for or the arb bot holds; while live, the arb bot's
     auto-entry skips this book's names (flip_reserve.py).
   - A venue position that doesn't match the state file (a liquidation, a manual trade) parks that name and
@@ -385,6 +386,26 @@ class StockCarry:
         save_state(self.st)
         return abs(filled) * px, ("" if p["status"] == "ok" else p["status"])
 
+    async def free_margin(self) -> float:
+        """Collateral free to back new positions. A plain account keeps xyz margin on the xyz dex ('withdrawable');
+        a unified account (HL userAbstraction 'unifiedAccount') backs every dex from spot USDC instead, so there
+        the xyz dex shows $0 and the free amount is spot USDC less the margin already used on the main and xyz
+        dexes (counted even if spot's 'hold' includes it: conservative)."""
+        xyz = await self.client.get_hl_balance("xyz") or {}
+        free = xyz.get("withdrawable", 0.0)
+        addr = (getattr(self.client, "api_keys", None) or {}).get("hl_account_address")
+        if addr:
+            try:
+                spot = await self.info({"type": "spotClearinghouseState", "user": addr})
+                usdc = sum(float(b.get("total") or 0) - float(b.get("hold") or 0)
+                           for b in spot.get("balances", []) if b.get("coin") == "USDC")
+                main = await self.client.get_hl_balance("") or {}
+                used = xyz.get("margin_used", 0.0) + main.get("margin_used", 0.0)
+                free = max(free, usdc - used)
+            except Exception as e:
+                log.warning(f"spot balance read failed ({e}); using the xyz dex balance only")
+        return free
+
     def margin_needed(self, target: dict, snap: dict, cfg: dict) -> float:
         """Extra margin the rebalance adds: growth in each name's |notional|, at the leverage."""
         add = 0.0
@@ -407,11 +428,10 @@ class StockCarry:
         adds_ok = True
         if live:
             need = self.margin_needed(target, snap, cfg)
-            bal = await self.client.get_hl_balance("xyz")
-            free = bal.get("withdrawable", 0.0) if bal else 0.0
+            free = await self.free_margin()
             if need * MARGIN_SPARE > free:
                 adds_ok = False
-                tg(f"⚠️ needs ${need:,.0f} more margin, xyz withdrawable ${free:,.0f} — only reductions traded today")
+                tg(f"⚠️ needs ${need:,.0f} more margin, free collateral ${free:,.0f} — only reductions traded today")
         traded, n_tr, notes = 0.0, 0, []
         names = set(target) | {n for n, p in self.st["pos"].items() if p.get("qty")}
         # reductions first, so the margin they free is there for the adds

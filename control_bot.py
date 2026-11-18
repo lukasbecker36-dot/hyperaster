@@ -1919,7 +1919,8 @@ def cmd_sc(chat_id: str, arg: str):
             return need_yes(f"Go LIVE: real IOC orders on Hyperliquid xyz — ${cfg['side_usd']:,.0f} long / "
                             f"${cfg['side_usd']:,.0f} short across ~30-40 names at {cfg['leverage']}x isolated, "
                             f"max {cfg['cap']:.0%} a name. Full book needs ~${m:,.0f} margin (keep ~${m * 1.25:,.0f} "
-                            f"in the xyz account); it builds up over 3 daily rebalances. Paper positions are closed first.")
+                            f"free — on the xyz dex, or as spot USDC on a unified account); it builds up over 3 daily "
+                            f"rebalances. Paper positions are closed first.")
         cfg["mode"] = "live"; _sc_write(cfg)
         send(chat_id, f"stock carry → LIVE. First live cohort at {cfg['rebalance_utc']} UTC — or /sc rebalance to start now.")
     elif sub == "size" and rest:
