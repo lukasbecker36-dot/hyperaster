@@ -389,19 +389,21 @@ class StockCarry:
     async def free_margin(self) -> float:
         """Collateral free to back new positions. A plain account keeps xyz margin on the xyz dex ('withdrawable');
         a unified account (HL userAbstraction 'unifiedAccount') backs every dex from spot USDC instead, so there
-        the xyz dex shows $0 and the free amount is spot USDC less the margin already used on the main and xyz
-        dexes (counted even if spot's 'hold' includes it: conservative)."""
+        the xyz dex shows $0 and the free amount is spot USDC less the margin in use. Spot's 'hold' already IS
+        that margin (19 Nov: hold $178.12 = xyz margin used $178.12), so it's taken once: the larger of the
+        hold and the perp dexes' margin used. Subtracting both had made $302 free look like $124."""
         xyz = await self.client.get_hl_balance("xyz") or {}
         free = xyz.get("withdrawable", 0.0)
         addr = (getattr(self.client, "api_keys", None) or {}).get("hl_account_address")
         if addr:
             try:
                 spot = await self.info({"type": "spotClearinghouseState", "user": addr})
-                usdc = sum(float(b.get("total") or 0) - float(b.get("hold") or 0)
-                           for b in spot.get("balances", []) if b.get("coin") == "USDC")
+                usdc = [b for b in spot.get("balances", []) if b.get("coin") == "USDC"]
+                total = sum(float(b.get("total") or 0) for b in usdc)
+                hold = sum(float(b.get("hold") or 0) for b in usdc)
                 main = await self.client.get_hl_balance("") or {}
                 used = xyz.get("margin_used", 0.0) + main.get("margin_used", 0.0)
-                free = max(free, usdc - used)
+                free = max(free, total - max(hold, used))
             except Exception as e:
                 log.warning(f"spot balance read failed ({e}); using the xyz dex balance only")
         return free

@@ -152,6 +152,26 @@ def test_unified_account_counts_spot_usdc(sandbox):
     assert c.venue == pytest.approx({"A": 10.0, "B": -5.0}) and not any("only reductions" in s for s in sent)
 
 
+def test_unified_margin_in_use_is_counted_once(sandbox):
+    """19 Nov live: spot USDC 480.67 with 178.12 on hold, and the xyz dex reporting the same 178.12 as margin
+    used. Free is 302.55, not 480.67 - 178.12 - 178.12."""
+    tmp, sent = sandbox
+    c = FakeClient({"A": 10.0}, withdrawable=0.0)
+    c.api_keys = {"hl_account_address": "0xabc"}
+
+    async def bal(dex="xyz"):
+        return {"withdrawable": 0.0, "margin_used": 178.12 if dex == "xyz" else 0.0}
+
+    c.get_hl_balance = bal
+    bot = make_bot(c, {})
+
+    async def info(body, pace=False):
+        return {"balances": [{"coin": "USDC", "total": "480.67", "hold": "178.12"}]}
+
+    bot.info = info
+    assert asyncio.run(bot.free_margin()) == pytest.approx(302.55)
+
+
 def test_venue_mismatch_parks_the_name(sandbox):
     tmp, sent = sandbox
     cfg = cfg_with(tmp, mode="live")
