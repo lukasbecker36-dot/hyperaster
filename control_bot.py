@@ -34,6 +34,7 @@ import json
 import os
 import subprocess
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -1498,28 +1499,83 @@ def _sf_live_open() -> list[str]:
     return [n for n, p in st.get("pos", {}).items() if p.get("qty") and p.get("mode") == "live"]
 
 
-def _hl_info(body: dict):
-    req = urllib.request.Request("https://api.hyperliquid.xyz/info", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req, timeout=15).read())
+def _hl_info(body: dict, retries: int = 3):
+    """POST /info. HL rate-limits per IP and this server's other bots share it, so a 429 waits 1, 2, 4s."""
+    for k in range(retries + 1):
+        req = urllib.request.Request("https://api.hyperliquid.xyz/info", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            return json.loads(urllib.request.urlopen(req, timeout=15).read())
+        except urllib.error.HTTPError as e:
+            if e.code != 429 or k == retries:
+                raise
+            time.sleep(2 ** k)
 
 
 # Per-call caps: userFunding returns at most 500 rows, userFillsByTime 2000. One call silently drops the rest
 # (stock carry's 41 positions log ~1,000 funding rows a day; /sc_pnl showed $0.12 of $0.38 on 20 Nov).
 _HL_PAGE = {"userFunding": 500, "userFillsByTime": 2000}
+PNL_CACHE = BASE_DIR / "data" / "hl_pnl_cache.json"
 
 
-def _hl_paged(kind: str, user: str, since: int, **extra) -> list:
-    out, start = [], since
-    for _ in range(200):
+def _row_key(kind: str, r: dict) -> str:
+    if kind == "userFillsByTime":
+        return str(r.get("tid") or f"{r.get('hash')}|{r.get('coin')}|{r.get('oid')}")
+    return f"{r['time']}|{r.get('delta', {}).get('coin')}"
+
+
+def _row_add(kind: str, sums: dict, r: dict):
+    if kind == "userFillsByTime":
+        s = sums.setdefault(r.get("coin", ""), {"closed": 0.0, "fee": 0.0})
+        s["closed"] += float(r.get("closedPnl") or 0)
+        s["fee"] += float(r.get("fee") or 0)
+    else:
+        d = r.get("delta", {})
+        s = sums.setdefault(d.get("coin", ""), {"usdc": 0.0})
+        s["usdc"] += float(d.get("usdc") or 0)               # + received, - paid
+
+
+def _hl_totals(kind: str, user: str, since: int, **extra) -> dict:
+    """Per-coin totals of HL fills ({coin: {closed, fee}}) or funding ({coin: {usdc}}) since `since`, paged and
+    cached: each call fetches only what is new since the last one (data/hl_pnl_cache.json).
+
+    Pages resume AT the last timestamp, not 1ms after it: every coin's hourly funding shares one timestamp,
+    so a page ending mid-hour would otherwise skip the rest of that hour. Rows at the boundary timestamp are
+    remembered by key and not counted twice."""
+    ck = f"{kind}|{user}|{since}|{json.dumps(extra, sort_keys=True)}"
+    try:
+        cache = json.loads(PNL_CACHE.read_text())
+    except Exception:
+        cache = {}
+    c = cache.get(ck) or {"upto": since, "edge": [], "sums": {}}
+    edge = set(c["edge"])
+    start = c["upto"]
+    for _ in range(500):
         rows = _hl_info({"type": kind, "user": user, "startTime": start, **extra})
         if not rows:
             break
-        out += rows
+        for r in sorted(rows, key=lambda r: int(r["time"])):
+            t, k = int(r["time"]), _row_key(kind, r)
+            if t < c["upto"] or (t == c["upto"] and k in edge):
+                continue
+            _row_add(kind, c["sums"], r)
+            if t > c["upto"]:
+                c["upto"], edge = t, {k}
+            else:
+                edge.add(k)
         if len(rows) < _HL_PAGE[kind]:
             break
-        start = max(int(r["time"]) for r in rows) + 1
-    return out
+        tmax = max(int(r["time"]) for r in rows)
+        # A full page all on one timestamp can't be paged past (HL has no offset): step 1ms on. Needs > 500
+        # coins' funding or > 2000 fills in one ms, which this account can't produce.
+        start = tmax if tmax > start else start + 1
+    c["edge"] = sorted(edge)
+    cache[ck] = c
+    PNL_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PNL_CACHE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cache))
+    tmp.replace(PNL_CACHE)
+    return c["sums"]
 
 
 def _sf_pnl() -> str:
@@ -1538,23 +1594,20 @@ def _sf_pnl() -> str:
         names = set(live["names"]) | set(_sf_cfg()["names"])
         addr = os.getenv("HL_ACCOUNT_ADDRESS") or os.getenv("HL_WALLET_ADDRESS", "")
         try:
-            fills = _hl_paged("userFillsByTime", addr, since)
-            fund = _hl_paged("userFunding", addr, since, dex="xyz")
+            fills = _hl_totals("userFillsByTime", addr, since)
+            fund = _hl_totals("userFunding", addr, since, dex="xyz")
             state = _hl_info({"type": "clearinghouseState", "user": addr, "dex": "xyz"})
         except Exception as e:
             return f"couldn't read Hyperliquid: {e}"
         base = lambda coin: coin.split(":")[-1]
         per = {n: {"closed": 0.0, "fees": 0.0, "fund": 0.0, "unreal": 0.0} for n in names}
-        for f in fills:
-            n = base(f.get("coin", ""))
-            if n in per:
-                per[n]["closed"] += float(f.get("closedPnl") or 0)
-                per[n]["fees"] += float(f.get("fee") or 0)
-        for f in fund:
-            d = f.get("delta", {})
-            n = base(d.get("coin", ""))
-            if n in per:
-                per[n]["fund"] += float(d.get("usdc") or 0)        # + received, - paid
+        for coin, s in fills.items():
+            if base(coin) in per:
+                per[base(coin)]["closed"] += s["closed"]
+                per[base(coin)]["fees"] += s["fee"]
+        for coin, s in fund.items():
+            if base(coin) in per:
+                per[base(coin)]["fund"] += s["usdc"]
         open_lines = []
         for ap in state.get("assetPositions", []):
             p = ap.get("position", {})
@@ -1857,16 +1910,15 @@ def _sc_pnl() -> str:
         names = set(live["names"])
         addr = os.getenv("HL_ACCOUNT_ADDRESS") or os.getenv("HL_WALLET_ADDRESS", "")
         try:
-            fills = _hl_paged("userFillsByTime", addr, since)
-            fund = _hl_paged("userFunding", addr, since, dex="xyz")
+            fills = _hl_totals("userFillsByTime", addr, since)
+            fund = _hl_totals("userFunding", addr, since, dex="xyz")
             state = _hl_info({"type": "clearinghouseState", "user": addr, "dex": "xyz"})
         except Exception as e:
             return f"couldn't read Hyperliquid: {e}"
         base = lambda coin: coin.split(":")[-1]
-        closed = sum(float(f.get("closedPnl") or 0) for f in fills if base(f.get("coin", "")) in names)
-        fees = sum(float(f.get("fee") or 0) for f in fills if base(f.get("coin", "")) in names)
-        fnd = sum(float(f.get("delta", {}).get("usdc") or 0) for f in fund
-                  if base(f.get("delta", {}).get("coin", "")) in names)
+        closed = sum(s["closed"] for c, s in fills.items() if base(c) in names)
+        fees = sum(s["fee"] for c, s in fills.items() if base(c) in names)
+        fnd = sum(s["usdc"] for c, s in fund.items() if base(c) in names)
         unreal = sum(float(ap["position"].get("unrealizedPnl") or 0) for ap in state.get("assetPositions", [])
                      if base(ap.get("position", {}).get("coin", "")) in names)
         ms = state.get("marginSummary", {})
