@@ -680,10 +680,19 @@ def cmd_restart(chat_id: str, _arg: str):
     send(chat_id, f"git pull:\n{out}")
 
     # 1. Restart the trader first — THIS process survives it, so we can confirm.
-    rc, out = run(["systemctl", "restart", SERVICE], timeout=30)
-    time.sleep(2)
-    _, active = run(["systemctl", "is-active", SERVICE], timeout=10)
-    send(chat_id, f"trader restart: {'ok' if rc == 0 else 'FAILED'} — now {active}\n{out}".strip())
+    #    A trader or capture unit that's been `systemctl disable`d is off on purpose (the arb was parked on
+    #    20 Nov 2026 to free HL request budget): `restart` would start it again, so it's skipped.
+    def disabled(unit: str) -> bool:
+        _, en = run(["systemctl", "is-enabled", unit], timeout=10)
+        return en.strip() == "disabled"
+
+    if disabled(SERVICE):
+        send(chat_id, f"trader '{SERVICE}' is disabled — left off (systemctl enable --now {SERVICE} to bring it back)")
+    else:
+        rc, out = run(["systemctl", "restart", SERVICE], timeout=30)
+        time.sleep(2)
+        _, active = run(["systemctl", "is-active", SERVICE], timeout=10)
+        send(chat_id, f"trader restart: {'ok' if rc == 0 else 'FAILED'} — now {active}\n{out}".strip())
 
     # 1b. Restart the capture daemon too (separate unit) so it picks up the
     #     gate-active backoff flag + retention prune. Only if it's loaded, and
@@ -693,7 +702,9 @@ def cmd_restart(chat_id: str, _arg: str):
             ["systemctl", "show", CAPTURE_SERVICE, "--property=LoadState", "--value"],
             timeout=10,
         )
-        if cap_load.strip() == "loaded":
+        if cap_load.strip() == "loaded" and disabled(CAPTURE_SERVICE):
+            send(chat_id, f"capture '{CAPTURE_SERVICE}' is disabled — left off")
+        elif cap_load.strip() == "loaded":
             rc_c, out_c = run(["systemctl", "restart", CAPTURE_SERVICE], timeout=30)
             time.sleep(2)
             _, cap_active = run(["systemctl", "is-active", CAPTURE_SERVICE], timeout=10)
