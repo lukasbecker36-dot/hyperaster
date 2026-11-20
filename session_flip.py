@@ -528,9 +528,12 @@ class SessionFlip:
         cfg = load_config()
         tg(f"up — {cfg['mode']}, {'enabled' if cfg['enabled'] else 'disabled'}: "
            + ", ".join(f"{n} ${notional_for(cfg, n):.0f}@{leverage_for(cfg, n)}x" for n in cfg["names"]))
-        # Startup reconcile for live names: never adopt or fight an unknown venue position.
+        # Startup reconcile for live names: never adopt or fight an unknown venue position. Skipped while the
+        # flip is off: its names are then free for stock_carry.py, whose positions would otherwise read as
+        # unknown and raise a park alert on every restart (MINIMAX / ZHIPU / SKHX, 20 Nov 2026). Turning the
+        # flip back on while the carry still holds one of its names parks that name at the first flip instead.
         for n, p in self.st["pos"].items():
-            if p.get("mode") == "live" and await self.ensure(n):
+            if cfg["enabled"] and p.get("mode") == "live" and await self.ensure(n):
                 venue = await self.venue_qty(n)
                 if abs(venue - p.get("qty", 0)) > max(1e-9, 0.02 * abs(p.get("qty", 0)) + 1e-6):
                     p["status"] = f"venue {venue:+.4f} != state {p.get('qty', 0):+.4f}"

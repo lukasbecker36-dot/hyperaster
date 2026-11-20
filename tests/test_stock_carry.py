@@ -90,7 +90,12 @@ def make_bot(client, cohort):
     async def build_cohort(cfg, s, now):
         return dict(cohort), {n: 0.1 for n in cohort}
 
-    bot.snapshot, bot.build_cohort = snapshot, build_cohort
+    async def venue_positions():
+        if getattr(client, "venue_fail", False):
+            raise RuntimeError("bad clearinghouseState reply: None")      # what a 429 looked like
+        return {n: q for n, q in client.venue.items() if q}
+
+    bot.snapshot, bot.build_cohort, bot.venue_positions = snapshot, build_cohort, venue_positions
     bot.only_isolated = {n: True for n in client.mids}
     return bot
 
@@ -182,6 +187,29 @@ def test_venue_mismatch_parks_the_name(sandbox):
     asyncio.run(bot.rebalance(cfg))
     assert bot.st["pos"]["A"]["status"].startswith("venue") and not any(o[0] == "A" for o in c.orders)
     assert any("parked" in s for s in sent)
+
+
+def test_failed_venue_read_trades_nothing_and_parks_nothing(sandbox):
+    tmp, sent = sandbox
+    cfg = cfg_with(tmp, mode="live")
+    c = FakeClient({"A": 10.0, "B": 20.0}, venue={"A": 20.0})
+    c.venue_fail = True
+    bot = make_bot(c, {"A": 300.0, "B": -300.0})
+    bot.st["pos"]["A"] = {"qty": 20.0, "avg": 10.0, "realised": 0.0, "fees": 0.0, "funding": 0.0,
+                          "status": "ok", "mode": "live"}
+    msg = asyncio.run(bot.rebalance(cfg))
+    assert "couldn't read the venue" in msg and c.orders == [] and bot.st["pos"]["A"]["status"] == "ok"
+
+
+def test_parked_name_unparks_when_the_venue_matches_again(sandbox):
+    tmp, sent = sandbox
+    cfg = cfg_with(tmp, mode="live")
+    c = FakeClient({"A": 10.0, "B": 20.0}, venue={"A": 0.047})
+    bot = make_bot(c, {"A": 0.47, "B": -300.0})                # A's target ~= what it holds
+    bot.st["pos"]["A"] = {"qty": 0.047, "avg": 10.0, "realised": 0.0, "fees": 0.0, "funding": 0.0,
+                          "status": "venue +0 != state +0.047", "mode": "live"}   # the false 20 Nov park
+    asyncio.run(bot.rebalance(cfg))
+    assert bot.st["pos"]["A"]["status"] == "ok" and any("un-parked" in s for s in sent)
 
 
 def test_session_flip_names_are_never_traded(sandbox):

@@ -338,3 +338,31 @@ def test_bad_hold_entries_are_dropped(sandbox):
     tmp, _ = sandbox
     write_cfg(tmp, hold={"skhx": 1, "AAPL": 1, "EWY": 2})
     assert sf.load_config()["hold"] == {"SKHX": 1}
+
+
+class _Stop(Exception):
+    pass
+
+
+@pytest.mark.parametrize("enabled, parked", [(False, False), (True, True)])
+def test_startup_reconcile_only_while_enabled(sandbox, monkeypatch, enabled, parked):
+    """Off, the flip's names are free for stock_carry: its positions there mustn't raise park alerts."""
+    tmp, sent = sandbox
+    write_cfg(tmp, enabled=enabled, mode="live", names=["MINIMAX"])
+    c = FakeClient(venue={"MINIMAX": -0.45})                   # the carry book's short
+    bot = make_bot(c)
+    bot.st["pos"]["MINIMAX"] = {"qty": 0.0, "avg": 0.0, "mode": "live", "status": "ok"}
+
+    async def stop_step():
+        raise _Stop
+
+    bot.step = stop_step
+    monkeypatch.setattr(sf, "tg", lambda text: sent.append(text))
+    with pytest.raises(_Stop):
+        async def go():
+            async def no_sleep(s):
+                raise _Stop
+            monkeypatch.setattr(sf.asyncio, "sleep", no_sleep)
+            await bot.run()
+        asyncio.run(go())
+    assert bot.st["pos"]["MINIMAX"]["status"].startswith("venue") == parked

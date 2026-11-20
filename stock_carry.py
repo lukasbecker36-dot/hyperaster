@@ -237,6 +237,7 @@ class StockCarry:
         self.lev_set: dict[str, int] = {}
         self.only_isolated: dict[str, bool] = {}
         self._last_info = 0.0
+        self._venue: dict | None = None             # one venue read, valid for the rebalance/flatten in progress
 
     # -- market data (public /info through the client's session)
     async def info(self, body: dict, pace: bool = False):
@@ -312,6 +313,37 @@ class StockCarry:
         except (TypeError, ValueError):
             return 0.0
 
+    async def venue_positions(self) -> dict:
+        """Every xyz position in ONE request ({name: szi}), and an exception if HL didn't answer properly.
+        The client's per-name get_hl_position() returns {} on any error, which reads as flat: on 20 Nov a
+        rate-limited startup check (41 calls at once) parked AAPL as 'venue 0' while HL held exactly ours."""
+        addr = (getattr(self.client, "api_keys", None) or {}).get("hl_account_address")
+        d = await self.info({"type": "clearinghouseState", "user": addr, "dex": "xyz"})
+        if not isinstance(d, dict) or not isinstance(d.get("assetPositions"), list):
+            raise RuntimeError(f"bad clearinghouseState reply: {str(d)[:120]}")
+        return {ap["position"]["coin"].split(":")[-1]: float(ap["position"]["szi"]) for ap in d["assetPositions"]}
+
+    @staticmethod
+    def mismatch(venue: float, qty: float) -> bool:
+        return abs(venue - qty) > max(1e-9, 0.02 * abs(qty) + 1e-6)
+
+    def reconcile(self, venue: dict) -> list[str]:
+        """Park live names whose venue position differs from state; un-park ones that match again."""
+        msgs = []
+        for n, p in self.st["pos"].items():
+            if p.get("mode") != "live":
+                continue
+            v, q = venue.get(n, 0.0), p.get("qty", 0.0)
+            parked = p.get("status", "ok").startswith("venue")
+            if q and self.mismatch(v, q) and not parked:
+                p["status"] = f"venue {v:+.4g} != state {q:+.4g}"
+                msgs.append(f"⚠️ {n}: venue {v:+.4g} vs state {q:+.4g} — parked (liquidated or traded by hand?). "
+                            f"/sc reset {n} adopts the venue position.")
+            elif parked and not self.mismatch(v, q):
+                p["status"] = "ok"
+                msgs.append(f"✅ {n}: venue matches state again ({q:+.4g}) — un-parked")
+        return msgs
+
     async def trade_live(self, name: str, delta: float) -> tuple[float, float]:
         """Move the venue position by `delta` coins with IOCs. Returns (filled, avg px)."""
         filled, cost = 0.0, 0.0
@@ -360,8 +392,11 @@ class StockCarry:
             if arb_holds(name):
                 p["status"] = "arb holds this symbol"
                 return 0.0, "arb holds it"
-            venue = await self.venue_qty(name)
-            if abs(venue - p["qty"]) > max(1e-9, 0.02 * abs(p["qty"]) + 1e-6):
+            # one venue read per rebalance/flatten (raises if HL didn't answer: never read as flat)
+            if self._venue is None:
+                self._venue = await self.venue_positions()
+            venue = self._venue.get(name, 0.0)
+            if self.mismatch(venue, p["qty"]):
                 p["status"] = f"venue {venue:+.4g} != state {p['qty']:+.4g}"
                 tg(f"⚠️ {name}: venue {venue:+.4g} vs state {p['qty']:+.4g} — parked (liquidated or traded by hand?). "
                    f"/sc reset {name} adopts the venue position.")
@@ -383,6 +418,8 @@ class StockCarry:
             record_trade({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "mode": mode, "name": name,
                           "side": "buy" if filled > 0 else "sell", "qty": f"{abs(filled):.6g}", "px": f"{px:.6g}",
                           "fee": f"{fee:.4f}", "reason": reason})
+            if mode == "live" and self._venue is not None:
+                self._venue[name] = self._venue.get(name, 0.0) + filled
         save_state(self.st)
         return abs(filled) * px, ("" if p["status"] == "ok" else p["status"])
 
@@ -420,6 +457,13 @@ class StockCarry:
         return add / cfg["leverage"]
 
     async def rebalance(self, cfg: dict, reason: str = "daily rebalance") -> str:
+        self._venue = None
+        try:
+            return await self._rebalance(cfg, reason)
+        finally:
+            self._venue = None
+
+    async def _rebalance(self, cfg: dict, reason: str) -> str:
         snap = await self.snapshot()
         cohort, fund = await self.build_cohort(cfg, snap, time.time())
         if not cohort:
@@ -429,6 +473,13 @@ class StockCarry:
         live = cfg["mode"] == "live"
         adds_ok = True
         if live:
+            try:
+                self._venue = await self.venue_positions()
+            except Exception as e:
+                save_state(self.st)
+                return f"⚠️ couldn't read the venue positions ({e}) — nothing traded; next rebalance or /sc rebalance retries"
+            for m in self.reconcile(self._venue):
+                tg(m)
             need = self.margin_needed(target, snap, cfg)
             free = await self.free_margin()
             if need * MARGIN_SPARE > free:
@@ -476,6 +527,13 @@ class StockCarry:
                 + ("\n" + "\n".join(notes) if notes else ""))
 
     async def flatten(self, cfg: dict, reason: str) -> str:
+        self._venue = None
+        try:
+            return await self._flatten(cfg, reason)
+        finally:
+            self._venue = None
+
+    async def _flatten(self, cfg: dict, reason: str) -> str:
         snap = await self.snapshot()
         out = []
         for n, p in list(self.st["pos"].items()):
@@ -543,8 +601,15 @@ class StockCarry:
                 n = req["name"]
                 p = self.st["pos"].setdefault(n, {"qty": 0.0, "avg": 0.0, "realised": 0.0, "fees": 0.0,
                                                   "funding": 0.0, "mode": cfg["mode"]})
-                if p.get("mode") == "live" and await self.ensure(n):
-                    vp = await self.client.get_hl_position(n)
+                if p.get("mode") == "live":
+                    try:                # one checked read: a failed per-name query would adopt 'flat'
+                        addr = (getattr(self.client, "api_keys", None) or {}).get("hl_account_address")
+                        d = await self.info({"type": "clearinghouseState", "user": addr, "dex": "xyz"})
+                        vp = next((ap["position"] for ap in d["assetPositions"]
+                                   if ap["position"]["coin"].split(":")[-1] == n), {})
+                    except Exception as e:
+                        tg(f"{n}: reset NOT done — couldn't read the venue ({e}); try again")
+                        continue
                     p["qty"] = float(vp.get("szi", 0) or 0)
                     p["avg"] = float(vp.get("entryPx", 0) or 0) if p["qty"] else 0.0
                 p["status"] = "ok"
@@ -571,12 +636,12 @@ class StockCarry:
         cfg = load_config()
         tg(f"up — {cfg['mode']}, {'enabled' if cfg['enabled'] else 'disabled'}: ${cfg['side_usd']:,.0f} a side at "
            f"{cfg['leverage']}x, max {cfg['cap']:.0%} a name, rebalance {cfg['rebalance_utc']} UTC")
-        for n, p in self.st["pos"].items():
-            if p.get("mode") == "live" and p.get("qty") and await self.ensure(n):
-                venue = await self.venue_qty(n)
-                if abs(venue - p["qty"]) > max(1e-9, 0.02 * abs(p["qty"]) + 1e-6):
-                    p["status"] = f"venue {venue:+.4g} != state {p['qty']:+.4g}"
-                    tg(f"⚠️ {n}: venue {venue:+.4g} vs state {p['qty']:+.4g} — parked until /sc reset {n}")
+        if any(p.get("mode") == "live" and p.get("qty") for p in self.st["pos"].values()):
+            try:
+                for m in self.reconcile(await self.venue_positions()):
+                    tg(m)
+            except Exception as e:      # don't park anything on a failed read; the next rebalance checks again
+                log.warning(f"startup venue check skipped: {e}")
         save_state(self.st)
         while True:
             try:
