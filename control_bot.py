@@ -1504,6 +1504,24 @@ def _hl_info(body: dict):
     return json.loads(urllib.request.urlopen(req, timeout=15).read())
 
 
+# Per-call caps: userFunding returns at most 500 rows, userFillsByTime 2000. One call silently drops the rest
+# (stock carry's 41 positions log ~1,000 funding rows a day; /sc_pnl showed $0.12 of $0.38 on 20 Nov).
+_HL_PAGE = {"userFunding": 500, "userFillsByTime": 2000}
+
+
+def _hl_paged(kind: str, user: str, since: int, **extra) -> list:
+    out, start = [], since
+    for _ in range(200):
+        rows = _hl_info({"type": kind, "user": user, "startTime": start, **extra})
+        if not rows:
+            break
+        out += rows
+        if len(rows) < _HL_PAGE[kind]:
+            break
+        start = max(int(r["time"]) for r in rows) + 1
+    return out
+
+
 def _sf_pnl() -> str:
     """Lifetime + open P&L. LIVE comes from Hyperliquid itself (fills' closedPnl and
     fee, userFunding, open positions' unrealizedPnl) for the flip names since the first
@@ -1520,8 +1538,8 @@ def _sf_pnl() -> str:
         names = set(live["names"]) | set(_sf_cfg()["names"])
         addr = os.getenv("HL_ACCOUNT_ADDRESS") or os.getenv("HL_WALLET_ADDRESS", "")
         try:
-            fills = _hl_info({"type": "userFillsByTime", "user": addr, "startTime": since})
-            fund = _hl_info({"type": "userFunding", "user": addr, "startTime": since, "dex": "xyz"})
+            fills = _hl_paged("userFillsByTime", addr, since)
+            fund = _hl_paged("userFunding", addr, since, dex="xyz")
             state = _hl_info({"type": "clearinghouseState", "user": addr, "dex": "xyz"})
         except Exception as e:
             return f"couldn't read Hyperliquid: {e}"
@@ -1839,8 +1857,8 @@ def _sc_pnl() -> str:
         names = set(live["names"])
         addr = os.getenv("HL_ACCOUNT_ADDRESS") or os.getenv("HL_WALLET_ADDRESS", "")
         try:
-            fills = _hl_info({"type": "userFillsByTime", "user": addr, "startTime": since})
-            fund = _hl_info({"type": "userFunding", "user": addr, "startTime": since, "dex": "xyz"})
+            fills = _hl_paged("userFillsByTime", addr, since)
+            fund = _hl_paged("userFunding", addr, since, dex="xyz")
             state = _hl_info({"type": "clearinghouseState", "user": addr, "dex": "xyz"})
         except Exception as e:
             return f"couldn't read Hyperliquid: {e}"
