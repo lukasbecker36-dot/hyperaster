@@ -212,6 +212,52 @@ def test_parked_name_unparks_when_the_venue_matches_again(sandbox):
     assert bot.st["pos"]["A"]["status"] == "ok" and any("un-parked" in s for s in sent)
 
 
+def test_rebalance_loads_every_name_in_one_market_list_read(sandbox, monkeypatch):
+    tmp, sent = sandbox
+    cfg = cfg_with(tmp, mode="live")
+    c = FakeClient({"A": 10.0, "B": 20.0, "C": 30.0})
+    loads = []
+    orig = c._load_hl_xyz_specs
+
+    async def counted(names):
+        loads.append(list(names))
+        await orig(names)
+
+    c._load_hl_xyz_specs = counted
+    monkeypatch.setattr(sc.asyncio, "sleep", lambda s, _real=asyncio.sleep: _real(0))
+    bot = make_bot(c, {"A": 300.0, "B": -300.0, "C": 300.0})
+    asyncio.run(bot.rebalance(cfg))
+    assert loads == [["A", "B", "C"]] and len(c.orders) == 3
+
+
+def test_leverage_refusal_is_retried_and_never_parks(sandbox, monkeypatch):
+    tmp, sent = sandbox
+    cfg = cfg_with(tmp, mode="live")
+    c = FakeClient({"A": 10.0, "B": 20.0})
+    monkeypatch.setattr(sc.asyncio, "sleep", lambda s, _real=asyncio.sleep: _real(0))
+    calls = []
+
+    async def refuse_a(n, lev, cross=True):
+        calls.append(n)
+        return n != "A"
+
+    c.set_hl_leverage = refuse_a
+    bot = make_bot(c, {"A": 300.0, "B": -300.0})
+    bot.st["pos"]["B"] = {"qty": 0.0, "avg": 0.0, "realised": 0.0, "fees": 0.0, "funding": 0.0,
+                          "status": "could not set 4x", "mode": "live"}           # parked by the old code
+    msg = asyncio.run(bot.rebalance(cfg))
+    assert calls.count("A") == 2 and "A" not in c.venue                         # retried once, not traded
+    assert bot.st["pos"]["A"]["status"] == "ok" and "retried next rebalance" in msg
+    assert c.venue["B"] == pytest.approx(-5.0)                                  # un-parked and traded
+    async def accept(n, lev, cross=True):
+        return True
+
+    c.set_hl_leverage = accept
+    bot.st["last_rebalance"] = ""
+    asyncio.run(bot.rebalance(cfg))
+    assert c.venue["A"] > 0                                                     # traded the next time
+
+
 def test_session_flip_names_are_never_traded(sandbox):
     tmp, sent = sandbox
     (tmp / "sf.json").write_text(json.dumps({"enabled": True, "names": ["MINIMAX", "zhipu"]}))

@@ -298,13 +298,30 @@ class StockCarry:
     async def ensure(self, name: str) -> bool:
         if name in self.loaded:
             return True
+        await self.prepare([name])
+        return name in self.loaded
+
+    async def prepare(self, names) -> None:
+        """Load HL specs for every name not loaded yet in ONE market-list read, then each one's tick size
+        (one book read each, paced). Loading them one by one re-read the whole xyz market list per name:
+        ~40 heavy reads in a burst, which HL rate-limited on 21 Nov, so valid markets (TLT, KSTR...) came
+        back as 'not an HL xyz market'. A name still missing after this is retried at the next rebalance."""
+        todo = [n for n in dict.fromkeys(names) if n not in self.loaded]
+        if not todo:
+            return
         await self.client.ensure_session()
-        await self.client._load_hl_xyz_specs([name])
-        if name not in self.client._hl_asset_index:
-            return False
-        await self.client._infer_hl_tick_sizes([name])
-        self.loaded.add(name)
-        return True
+        for attempt in range(2):
+            missing = [n for n in todo if n not in self.client._hl_asset_index]
+            if not missing:
+                break
+            if attempt:
+                await asyncio.sleep(5)          # one retry after a pause if HL refused the read
+            await self.client._load_hl_xyz_specs(missing)
+        for n in todo:
+            if n in self.client._hl_asset_index:
+                await self.client._infer_hl_tick_sizes([n])
+                self.loaded.add(n)
+                await asyncio.sleep(0.25)
 
     async def venue_qty(self, name: str) -> float:
         p = await self.client.get_hl_position(name)
@@ -403,9 +420,13 @@ class StockCarry:
                 return 0.0, "parked"
             if target and self.lev_set.get(name) != cfg["leverage"]:
                 cross = not self.only_isolated.get(name, True)
-                if not await self.client.set_hl_leverage(name, cfg["leverage"], cross=cross):
-                    p["status"] = f"could not set {cfg['leverage']}x"
-                    return 0.0, "leverage refused"
+                ok = await self.client.set_hl_leverage(name, cfg["leverage"], cross=cross)
+                if not ok:                      # usually a rate-limited request: one retry after a pause
+                    await asyncio.sleep(3)
+                    ok = await self.client.set_hl_leverage(name, cfg["leverage"], cross=cross)
+                if not ok:
+                    # not traded this time, but not parked either: the next rebalance tries again
+                    return 0.0, f"HL didn't confirm {cfg['leverage']}x leverage (busy?) — not traded, retried next rebalance"
                 self.lev_set[name] = cfg["leverage"]
             filled, px = await self.trade_live(name, delta)
             p["status"] = "ok" if abs(filled) >= abs(delta) * 0.98 else f"partial {filled:+.4g}/{delta:+.4g}"
@@ -487,6 +508,10 @@ class StockCarry:
                 tg(f"⚠️ needs ${need:,.0f} more margin, free collateral ${free:,.0f} — only reductions traded today")
         traded, n_tr, notes = 0.0, 0, []
         names = set(target) | {n for n, p in self.st["pos"].items() if p.get("qty")}
+        for p in self.st["pos"].values():       # the old leverage refusal used to park: un-park those
+            if p.get("status", "ok").startswith("could not set"):
+                p["status"] = "ok"
+        await self.prepare(sorted(names))
         # reductions first, so the margin they free is there for the adds
         order = sorted(names, key=lambda n: abs(target.get(n, 0.0)) - abs(
             self.st["pos"].get(n, {}).get("qty", 0.0) * snap.get(n, {}).get("mid", 0.0)))
@@ -505,7 +530,7 @@ class StockCarry:
                 continue
             try:
                 if not await self.ensure(n):
-                    notes.append(f"{n}: not an HL xyz market")
+                    notes.append(f"{n}: couldn't load its HL market details (HL busy?) — retried next rebalance")
                     continue
                 usd, note = await self.move_to(n, want, cfg, s["mid"], reason)
                 traded += usd
@@ -536,6 +561,7 @@ class StockCarry:
     async def _flatten(self, cfg: dict, reason: str) -> str:
         snap = await self.snapshot()
         out = []
+        await self.prepare(sorted(n for n, p in self.st["pos"].items() if p.get("qty")))
         for n, p in list(self.st["pos"].items()):
             if not p.get("qty"):
                 continue
