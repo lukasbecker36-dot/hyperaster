@@ -1901,7 +1901,13 @@ def _sc_status() -> str:
              f"rebalance {cfg['rebalance_utc']} UTC (last {st.get('last_rebalance') or 'never'}, "
              f"{len(st.get('cohorts', []))}/{cfg['hold_d']} cohorts)",
              f"book: long ${lu:,.0f} / short ${su:,.0f} · margin ~${(lu + su) / cfg['leverage']:,.0f} · "
-             f"open P&L ${unreal:+.2f}", ""]
+             f"open P&L ${unreal:+.2f}"]
+    peak = st.get("pnl_peak")
+    lines.append(("🛑 KILL SWITCH tripped — rebalancing paused; /sc_resume to carry on, /sc_off to close all"
+                  if st.get("killed") else
+                  f"kill switch at {cfg.get('kill_dd', 0.10):.0%} of the book "
+                  f"(${cfg.get('kill_dd', 0.10) * 2 * cfg['side_usd']:,.0f}) below the P&L peak"
+                  + (f" ${peak:+,.2f}" if peak is not None else "")) + "\n")
     lines += [r[1] for r in rows] or ["no positions yet — the first cohort goes on at the next rebalance"]
     lines.append("\nlifetime P&L incl. fees and funding: /sc_pnl")
     return "\n".join(lines)
@@ -2007,6 +2013,12 @@ def cmd_sc(chat_id: str, arg: str):
     elif sub == "size" and rest:
         cfg["side_usd"] = max(100.0, float(rest[0])); _sc_write(cfg)
         send(chat_id, f"${cfg['side_usd']:,.0f} a side from the next rebalance.")
+    elif sub == "kill" and rest:
+        # /sc kill 10 (percent of the gross book) · /sc kill 0 turns it off
+        v = float(rest[0].rstrip("%"))
+        cfg["kill_dd"] = max(0.0, v / 100 if v >= 1 else v); _sc_write(cfg)
+        send(chat_id, (f"kill switch at {cfg['kill_dd']:.0%} of the book (${cfg['kill_dd'] * 2 * cfg['side_usd']:,.0f}) "
+                       f"below the P&L peak" if cfg["kill_dd"] else "kill switch OFF"))
     elif sub == "lev" and rest:
         cfg["leverage"] = max(1, min(10, int(rest[0]))); _sc_write(cfg)
         send(chat_id, f"{cfg['leverage']}x for positions opened or added from the next rebalance "
@@ -2034,7 +2046,7 @@ def cmd_sc(chat_id: str, arg: str):
         send_pre(chat_id, "\n".join(rows[-n:]) or "no trades yet")
     else:
         send(chat_id, "/sc [status] · pnl · trades [n] · on · off · pause · resume · paper · live · size USD · "
-                      "lev N · rebalance · close · reset SYM")
+                      "lev N · kill PCT · rebalance · close · reset SYM")
 
 
 def cmd_help(chat_id: str, _arg: str):
@@ -2042,7 +2054,7 @@ def cmd_help(chat_id: str, _arg: str):
          "STOCK CARRY (short high-funding / long low-funding xyz stock perps, 4x isolated):\n"
          "/sc — positions, margin, open P&L · /sc_pnl — lifetime P&L (live from Hyperliquid)\n"
          "/sc_trades · /sc_pause · /sc_resume · /sc_on · /sc_off (closes all)\n"
-         "/sc_live (asks YES) · /sc_paper · /sc size USD · /sc lev N · /sc rebalance · /sc close · /sc reset SYM\n\n"
+         "/sc_live (asks YES) · /sc_paper · /sc size USD · /sc lev N · /sc kill PCT · /sc rebalance · /sc close · /sc reset SYM\n\n"
          "SESSION FLIP (Korea/HK long overnight, short in session):\n"
          "/sf — positions, open P&L, next flips\n"
          "/sf_pnl — lifetime P&L (closed trades, fees, funding) + open P&L, live from Hyperliquid\n"

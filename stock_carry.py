@@ -27,6 +27,13 @@ SAFETY
     auto-entry skips this book's names (flip_reserve.py).
   - A venue position that doesn't match the state file (a liquidation, a manual trade) parks that name and
     alerts; `/sc reset SYM` adopts what the venue shows.
+  - A day's cohort only counts once its rebalance actually trades: a run that can't read the venue, or that
+    scored under 90% of the names (HL rate limits), trades nothing and retries in 15 min (3 tries a day). A
+    second rebalance the same day replaces that day's cohort instead of adding one.
+  - Short of margin, every add is scaled down by the same factor (reductions in full) so the book stays
+    balanced, instead of skipping all adds.
+  - Kill switch: if the book's P&L falls `kill_dd` (10%) of the gross book below its peak, rebalancing pauses
+    and Telegram alerts (positions are held; /sc_off closes them, /sc_resume carries on from there).
 
 CONTROL
   data/stockcarry.json          config, written by control_bot (/sc ...)
@@ -82,6 +89,8 @@ DEFAULT_CONFIG = {
     "rebalance_utc": "00:05",
     "exclude": [],                   # never trade these (on top of the session-flip names)
     "paused": False,                 # True: hold positions, no rebalances
+    "kill_dd": 0.10,                 # pause when P&L falls this share of the gross book (2 x side_usd) off its peak
+    "max_skip": 0.10,                # don't trade a cohort scored from fewer than 90% of the candidate names
 }
 TAKER_FEE = 0.00009                  # HL growth-mode taker (~0.9bp) for paper fills
 IOC_BUFFER_BPS = 15
@@ -90,6 +99,8 @@ MIN_ORDER_USD = 10.0                 # HL minimum order value
 MAINT = 0.05                         # maintenance ~ half the initial margin at 10x max leverage
 MARGIN_SPARE = 1.10                  # free margin wanted per $ of new margin before adding
 PACE_S = 1.2                         # between per-coin /info reads at a rebalance
+RETRY_S = 900                        # a failed daily rebalance retries after this long...
+MAX_RETRIES = 3                      # ...this many times a day
 
 
 # ---------------------------------------------------------------- pure helpers
@@ -183,6 +194,12 @@ def load_state() -> dict:
         st = {}
     st.setdefault("pos", {})          # name -> {"mode", "qty", "avg", "realised", "fees", "funding", "status"}
     st.setdefault("cohorts", [])
+    days = st.get("cohort_days")
+    st["cohort_days"] = days if isinstance(days, list) and len(days) == len(st["cohorts"]) else [""] * len(st["cohorts"])
+    st.setdefault("retry_after", 0)
+    st.setdefault("retries", {})      # day -> failed attempts
+    st.setdefault("pnl_peak", None)
+    st.setdefault("killed", False)
     st.setdefault("last_rebalance", "")
     st.setdefault("last_funding_hour", 0)
     st.setdefault("liqs", [])         # paper liquidations: {"ts", "name", "loss"}
@@ -225,7 +242,27 @@ def tg(text: str):
 
 def due(cfg: dict, st: dict, now: datetime) -> bool:
     hh, mm = (int(x) for x in cfg["rebalance_utc"].split(":"))
-    return (now.hour, now.minute) >= (hh, mm) and st["last_rebalance"] != now.strftime("%Y-%m-%d")
+    return ((now.hour, now.minute) >= (hh, mm) and st["last_rebalance"] != now.strftime("%Y-%m-%d")
+            and now.timestamp() >= st.get("retry_after", 0))
+
+
+def with_cohort(cohorts: list, days: list, cohort: dict, day: str, hold_d: int) -> tuple[list, list]:
+    """The cohort list after adding today's: a cohort already dated today is replaced (a second rebalance the
+    same day), and only the last hold_d are kept."""
+    keep = [(c, d) for c, d in zip(cohorts, days) if d != day]
+    keep = (keep + [(cohort, day)])[-hold_d:]
+    return [c for c, _ in keep], [d for _, d in keep]
+
+
+def scale_add(want: float, cur: float, k: float) -> float:
+    """Shrink the ADDING part of a move to `want` (from `cur`, $) by k; reductions are kept whole."""
+    if k >= 1:
+        return want
+    if want * cur > 0 and abs(want) > abs(cur):
+        return cur + (want - cur) * k          # growing a position: only the growth is scaled
+    if want * cur < 0 or cur == 0:
+        return want * k                        # opening or flipping: the new side is scaled
+    return want                                # reducing
 
 
 # ---------------------------------------------------------------- the trader
@@ -238,6 +275,9 @@ class StockCarry:
         self.only_isolated: dict[str, bool] = {}
         self._last_info = 0.0
         self._venue: dict | None = None             # one venue read, valid for the rebalance/flatten in progress
+        self.last_ok = True                         # did the last rebalance run (not abort)?
+        self.skipped: list = []
+        self.scored_of = 0
 
     # -- market data (public /info through the client's session)
     async def info(self, body: dict, pace: bool = False):
@@ -276,21 +316,28 @@ class StockCarry:
         names = [n for n, s in snap.items() if s["vol"] >= cfg["min_vol"] and n not in FX_COMM and n not in skip]
         sig, vol = {}, {}
         age_s = cfg["min_age_d"] * 86400
+        self.skipped = []                                    # names HL didn't answer for (not: too young)
         for n in names:
             try:
                 cl = await self.info({"type": "candleSnapshot", "req": {
                     "coin": f"xyz:{n}", "interval": "1h", "startTime": int((now_s - age_s - 3600) * 1000),
                     "endTime": int(now_s * 1000)}}, pace=True)
+                if not isinstance(cl, list):
+                    raise RuntimeError(f"bad candles reply {str(cl)[:60]}")
                 if not cl or int(cl[0]["t"]) / 1000 > now_s - age_s + 6 * 3600:
                     continue                                 # listed < min_age_d
                 vol[n] = hourly_vol([float(x["c"]) for x in cl[-241:]])
                 fh = await self.info({"type": "fundingHistory", "coin": f"xyz:{n}",
                                       "startTime": int((now_s - cfg["look_h"] * 3600) * 1000)}, pace=True)
-                rates = [float(x["fundingRate"]) for x in fh or []]
+                if not isinstance(fh, list):
+                    raise RuntimeError(f"bad funding reply {str(fh)[:60]}")
+                rates = [float(x["fundingRate"]) for x in fh]
                 if rates:
                     sig[n] = -statistics.mean(rates)         # high funding -> short
             except Exception as e:
                 log.warning(f"{n} skipped: {e}")
+                self.skipped.append(n)
+        self.scored_of = len(names)
         return (long_short(sig, vol, cfg["q"], cfg["side_usd"], cfg["cap"]),
                 {n: -v * 8760 for n, v in sig.items()})
 
@@ -478,7 +525,9 @@ class StockCarry:
         return add / cfg["leverage"]
 
     async def rebalance(self, cfg: dict, reason: str = "daily rebalance") -> str:
+        """Run one rebalance; sets self.last_ok False if it aborted before trading (nothing committed)."""
         self._venue = None
+        self.last_ok = False
         try:
             return await self._rebalance(cfg, reason)
         finally:
@@ -487,12 +536,17 @@ class StockCarry:
     async def _rebalance(self, cfg: dict, reason: str) -> str:
         snap = await self.snapshot()
         cohort, fund = await self.build_cohort(cfg, snap, time.time())
+        if self.scored_of and len(self.skipped) > cfg["max_skip"] * self.scored_of:
+            return (f"⚠️ {reason}: only scored {self.scored_of - len(self.skipped)} of {self.scored_of} names "
+                    f"(HL busy?) — nothing traded, cohort not counted; retrying")
         if not cohort:
+            self.last_ok = True
             return "no cohort today (too few eligible names) — positions unchanged"
-        self.st["cohorts"] = (self.st["cohorts"] + [cohort])[-cfg["hold_d"]:]
-        target = book_target(self.st["cohorts"], cfg["hold_d"])
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        cohorts, days = with_cohort(self.st["cohorts"], self.st["cohort_days"], cohort, today, cfg["hold_d"])
+        target = book_target(cohorts, cfg["hold_d"])
         live = cfg["mode"] == "live"
-        adds_ok = True
+        k = 1.0                                  # share of each add that fits the free margin
         if live:
             try:
                 self._venue = await self.venue_positions()
@@ -504,8 +558,12 @@ class StockCarry:
             need = self.margin_needed(target, snap, cfg)
             free = await self.free_margin()
             if need * MARGIN_SPARE > free:
-                adds_ok = False
-                tg(f"⚠️ needs ${need:,.0f} more margin, free collateral ${free:,.0f} — only reductions traded today")
+                k = max(0.0, free / (need * MARGIN_SPARE))
+                tg(f"⚠️ adds need ${need:,.0f} more margin, free collateral ${free:,.0f} — every add scaled to "
+                   f"{k:.0%} so the book stays balanced (reductions in full)")
+        # committed now: this cohort counts towards the 3-day book
+        self.st["cohorts"], self.st["cohort_days"] = cohorts, days
+        self.last_ok = True
         traded, n_tr, notes = 0.0, 0, []
         names = set(target) | {n for n, p in self.st["pos"].items() if p.get("qty")}
         for p in self.st["pos"].values():       # the old leverage refusal used to park: un-park those
@@ -520,10 +578,8 @@ class StockCarry:
             if not s:
                 notes.append(f"{n}: no quote")
                 continue
-            want = target.get(n, 0.0)
             cur_usd = self.st["pos"].get(n, {}).get("qty", 0.0) * s["mid"]
-            if not adds_ok and abs(want) > abs(cur_usd) and want * cur_usd >= 0:
-                continue
+            want = scale_add(target.get(n, 0.0), cur_usd, k)
             st = self.st["pos"].get(n, {}).get("status", "ok")
             if st != "ok" and not st.startswith("partial"):
                 notes.append(f"{n}: {st}")
@@ -569,7 +625,7 @@ class StockCarry:
             if await self.ensure(n):
                 usd, note = await self.move_to(n, 0.0, cfg, mid, reason)
                 out.append(f"{n} closed ${usd:,.0f}" + (f" ({note})" if note else ""))
-        self.st["cohorts"] = []
+        self.st["cohorts"], self.st["cohort_days"] = [], []
         save_state(self.st)
         return "\n".join(out) or "nothing open"
 
@@ -602,6 +658,51 @@ class StockCarry:
                 tg(f"PAPER {n} liquidated at {cfg['leverage']}x: ${loss:+,.2f}")
         save_state(self.st)
 
+    def book_pnl(self, cfg: dict, snap: dict) -> float:
+        """The current mode's P&L from the state: realised - fees + open (marked to `snap`), + paper funding.
+        Live funding is paid on the venue and isn't in the state (small next to price; see /sc_pnl)."""
+        tot = 0.0
+        for n, p in self.st["pos"].items():
+            if p.get("mode") != cfg["mode"]:
+                continue
+            tot += p.get("realised", 0.0) - p.get("fees", 0.0) + (p.get("funding", 0.0) if cfg["mode"] == "paper" else 0.0)
+            if p.get("qty"):
+                tot += p["qty"] * (snap.get(n, {}).get("mid", p["avg"]) - p["avg"])
+        return tot
+
+    def kill_check(self, cfg: dict, pnl: float) -> str | None:
+        """Track the P&L peak; past `kill_dd` of the gross book below it, pause (once) and say so."""
+        if self.st["killed"] and not cfg["paused"]:          # resumed by hand: start a fresh peak
+            self.st["killed"], self.st["pnl_peak"] = False, pnl
+        peak = pnl if self.st["pnl_peak"] is None else max(self.st["pnl_peak"], pnl)
+        self.st["pnl_peak"] = peak
+        limit = cfg["kill_dd"] * 2 * cfg["side_usd"]
+        if not self.st["killed"] and peak - pnl >= limit > 0:
+            self.st["killed"] = True
+            try:
+                raw = json.loads(CONFIG_FILE.read_text())
+            except Exception:
+                raw = {}
+            raw["paused"] = True
+            _atomic_write(CONFIG_FILE, json.dumps(raw, indent=1))
+            return (f"🛑 kill switch: P&L ${pnl:+,.2f} is ${peak - pnl:,.2f} below its peak ${peak:+,.2f} "
+                    f"(limit {cfg['kill_dd']:.0%} of the ${2 * cfg['side_usd']:,.0f} book) — rebalancing PAUSED, "
+                    f"positions held. /sc_off closes everything; /sc_resume carries on.")
+        return None
+
+    async def hourly(self, cfg: dict):
+        hour = int(time.time() // 3600)
+        if self.st.get("kill_hour") == hour:
+            return
+        self.st["kill_hour"] = hour
+        if not any(p.get("qty") for p in self.st["pos"].values()):
+            save_state(self.st)
+            return
+        msg = self.kill_check(cfg, self.book_pnl(cfg, await self.snapshot()))
+        save_state(self.st)
+        if msg:
+            tg(msg)
+
     def requests(self) -> list[dict]:
         CMD_DIR.mkdir(parents=True, exist_ok=True)
         out = []
@@ -621,7 +722,8 @@ class StockCarry:
                 tg("closed on request:\n" + await self.flatten(cfg, "manual close"))
             elif a == "rebalance":
                 tg(await self.rebalance(cfg, "manual rebalance"))
-                self.st["last_rebalance"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                if self.last_ok:
+                    self.st["last_rebalance"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 save_state(self.st)
             elif a == "reset" and req.get("name"):
                 n = req["name"]
@@ -650,13 +752,26 @@ class StockCarry:
             tg(f"mode is now {cfg['mode']} — closed the old book:\n" + await self.flatten(
                 dict(cfg, mode=self.st["pos"][stale[0]]["mode"]), f"switched to {cfg['mode']}"))
         await self.paper_hourly(cfg)
-        if cfg["paused"]:
+        await self.hourly(cfg)
+        if cfg["paused"] or self.st["killed"]:
             return
         now = datetime.now(timezone.utc)
         if due(cfg, self.st, now):
-            self.st["last_rebalance"] = now.strftime("%Y-%m-%d")
+            day, prev = now.strftime("%Y-%m-%d"), self.st["last_rebalance"]
+            self.st["last_rebalance"] = day           # set first: a crash mid-run doesn't re-trade today
             save_state(self.st)
-            tg(await self.rebalance(cfg))
+            msg = await self.rebalance(cfg)
+            if not self.last_ok:
+                n = self.st["retries"].get(day, 0) + 1
+                self.st["retries"] = {day: n}
+                if n < MAX_RETRIES:
+                    self.st["last_rebalance"] = prev
+                    self.st["retry_after"] = now.timestamp() + RETRY_S
+                    msg += f" (try {n} of {MAX_RETRIES}, next in {RETRY_S // 60} min)"
+                else:
+                    msg += f" (gave up after {MAX_RETRIES} tries; positions unchanged until tomorrow or /sc rebalance)"
+                save_state(self.st)
+            tg(msg)
 
     async def run(self):
         cfg = load_config()

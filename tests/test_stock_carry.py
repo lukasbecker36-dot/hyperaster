@@ -1,7 +1,7 @@
 """Offline tests for stock_carry.py — a fake HL client, no network."""
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -127,7 +127,7 @@ def test_live_sets_isolated_leverage_and_trades(sandbox):
     assert bot.st["pos"]["A"]["mode"] == "live"
 
 
-def test_live_short_of_margin_only_reduces(sandbox):
+def test_live_short_of_margin_scales_adds_and_reduces_in_full(sandbox):
     tmp, sent = sandbox
     cfg = cfg_with(tmp, mode="live")
     c = FakeClient({"A": 10.0, "B": 20.0}, venue={"B": -15.0}, withdrawable=10.0)
@@ -135,9 +135,95 @@ def test_live_short_of_margin_only_reduces(sandbox):
     bot.st["pos"]["B"] = {"qty": -15.0, "avg": 20.0, "realised": 0.0, "fees": 0.0, "funding": 0.0,
                           "status": "ok", "mode": "live"}
     asyncio.run(bot.rebalance(cfg))
-    assert "A" not in c.venue                                   # the add was skipped
-    assert c.venue["B"] == pytest.approx(-5.0)                  # the reduction went through
-    assert any("only reductions" in s for s in sent)
+    # A's $100 add needs $25 margin (x1.1 spare) against $10 free: scaled to 10/27.5 = 36%
+    assert c.venue["A"] == pytest.approx(100 * 10 / 27.5 / 10, rel=0.01)
+    assert c.venue["B"] == pytest.approx(-5.0)                  # the reduction went through in full
+    assert any("scaled to 36%" in s for s in sent)
+
+
+def test_scale_add_shrinks_only_the_adding_part():
+    assert sc.scale_add(100.0, 40.0, 0.5) == pytest.approx(70.0)     # growth 60 -> 30
+    assert sc.scale_add(-100.0, 0.0, 0.5) == pytest.approx(-50.0)    # new position
+    assert sc.scale_add(-100.0, 40.0, 0.5) == pytest.approx(-50.0)   # flip: the new side scaled
+    assert sc.scale_add(20.0, 40.0, 0.5) == 20.0                     # reduction untouched
+    assert sc.scale_add(100.0, 40.0, 1.0) == 100.0
+
+
+def test_cohort_is_committed_only_when_the_rebalance_trades(sandbox):
+    tmp, sent = sandbox
+    cfg = cfg_with(tmp, mode="live")
+    c = FakeClient({"A": 10.0, "B": 20.0})
+    c.venue_fail = True
+    bot = make_bot(c, {"A": 300.0, "B": -300.0})
+    asyncio.run(bot.rebalance(cfg))
+    assert not bot.last_ok and bot.st["cohorts"] == [] and bot.st["cohort_days"] == []
+    c.venue_fail = False
+    asyncio.run(bot.rebalance(cfg))
+    assert bot.last_ok and len(bot.st["cohorts"]) == 1
+
+
+def test_second_rebalance_same_day_replaces_that_days_cohort(sandbox):
+    tmp, sent = sandbox
+    cfg = cfg_with(tmp)
+    c = FakeClient({"A": 10.0, "B": 20.0})
+    bot = make_bot(c, {"A": 300.0, "B": -300.0})
+    bot.st["cohorts"], bot.st["cohort_days"] = [{"A": 30.0}, {"A": 30.0}], ["2026-11-19", "2026-11-20"]
+    asyncio.run(bot.rebalance(cfg))
+    asyncio.run(bot.rebalance(cfg))
+    assert len(bot.st["cohorts"]) == 3 and bot.st["cohort_days"][:2] == ["2026-11-19", "2026-11-20"]
+    assert sc.with_cohort([{"x": 1}, {"y": 1}], ["d1", "d2"], {"z": 1}, "d2", 3) == ([{"x": 1}, {"z": 1}], ["d1", "d2"])
+
+
+def test_cohort_scored_from_too_few_names_is_not_traded(sandbox):
+    tmp, sent = sandbox
+    cfg = cfg_with(tmp, mode="live")
+    c = FakeClient({"A": 10.0, "B": 20.0})
+    bot = make_bot(c, {"A": 300.0, "B": -300.0})
+    real = bot.build_cohort
+
+    async def flaky(cfg_, snap, now):
+        out = await real(cfg_, snap, now)
+        bot.skipped, bot.scored_of = ["X", "Y"], 10                 # HL refused 2 of 10 names
+        return out
+
+    bot.build_cohort = flaky
+    msg = asyncio.run(bot.rebalance(cfg))
+    assert "only scored 8 of 10" in msg and not bot.last_ok and c.orders == [] and bot.st["cohorts"] == []
+
+
+def test_failed_daily_rebalance_retries_three_times(sandbox, monkeypatch):
+    tmp, sent = sandbox
+    cfg_with(tmp, mode="live")
+    c = FakeClient({"A": 10.0, "B": 20.0})
+    c.venue_fail = True
+    bot = make_bot(c, {"A": 300.0, "B": -300.0})
+    now = [datetime(2026, 11, 23, 0, 6, tzinfo=timezone.utc)]
+
+    class FD(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now[0]
+
+    monkeypatch.setattr(sc, "datetime", FD)
+    for i in range(4):
+        asyncio.run(bot.step())
+        now[0] = now[0] + timedelta(minutes=16)
+    tries = [s for s in sent if "couldn't read the venue" in s]
+    assert len(tries) == 3 and "try 1 of 3" in tries[0] and "gave up" in tries[2]
+    assert bot.st["last_rebalance"] == "2026-11-23"
+
+
+def test_kill_switch_pauses_once_and_rearms_after_resume(sandbox):
+    tmp, sent = sandbox
+    cfg = cfg_with(tmp, side_usd=500.0)                         # limit: 10% of the $1,000 book = $100
+    bot = sc.StockCarry(FakeClient({"A": 10.0}))
+    assert bot.kill_check(cfg, 20.0) is None and bot.st["pnl_peak"] == 20.0
+    assert bot.kill_check(cfg, -70.0) is None                   # $90 off the peak
+    msg = bot.kill_check(cfg, -81.0)
+    assert msg and "PAUSED" in msg and json.loads((tmp / "cfg.json").read_text())["paused"] is True
+    assert bot.kill_check(cfg, -200.0) is None                  # alerts once
+    cfg = cfg_with(tmp, side_usd=500.0, paused=False)           # /sc resume
+    assert bot.kill_check(cfg, -200.0) is None and bot.st["pnl_peak"] == -200.0 and not bot.st["killed"]
 
 
 def test_unified_account_counts_spot_usdc(sandbox):
