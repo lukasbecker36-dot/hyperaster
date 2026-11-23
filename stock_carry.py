@@ -905,10 +905,10 @@ class StockCarry:
     async def run(self):
         cfg = load_config()
         tg(f"up — {cfg['mode']}, {'enabled' if cfg['enabled'] else 'disabled'}: ${cfg['side_usd']:,.0f} a side at "
-           f"{cfg['leverage']}x, max {cfg['cap']:.0%} a name, rebalance {cfg['rebalance_utc']} UTC")
+           f"up to {cfg['leverage']}x (each name's set by its vol), max {cfg['cap']:.0%} a name, rebalance {cfg['rebalance_utc']} UTC")
         if any(p.get("mode") == "live" and p.get("qty") for p in self.st["pos"].values()):
-            try:
-                for m in self.reconcile(await self.venue_positions()):
+            try:                        # liquidations first, so a liquidated name is booked, not parked
+                for m in await self.book_liquidations(cfg) + self.reconcile(await self.venue_positions()):
                     tg(m)
             except Exception as e:      # don't park anything on a failed read; the next rebalance checks again
                 log.warning(f"startup venue check skipped: {e}")
