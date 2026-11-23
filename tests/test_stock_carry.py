@@ -67,6 +67,9 @@ class FakeClient:
         self.orders.append((n, side, qty))
         return SimpleNamespace(success=True, filled_qty=qty, fill_price=ref, ambiguous=False, error="")
     async def get_hl_balance(self, dex="xyz"): return {"withdrawable": self.withdrawable}
+    async def add_hl_isolated_margin(self, n, usd):
+        self.margin_adds = getattr(self, "margin_adds", []) + [(n, usd)]
+        return True
 
 
 @pytest.fixture
@@ -97,6 +100,11 @@ def make_bot(client, cohort):
 
     bot.snapshot, bot.build_cohort, bot.venue_positions = snapshot, build_cohort, venue_positions
     bot.only_isolated = {n: True for n in client.mids}
+    bot.st["vol"] = {n: 0.002 for n in client.mids}       # blue-chip vol: the full 4x
+
+    async def clearinghouse():
+        return getattr(client, "ch", {})
+    bot.clearinghouse = clearinghouse
     return bot
 
 
@@ -379,3 +387,83 @@ def test_flatten_request_closes_everything(sandbox):
     bot.st["last_rebalance"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     asyncio.run(bot.step())
     assert all(not p["qty"] for p in bot.st["pos"].values()) and bot.st["cohorts"] == []
+
+
+# ---- leverage per name, margin top-up, live liquidations (23 Nov: NBIS/ZHIPU/KORU/SHAZ liquidated at a flat 4x)
+def test_lev_for_scales_leverage_down_with_vol():
+    assert sc.lev_for(0.002, 3, 4, 3.0) == 4                 # AAPL-like: 4x
+    assert sc.lev_for(0.07 / 24 ** 0.5, 3, 4, 3.0) == 2      # NBIS-like 7%/day: 2x
+    assert sc.lev_for(0.03, 3, 4, 3.0) == 1                  # wilder: 1x
+    assert sc.lev_for(None, 3, 4, 3.0) == 2                  # unknown vol: cautious
+    assert sc.lev_for(0.0001, 3, 3, 3.0) == 3                # never above the configured max
+
+
+def test_live_rebalance_sets_each_names_leverage_and_sizes_margin_by_it(sandbox):
+    tmp, sent = sandbox
+    cfg = cfg_with(tmp, mode="live")
+    c = FakeClient({"A": 10.0, "B": 20.0})
+    bot = make_bot(c, {"A": 300.0, "B": -300.0})
+    bot.st["vol"]["B"] = 0.07 / 24 ** 0.5
+    assert bot.margin_needed({"A": 100.0, "B": -100.0}, {"A": {"mid": 10.0}, "B": {"mid": 20.0}}, cfg) \
+        == pytest.approx(100 / 4 + 100 / 2)
+    msg = asyncio.run(bot.rebalance(cfg))
+    assert sorted(c.lev) == [("A", 4, False), ("B", 2, False)]
+    assert "4x 1, 2x 1" in msg
+
+
+def test_open_position_whose_leverage_wont_change_still_trades(sandbox):
+    tmp, sent = sandbox
+    cfg = cfg_with(tmp, mode="live")
+    c = FakeClient({"A": 10.0, "B": 20.0}, venue={"B": -2.0})
+    bot = make_bot(c, {"A": 300.0, "B": -300.0})
+    bot.st["pos"]["B"] = {"qty": -2.0, "avg": 20.0, "realised": 0.0, "fees": 0.0, "funding": 0.0,
+                          "status": "ok", "mode": "live"}
+
+    async def refuse(n, lev, cross=True):
+        return n != "B"
+    c.set_hl_leverage = refuse
+    asyncio.run(bot.rebalance(cfg))
+    assert c.venue["B"] == pytest.approx(-5.0)
+
+
+def test_top_up_brings_margin_to_notional_over_leverage(sandbox):
+    tmp, sent = sandbox
+    cfg = cfg_with(tmp, mode="live")
+    c = FakeClient({"A": 10.0, "B": 20.0}, venue={"B": -5.0})
+    bot = make_bot(c, {"A": 300.0, "B": -300.0})
+    bot.st["vol"]["B"] = 0.07 / 24 ** 0.5                     # 2x
+    bot.st["pos"]["B"] = {"qty": -5.0, "avg": 20.0, "realised": 0.0, "fees": 0.0, "funding": 0.0,
+                          "status": "ok", "mode": "live"}
+    c.ch = {"B": {"positionValue": "100", "marginUsed": "25", "leverage": {"type": "isolated", "value": 4}}}
+    notes = asyncio.run(bot.top_up_margin(cfg))
+    assert c.margin_adds == [("B", 25.0)] and "B +$25.00" in notes[0]
+    c.ch["B"]["marginUsed"] = "50"
+    assert asyncio.run(bot.top_up_margin(cfg)) == []           # already there: nothing sent
+
+
+def test_hourly_books_a_live_liquidation_and_does_not_park(sandbox):
+    tmp, sent = sandbox
+    cfg = cfg_with(tmp, mode="live")
+    c = FakeClient({"A": 10.0, "B": 24.0}, venue={})          # HL closed B
+    bot = make_bot(c, {})
+    bot.st["pos"]["B"] = {"qty": -5.0, "avg": 20.0, "realised": 0.0, "fees": 0.0, "funding": 0.0,
+                          "status": "ok", "mode": "live"}
+    fills = [{"coin": "xyz:B", "side": "B", "sz": "5", "px": "24", "fee": "0.01", "time": 1795000000000,
+              "closedPnl": "-20", "liquidation": {"markPx": "24", "method": "market"}},
+             {"coin": "xyz:A", "side": "B", "sz": "1", "px": "10", "fee": "0", "time": 1795000001000}]
+
+    async def info(body, pace=False):
+        assert body["type"] == "userFillsByTime"
+        return fills
+    bot.info = info
+    bot.st["liq_seen_ms"] = 1794999999000
+    asyncio.run(bot.live_hourly(cfg))
+    p = bot.st["pos"]["B"]
+    assert p["qty"] == 0.0 and p["realised"] == pytest.approx(-20.0) and p["status"] == "ok"
+    assert bot.st["liqs"][-1] == {"ts": 1795000000, "name": "B", "loss": -20.01, "mode": "live"}
+    assert any("liquidated by HL" in m for m in sent) and not any("parked" in m for m in sent)
+    assert sc.read_trades()[-1]["reason"] == "liquidated on HL"
+    assert bot.st["liq_seen_ms"] == 1795000001000
+    sent.clear()
+    asyncio.run(bot.live_hourly(cfg))                         # nothing open any more: no second booking
+    assert sent == []

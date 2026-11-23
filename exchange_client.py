@@ -1940,6 +1940,30 @@ class ExchangeClient:
             log.error(f"HL set leverage error for {symbol}: {e}")
             return False
 
+    async def add_hl_isolated_margin(self, symbol: str, usd: float) -> bool:
+        """Move `usd` of collateral into (or, negative, out of) an open isolated position's margin
+        (HL action updateIsolatedMargin, as the official SDK sends it: isBuy True, ntli in micro-USDC).
+        More margin pushes the liquidation price away without changing the position."""
+        asset_idx = self._hl_asset_index.get(symbol)
+        if asset_idx is None:
+            log.error(f"HL isolated margin: asset index not found for {symbol}")
+            return False
+        action = {"type": "updateIsolatedMargin", "asset": asset_idx, "isBuy": True,
+                  "ntli": int(round(usd * 1_000_000))}
+        try:
+            payload = self._hl_sign_action(action, int(time.time() * 1000))
+            async with self.session.post(HL_EXCHANGE_URL, json=payload, timeout=self.timeout) as r:
+                if r.content_type != "application/json":
+                    log.error(f"HL non-JSON response ({r.status}): {await r.text()}")
+                    return False
+                data = await r.json()
+            ok = data.get("status") == "ok"
+            log.info(f"HL isolated margin {self._hl_coin(symbol)} {usd:+.2f} USDC: {ok} ({data})")
+            return ok
+        except Exception as e:
+            log.error(f"HL isolated margin error for {symbol}: {e}")
+            return False
+
     async def set_aster_leverage(self, symbol: str, leverage: int) -> bool:
         """Set leverage on Aster for a symbol (POST /fapi/v1/leverage).
 

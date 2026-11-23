@@ -14,9 +14,12 @@ THE RULE (daily at REBALANCE UTC)
   Today's cohort: long the lowest-funding 20%, short the highest 20%, `side_usd` a side, weights inverse to
   10-day hourly volatility, no name above `cap` (10%) of its side. The book is the average of the last three
   daily cohorts (each held 72h), traded to once a day; changes under $10 (HL's minimum) are skipped.
-  4x isolated margin: most xyz perps are isolated-only, so a position stands on its own margin and is
-  liquidated ~20% against its entry (25% margin less ~5% maintenance). 72h moves Apr-Nov: 4x liquidates
-  ~1.4% of positions, 3x ~0.3%, 5x ~3.6%.
+  Isolated margin, LEVERAGE PER NAME: the highest leverage up to `leverage` (4x) that keeps the liquidation
+  (1/lev less ~5% maintenance) beyond a `lev_sigmas` (3) sigma move over the 3-day hold, from the name's 10-day
+  hourly vol. Blue chips stay at 4x (~20% to liquidation); 7-8%/day names (NBIS, ZHIPU, KORU, SHAZ) get 2x or less.
+  A flat 4x liquidated those four on 23 Nov after ~20% one-day squeezes: a routine 3-day move for them.
+  After each live rebalance any position whose margin is below its notional / its leverage is topped up
+  (updateIsolatedMargin), so a lower leverage also reaches positions opened at the old one.
 
 SAFETY
   - Paper by default; live only after `/sc live YES`.
@@ -25,8 +28,9 @@ SAFETY
     says so.
   - Never trades a name the session flip is configured for or the arb bot holds; while live, the arb bot's
     auto-entry skips this book's names (flip_reserve.py).
-  - A venue position that doesn't match the state file (a liquidation, a manual trade) parks that name and
-    alerts; `/sc reset SYM` adopts what the venue shows.
+  - Every hour (live) HL's liquidation fills are booked into the state (realised loss, trade row, Telegram)
+    so the name stays tradable; any OTHER venue/state mismatch (a manual trade) parks that name and alerts;
+    `/sc reset SYM` adopts what the venue shows.
   - A day's cohort only counts once its rebalance actually trades: a run that can't read the venue, or that
     scored under 90% of the names (HL rate limits), trades nothing and retries in 15 min (3 tries a day). A
     second rebalance the same day replaces that day's cohort instead of adding one.
@@ -79,7 +83,8 @@ DEFAULT_CONFIG = {
     "enabled": True,
     "mode": "paper",                 # paper | live
     "side_usd": 1000.0,              # $ long and $ short
-    "leverage": 4,
+    "leverage": 4,                   # the MOST any name gets; each name's is set from its vol (lev_for)
+    "lev_sigmas": 3.0,               # liquidation kept beyond this many sigmas of a hold_d-day move
     "cap": 0.10,                     # max share of one side in one name
     "q": 0.20,                       # top / bottom fraction of the universe
     "look_h": 24,                    # funding lookback
@@ -153,6 +158,15 @@ def hourly_vol(closes: list) -> float | None:
     return statistics.pstdev(r) if len(r) >= 48 else None
 
 
+def lev_for(hvol, hold_d: int, max_lev: int, sigmas: float) -> int:
+    """Highest leverage <= max_lev whose liquidation (1/lev - MAINT against entry) sits beyond `sigmas` x the
+    name's hold_d-day vol (hourly vol x sqrt(24 x days): xyz perps trade around the clock). No vol: 2x at most."""
+    if not hvol:
+        return min(2, max_lev)
+    move = sigmas * hvol * math.sqrt(24 * hold_d)
+    return max(1, min(max_lev, math.floor(1 / (move + MAINT))))
+
+
 def liq_price(qty: float, avg: float, lev: int) -> float:
     side = 1 if qty > 0 else -1
     return avg * (1 - side * (1 / lev - MAINT))
@@ -202,7 +216,9 @@ def load_state() -> dict:
     st.setdefault("killed", False)
     st.setdefault("last_rebalance", "")
     st.setdefault("last_funding_hour", 0)
-    st.setdefault("liqs", [])         # paper liquidations: {"ts", "name", "loss"}
+    st.setdefault("liqs", [])         # liquidations: {"ts", "name", "loss", "mode"}
+    st.setdefault("vol", {})          # name -> 10-day hourly vol at the last scoring (sets its leverage)
+    st.setdefault("liq_seen_ms", int((time.time() - 86400) * 1000))   # HL fills booked up to here
     return st
 
 
@@ -327,6 +343,8 @@ class StockCarry:
                 if not cl or int(cl[0]["t"]) / 1000 > now_s - age_s + 6 * 3600:
                     continue                                 # listed < min_age_d
                 vol[n] = hourly_vol([float(x["c"]) for x in cl[-241:]])
+                if vol[n]:
+                    self.st["vol"][n] = vol[n]
                 fh = await self.info({"type": "fundingHistory", "coin": f"xyz:{n}",
                                       "startTime": int((now_s - cfg["look_h"] * 3600) * 1000)}, pace=True)
                 if not isinstance(fh, list):
@@ -340,6 +358,9 @@ class StockCarry:
         self.scored_of = len(names)
         return (long_short(sig, vol, cfg["q"], cfg["side_usd"], cfg["cap"]),
                 {n: -v * 8760 for n, v in sig.items()})
+
+    def lev(self, name: str, cfg: dict) -> int:
+        return lev_for(self.st["vol"].get(name), cfg["hold_d"], cfg["leverage"], cfg.get("lev_sigmas", 3.0))
 
     # -- venue helpers
     async def ensure(self, name: str) -> bool:
@@ -465,16 +486,20 @@ class StockCarry:
                 tg(f"⚠️ {name}: venue {venue:+.4g} vs state {p['qty']:+.4g} — parked (liquidated or traded by hand?). "
                    f"/sc reset {name} adopts the venue position.")
                 return 0.0, "parked"
-            if target and self.lev_set.get(name) != cfg["leverage"]:
+            lev = self.lev(name, cfg)
+            if target and self.lev_set.get(name) != lev:
                 cross = not self.only_isolated.get(name, True)
-                ok = await self.client.set_hl_leverage(name, cfg["leverage"], cross=cross)
+                ok = await self.client.set_hl_leverage(name, lev, cross=cross)
                 if not ok:                      # usually a rate-limited request: one retry after a pause
                     await asyncio.sleep(3)
-                    ok = await self.client.set_hl_leverage(name, cfg["leverage"], cross=cross)
-                if not ok:
+                    ok = await self.client.set_hl_leverage(name, lev, cross=cross)
+                if ok:
+                    self.lev_set[name] = lev
+                elif not p["qty"]:
                     # not traded this time, but not parked either: the next rebalance tries again
-                    return 0.0, f"HL didn't confirm {cfg['leverage']}x leverage (busy?) — not traded, retried next rebalance"
-                self.lev_set[name] = cfg["leverage"]
+                    return 0.0, f"HL didn't confirm {lev}x leverage (busy?) — not traded, retried next rebalance"
+                # an open position keeps trading at its old leverage; the margin top-up after the rebalance
+                # brings its margin up to notional / lev
             filled, px = await self.trade_live(name, delta)
             p["status"] = "ok" if abs(filled) >= abs(delta) * 0.98 else f"partial {filled:+.4g}/{delta:+.4g}"
         else:
@@ -518,11 +543,9 @@ class StockCarry:
         add = 0.0
         for n, usd in target.items():
             cur = self.st["pos"].get(n, {}).get("qty", 0.0) * snap.get(n, {}).get("mid", 0.0)
-            if usd * cur < 0:
-                add += abs(usd)
-            else:
-                add += max(0.0, abs(usd) - abs(cur))
-        return add / cfg["leverage"]
+            grow = abs(usd) if usd * cur < 0 else max(0.0, abs(usd) - abs(cur))
+            add += grow / self.lev(n, cfg)
+        return add
 
     async def rebalance(self, cfg: dict, reason: str = "daily rebalance") -> str:
         """Run one rebalance; sets self.last_ok False if it aborted before trading (nothing committed)."""
@@ -599,11 +622,21 @@ class StockCarry:
                 save_state(self.st)
                 notes.append(f"{n}: ERROR {e}")
         save_state(self.st)
+        if live:
+            notes += await self.top_up_margin(cfg)
         longs = sorted((c for c in cohort if cohort[c] > 0), key=lambda c: fund.get(c, 0))
         shorts = sorted((c for c in cohort if cohort[c] < 0), key=lambda c: -fund.get(c, 0))
         gross = sum(abs(p["qty"]) * snap.get(n, {}).get("mid", p["avg"]) for n, p in self.st["pos"].items() if p.get("qty"))
+        levs: dict = {}
+        margin = 0.0
+        for n, p in self.st["pos"].items():
+            if p.get("qty"):
+                lv = self.lev(n, cfg)
+                levs[lv] = levs.get(lv, 0) + 1
+                margin += abs(p["qty"]) * snap.get(n, {}).get("mid", p["avg"]) / lv
+        mix = ", ".join(f"{lv}x {k}" for lv, k in sorted(levs.items(), reverse=True))
         return (f"{cfg['mode'].upper()} {reason}: {n_tr} trades, ${traded:,.0f} traded · book ${gross:,.0f} gross, "
-                f"margin ~${gross / cfg['leverage']:,.0f} at {cfg['leverage']}x\n"
+                f"margin ~${margin:,.0f} (names by leverage: {mix or 'none'})\n"
                 f"cohort long {', '.join(longs)}\ncohort short {', '.join(shorts)}"
                 + ("\n" + "\n".join(notes) if notes else ""))
 
@@ -629,6 +662,99 @@ class StockCarry:
         save_state(self.st)
         return "\n".join(out) or "nothing open"
 
+    async def clearinghouse(self) -> dict:
+        """{name: HL position dict} on the xyz dex, in one checked read."""
+        addr = (getattr(self.client, "api_keys", None) or {}).get("hl_account_address")
+        d = await self.info({"type": "clearinghouseState", "user": addr, "dex": "xyz"})
+        if not isinstance(d, dict) or not isinstance(d.get("assetPositions"), list):
+            raise RuntimeError(f"bad clearinghouseState reply: {str(d)[:120]}")
+        return {ap["position"]["coin"].split(":")[-1]: ap["position"] for ap in d["assetPositions"]}
+
+    async def top_up_margin(self, cfg: dict) -> list[str]:
+        """Bring each live isolated position's margin up to notional / its leverage (never takes margin out).
+        A position opened at a higher leverage, or one that has run against us, gets its liquidation pushed back
+        out. Scaled down together if the free collateral can't cover it all."""
+        try:
+            ch = await self.clearinghouse()
+            free = await self.free_margin()
+        except Exception as e:
+            return [f"margin top-up skipped: couldn't read the venue ({e})"]
+        want = {}
+        for n, p in self.st["pos"].items():
+            v = ch.get(n)
+            if p.get("mode") != "live" or not p.get("qty") or not v:
+                continue
+            if (v.get("leverage") or {}).get("type") != "isolated":
+                continue
+            need = float(v["positionValue"]) / self.lev(n, cfg) - float(v["marginUsed"])
+            if need >= 1.0:                       # cents aren't worth a signed action
+                want[n] = need
+        if not want:
+            return []
+        k = min(1.0, free / (sum(want.values()) * MARGIN_SPARE)) if free > 0 else 0.0
+        done, total = [], 0.0
+        for n, need in sorted(want.items(), key=lambda kv: -kv[1]):
+            usd = round(need * k, 2)
+            if usd < 1.0 or not await self.ensure(n):
+                continue
+            if await self.client.add_hl_isolated_margin(n, usd):
+                done.append(f"{n} +${usd:.2f}")
+                total += usd
+            await asyncio.sleep(0.5)
+        if not done:
+            return [f"margin top-up wanted ${sum(want.values()):,.0f} but nothing was added (free ${free:,.0f})"]
+        return [f"margin topped up ${total:,.2f} to each name's leverage: {', '.join(done)}"
+                + ("" if k >= 1 else f" (scaled to {k:.0%}: free collateral ${free:,.0f})")]
+
+    async def book_liquidations(self, cfg: dict) -> list[str]:
+        """Book HL liquidation fills on live names into the state (so the name isn't parked as a mismatch)."""
+        addr = (getattr(self.client, "api_keys", None) or {}).get("hl_account_address")
+        since = int(self.st.get("liq_seen_ms") or 0)
+        fills = await self.info({"type": "userFillsByTime", "user": addr, "startTime": since + 1,
+                                 "aggregateByTime": True})
+        if not isinstance(fills, list):
+            raise RuntimeError(f"bad userFillsByTime reply: {str(fills)[:120]}")
+        msgs = []
+        for f in sorted(fills, key=lambda f: f["time"]):
+            self.st["liq_seen_ms"] = max(int(self.st.get("liq_seen_ms") or 0), int(f["time"]))
+            if not f.get("liquidation") or not str(f.get("coin", "")).startswith("xyz:"):
+                continue
+            n = f["coin"].split(":")[-1]
+            p = self.st["pos"].get(n)
+            if not p or p.get("mode") != "live" or not p.get("qty"):
+                continue
+            sz = float(f["sz"]) * (1 if f["side"] == "B" else -1)
+            if (p["qty"] > 0) == (sz > 0):
+                continue                           # not a reduction of our position
+            sz = max(-abs(p["qty"]), min(abs(p["qty"]), sz))
+            px, fee = float(f["px"]), float(f.get("fee") or 0)
+            before, avg = p.get("realised", 0.0), p["avg"]
+            apply_fill(p, sz, px, fee)
+            loss = p["realised"] - before - fee
+            record_trade({"ts": datetime.fromtimestamp(f["time"] / 1000, timezone.utc).isoformat(timespec="seconds"),
+                          "mode": "live", "name": n, "side": "buy" if sz > 0 else "sell", "qty": f"{abs(sz):.6g}",
+                          "px": f"{px:.6g}", "fee": f"{fee:.4f}", "reason": "liquidated on HL"})
+            self.st["liqs"].append({"ts": int(f["time"] / 1000), "name": n, "loss": round(loss, 2), "mode": "live"})
+            p["status"] = "ok"
+            msgs.append(f"💥 LIVE {n} liquidated by HL: {'short' if sz > 0 else 'long'} {abs(sz):.4g} @ {px:.6g} "
+                        f"(entry {avg:.6g}, {px / avg - 1:+.1%}) — ${loss:+,.2f}. Booked; {n} stays tradable, "
+                        f"next rebalance at {self.lev(n, cfg)}x.")
+        return msgs
+
+    async def live_hourly(self, cfg: dict):
+        """Live: book HL liquidations, then park any other venue/state mismatch (alerts once per name)."""
+        if not any(p.get("mode") == "live" and p.get("qty") for p in self.st["pos"].values()):
+            return
+        try:
+            msgs = await self.book_liquidations(cfg)
+            msgs += self.reconcile(await self.venue_positions())
+        except Exception as e:
+            log.warning(f"hourly venue check skipped: {e}")
+            return
+        save_state(self.st)
+        for m in msgs:
+            tg(m)
+
     # -- hourly paper bookkeeping (live funding and liquidations happen on the venue)
     async def paper_hourly(self, cfg: dict):
         hour = int(time.time() // 3600)
@@ -646,16 +772,17 @@ class StockCarry:
                 continue
             p["funding"] = p.get("funding", 0.0) - p["qty"] * s["mid"] * s["funding"]
             side = 1 if p["qty"] > 0 else -1
-            if side * (s["mid"] - liq_price(p["qty"], p["avg"], cfg["leverage"])) <= 0:
-                loss = -abs(p["qty"]) * p["avg"] / cfg["leverage"]           # the position's margin
+            lev = self.lev(n, cfg)
+            if side * (s["mid"] - liq_price(p["qty"], p["avg"], lev)) <= 0:
+                loss = -abs(p["qty"]) * p["avg"] / lev                       # the position's margin
                 p["realised"] = p.get("realised", 0.0) + loss
                 record_trade({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "mode": "paper",
                               "name": n, "side": "sell" if side > 0 else "buy", "qty": f"{abs(p['qty']):.6g}",
                               "px": f"{p['avg'] * (1 + loss / (p['qty'] * p['avg'])):.6g}", "fee": "0",
-                              "reason": f"liquidated {cfg['leverage']}x"})
+                              "reason": f"liquidated {lev}x"})
                 self.st["liqs"].append({"ts": int(time.time()), "name": n, "loss": round(loss, 2)})
                 p["qty"], p["avg"] = 0.0, 0.0
-                tg(f"PAPER {n} liquidated at {cfg['leverage']}x: ${loss:+,.2f}")
+                tg(f"PAPER {n} liquidated at {lev}x: ${loss:+,.2f}")
         save_state(self.st)
 
     def book_pnl(self, cfg: dict, snap: dict) -> float:
@@ -698,6 +825,8 @@ class StockCarry:
         if not any(p.get("qty") for p in self.st["pos"].values()):
             save_state(self.st)
             return
+        if cfg["mode"] == "live":
+            await self.live_hourly(cfg)
         msg = self.kill_check(cfg, self.book_pnl(cfg, await self.snapshot()))
         save_state(self.st)
         if msg:
