@@ -18,6 +18,12 @@ THE RULE (daily at REBALANCE UTC)
   (1/lev less ~5% maintenance) beyond a `lev_sigmas` (3) sigma move over the 3-day hold, from the name's 10-day
   hourly vol. Blue chips stay at 4x (~20% to liquidation); 7-8%/day names (NBIS, ZHIPU, KORU, SHAZ) get 2x or less.
   A flat 4x liquidated those four on 23 Nov after ~20% one-day squeezes: a routine 3-day move for them.
+  NO LONG THROUGH AN EX-DIVIDEND DATE: xyz oracles are the raw price, so a perp drops by the dividend at the
+  ex-date open, and funding pays longs back only ~16% of it beforehand (hyperdata scratchpad divs.py /
+  divgap.py, 24 Nov 2026: 16 US ex-dates, perp-vs-stock gap slope 0.15 on the dividend). Low pre-ex funding
+  would otherwise pull those names into the long side. exdiv.json lists windows for dividends >= ~0.3%: a new
+  cohort doesn't buy a name with an ex-date inside its hold (the next-lowest funding name takes the slot), and
+  a long from an older cohort is closed at the rebalance before its date. Shorts hold through (they gain it).
   After each live rebalance any position whose margin is below its notional / its leverage is topped up
   (updateIsolatedMargin), so a lower leverage also reaches positions opened at the old one.
 
@@ -74,6 +80,7 @@ STATE_FILE = DATA / "stockcarry_state.json"
 TRADES_FILE = DATA / "stockcarry_trades.csv"
 CMD_DIR = DATA / "stockcarry_cmd"
 SF_CONFIG = DATA / "sessionflip.json"
+EXDIV_FILE = BASE_DIR / "exdiv.json"
 HL_INFO = "https://api.hyperliquid.xyz/info"
 
 log = logging.getLogger("stockcarry")
@@ -96,6 +103,7 @@ DEFAULT_CONFIG = {
     "paused": False,                 # True: hold positions, no rebalances
     "kill_dd": 0.10,                 # pause when P&L falls this share of the gross book (2 x side_usd) off its peak
     "max_skip": 0.10,                # don't trade a cohort scored from fewer than 90% of the candidate names
+    "exdiv_min_pct": 0.3,            # no long held through an ex-dividend date this big (exdiv.json)
 }
 TAKER_FEE = 0.00009                  # HL growth-mode taker (~0.9bp) for paper fills
 IOC_BUFFER_BPS = 15
@@ -131,14 +139,18 @@ def capped_weights(raw: dict, cap) -> dict:
         fixed.update({c: cap for c in over})
 
 
-def long_short(signal: dict, vol: dict, q: float, side_usd: float, cap=None, min_n: int = 3) -> dict:
-    """Long the top q of `signal`, short the bottom q, `side_usd` a side by capped inverse vol. {name: usd}."""
+def long_short(signal: dict, vol: dict, q: float, side_usd: float, cap=None, min_n: int = 3,
+               no_long=frozenset()) -> dict:
+    """Long the top q of `signal`, short the bottom q, `side_usd` a side by capped inverse vol. {name: usd}.
+    Names in `no_long` are passed over for the long side (the next best fill in); they can still be shorted."""
     s = sorted((v, c) for c, v in signal.items() if v is not None and vol.get(c))
     n = int(len(s) * q)
     if n < min_n:
         return {}
     out = {}
-    for names, sign in (([c for _, c in s[-n:]], 1), ([c for _, c in s[:n]], -1)):
+    shorts = [c for _, c in s[:n]]
+    longs = [c for _, c in reversed(s) if c not in no_long and c not in shorts][:n]
+    for names, sign in ((longs, 1), (shorts, -1)):
         for c, wt in capped_weights({c: 1 / vol[c] for c in names}, cap).items():
             out[c] = sign * side_usd * wt
     return out
@@ -151,6 +163,32 @@ def book_target(cohorts: list, hold_d: int) -> dict:
         for c, usd in w.items():
             out[c] = out.get(c, 0.0) + usd / hold_d
     return out
+
+
+def load_exdiv(path: Path | None = None) -> dict:
+    """The hand-kept ex-dividend calendar: {"valid_until": "YYYY-MM-DD", "names": {name: [{from, to, pct}]}}.
+    A missing or broken file gives an empty calendar (and a warning at the rebalance)."""
+    try:
+        d = json.loads((path or EXDIV_FILE).read_text())
+        return {"valid_until": d.get("valid_until", ""), "names": {k.upper(): v for k, v in d.get("names", {}).items()}}
+    except Exception as e:
+        log.warning(f"ex-dividend calendar unreadable: {e}")
+        return {"valid_until": "", "names": {}}
+
+
+def exdiv_hits(cal: dict, start: str, end: str, min_pct: float) -> dict:
+    """Names with an ex-dividend window (>= min_pct) overlapping [start, end] (ISO dates): {name: entry}."""
+    out = {}
+    for n, ents in cal.get("names", {}).items():
+        for e in ents:
+            if float(e.get("pct", 0)) >= min_pct and e["from"] <= end and e["to"] >= start:
+                out[n] = e
+                break
+    return out
+
+
+def _day(now_s: float, plus_d: int = 0) -> str:
+    return datetime.fromtimestamp(now_s + plus_d * 86400, timezone.utc).strftime("%Y-%m-%d")
 
 
 def hourly_vol(closes: list) -> float | None:
@@ -294,6 +332,7 @@ class StockCarry:
         self.last_ok = True                         # did the last rebalance run (not abort)?
         self.skipped: list = []
         self.scored_of = 0
+        self.exdiv_passed: dict = {}                # names the cohort didn't buy for an ex-dividend date
 
     # -- market data (public /info through the client's session)
     async def info(self, body: dict, pace: bool = False):
@@ -356,8 +395,12 @@ class StockCarry:
                 log.warning(f"{n} skipped: {e}")
                 self.skipped.append(n)
         self.scored_of = len(names)
-        return (long_short(sig, vol, cfg["q"], cfg["side_usd"], cfg["cap"]),
-                {n: -v * 8760 for n, v in sig.items()})
+        # a cohort is held until the rebalance hold_d days on, which comes after that day's Asian open
+        no_long = exdiv_hits(load_exdiv(), _day(now_s), _day(now_s, cfg["hold_d"]), cfg["exdiv_min_pct"])
+        free = long_short(sig, vol, cfg["q"], cfg["side_usd"], cfg["cap"])
+        cohort = long_short(sig, vol, cfg["q"], cfg["side_usd"], cfg["cap"], no_long=set(no_long))
+        self.exdiv_passed = {n: no_long[n] for n in free if free[n] > 0 and n not in cohort}
+        return cohort, {n: -v * 8760 for n, v in sig.items()}
 
     def lev(self, name: str, cfg: dict) -> int:
         return lev_for(self.st["vol"].get(name), cfg["hold_d"], cfg["leverage"], cfg.get("lev_sigmas", 3.0))
@@ -568,6 +611,19 @@ class StockCarry:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         cohorts, days = with_cohort(self.st["cohorts"], self.st["cohort_days"], cohort, today, cfg["hold_d"])
         target = book_target(cohorts, cfg["hold_d"])
+        # no long into an ex-date before the next rebalance (tomorrow's Asian open comes first); older cohorts
+        # may hold one bought before its date was in the calendar
+        cal, now_s = load_exdiv(), time.time()
+        exd = exdiv_hits(cal, _day(now_s), _day(now_s, 1), cfg["exdiv_min_pct"])
+        cut = [n for n in exd if target.get(n, 0.0) > 0]
+        for n in cut:
+            target[n] = 0.0
+        div_notes = [f"ex-dividend: not buying {n} (ex {e['from']}{'' if e['to'] == e['from'] else '..' + e['to']}, "
+                     f"~{e['pct']}%)" for n, e in sorted(self.exdiv_passed.items())]
+        div_notes += [f"ex-dividend: {n} long closed (ex {exd[n]['from']}, ~{exd[n]['pct']}%)" for n in sorted(cut)]
+        if cal["valid_until"] < _day(now_s, cfg["hold_d"] + 7):
+            div_notes.append(f"⚠️ ex-dividend calendar {'missing' if not cal['valid_until'] else 'ends ' + cal['valid_until']}"
+                             f" — rebuild exdiv.json (scripts/exdiv_build.py)")
         live = cfg["mode"] == "live"
         k = 1.0                                  # share of each add that fits the free margin
         if live:
@@ -587,7 +643,7 @@ class StockCarry:
         # committed now: this cohort counts towards the 3-day book
         self.st["cohorts"], self.st["cohort_days"] = cohorts, days
         self.last_ok = True
-        traded, n_tr, notes = 0.0, 0, []
+        traded, n_tr, notes = 0.0, 0, div_notes
         names = set(target) | {n for n, p in self.st["pos"].items() if p.get("qty")}
         for p in self.st["pos"].values():       # the old leverage refusal used to park: un-park those
             if p.get("status", "ok").startswith("could not set"):

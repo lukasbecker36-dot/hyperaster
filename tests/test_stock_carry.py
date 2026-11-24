@@ -75,7 +75,7 @@ class FakeClient:
 @pytest.fixture
 def sandbox(tmp_path, monkeypatch):
     for k, f in (("CONFIG_FILE", "cfg.json"), ("STATE_FILE", "state.json"), ("TRADES_FILE", "trades.csv"),
-                 ("CMD_DIR", "cmd"), ("SF_CONFIG", "sf.json")):
+                 ("CMD_DIR", "cmd"), ("SF_CONFIG", "sf.json"), ("EXDIV_FILE", "exdiv.json")):
         monkeypatch.setattr(sc, k, tmp_path / f)
     sent = []
     monkeypatch.setattr(sc, "tg", lambda text: sent.append(text))
@@ -467,3 +467,80 @@ def test_hourly_books_a_live_liquidation_and_does_not_park(sandbox):
     sent.clear()
     asyncio.run(bot.live_hourly(cfg))                         # nothing open any more: no second booking
     assert sent == []
+
+
+# ---- ex-dividend dates
+def write_cal(tmp, names, valid_until="2099-01-01"):
+    (tmp / "exdiv.json").write_text(json.dumps({"valid_until": valid_until, "names": names}))
+
+
+def test_long_short_passes_over_no_long_names_but_still_shorts_them():
+    sig = {c: i for i, c in enumerate("ABCDEFGHIJ")}                 # J highest -> long
+    vol = {c: 0.01 for c in sig}
+    w = sc.long_short(sig, vol, 0.3, 300.0, no_long={"J", "A"})
+    assert "J" not in w and {c for c in w if w[c] > 0} == {"I", "H", "G"}
+    assert w["A"] < 0                                                # a short through an ex-date gains the dividend
+
+
+def test_exdiv_hits_overlap_and_threshold():
+    cal = {"names": {"X": [{"from": "2026-12-12", "to": "2026-12-20", "pct": 3.5}],
+                     "S": [{"from": "2026-12-13", "to": "2026-12-13", "pct": 0.1}]}}
+    assert set(sc.exdiv_hits(cal, "2026-12-09", "2026-12-12", 0.3)) == {"X"}
+    assert sc.exdiv_hits(cal, "2026-12-21", "2026-12-24", 0.3) == {}
+    assert sc.exdiv_hits(cal, "2026-12-13", "2026-12-13", 0.3).keys() == {"X"}      # S is too small
+
+
+def test_older_cohorts_long_is_closed_before_its_ex_date(sandbox):
+    tmp, sent = sandbox
+    today = datetime.now(timezone.utc)
+    write_cal(tmp, {"A": [{"from": (today + timedelta(days=1)).strftime("%Y-%m-%d"),
+                           "to": (today + timedelta(days=1)).strftime("%Y-%m-%d"), "pct": 2.0}]})
+    cfg = cfg_with(tmp)
+    c = FakeClient({"A": 10.0, "B": 20.0, "C": 5.0})
+    bot = make_bot(c, {"C": 300.0, "B": -300.0})
+    bot.st["cohorts"] = [{"A": 300.0, "B": -300.0}]
+    bot.st["cohort_days"] = ["2000-01-01"]
+    bot.st["pos"]["A"] = {"mode": "paper", "qty": 10.0, "avg": 10.0, "realised": 0.0, "fees": 0.0, "funding": 0.0, "status": "ok"}
+    msg = asyncio.run(bot.rebalance(cfg))
+    assert bot.st["pos"]["A"]["qty"] == pytest.approx(0.0)
+    assert "A long closed" in msg and bot.st["pos"]["C"]["qty"] > 0
+
+
+def test_short_is_kept_through_an_ex_date(sandbox):
+    tmp, sent = sandbox
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    write_cal(tmp, {"B": [{"from": today, "to": today, "pct": 2.0}]})
+    cfg = cfg_with(tmp)
+    bot = make_bot(FakeClient({"A": 10.0, "B": 20.0}), {"A": 300.0, "B": -300.0})
+    asyncio.run(bot.rebalance(cfg))
+    assert bot.st["pos"]["B"]["qty"] == pytest.approx(-5.0)
+
+
+def test_cohort_skips_a_long_with_an_ex_date_inside_its_hold(sandbox):
+    tmp, sent = sandbox
+    now = datetime(2026, 12, 10, 0, 5, tzinfo=timezone.utc)
+    write_cal(tmp, {"N": [{"from": "2026-12-13", "to": "2026-12-13", "pct": 3.0}],     # day 3: inside the hold
+                    "M": [{"from": "2026-12-14", "to": "2026-12-14", "pct": 3.0}]})    # day 4: after it
+    cfg = cfg_with(tmp, q=0.3, min_age_d=1)
+    names = list("ABCDEFGHIJ") + ["M", "N"]
+    rank = {n: i for i, n in enumerate(names)}               # N lowest funding -> first long pick, then M
+    bot = sc.StockCarry(FakeClient({n: 10.0 for n in names}))
+
+    async def info(body, pace=False):
+        if body["type"] == "candleSnapshot":
+            return [{"t": int(now.timestamp() * 1000) - 2 * 86400_000 + h * 3600_000, "c": 10 + (h % 2) * 0.01} for h in range(60)]
+        return [{"fundingRate": str(-rank[body["coin"].split(":")[1]] * 1e-5)}]
+    bot.info = info
+    snap = {n: {"mid": 10.0, "vol": 1e6, "funding": 0.0} for n in names}
+    cohort, _ = asyncio.run(bot.build_cohort(cfg, snap, now.timestamp()))
+    longs = {n for n, v in cohort.items() if v > 0}
+    assert "N" not in longs and "M" in longs and len(longs) == 3
+    assert set(bot.exdiv_passed) == {"N"}
+
+
+def test_shipped_calendar_parses():
+    cal = sc.load_exdiv(sc.BASE_DIR / "exdiv.json")
+    assert cal["valid_until"] >= "2027-01-01" and cal["names"]
+    for n, ents in cal["names"].items():
+        for e in ents:
+            assert e["from"] <= e["to"] and float(e["pct"]) > 0, n
