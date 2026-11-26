@@ -544,3 +544,13 @@ def test_shipped_calendar_parses():
     for n, ents in cal["names"].items():
         for e in ents:
             assert e["from"] <= e["to"] and float(e["pct"]) > 0, n
+
+
+def test_excluded_name_held_by_older_cohorts_is_closed(sandbox):
+    tmp, sent = sandbox
+    cfg = cfg_with(tmp, exclude=["a"])
+    bot = make_bot(FakeClient({"A": 10.0, "B": 20.0, "C": 5.0}), {"C": 300.0, "B": -300.0})
+    bot.st["cohorts"], bot.st["cohort_days"] = [{"A": 300.0, "B": -300.0}], ["2000-01-01"]
+    bot.st["pos"]["A"] = {"mode": "paper", "qty": 10.0, "avg": 10.0, "realised": 0.0, "fees": 0.0, "funding": 0.0, "status": "ok"}
+    asyncio.run(bot.rebalance(cfg))
+    assert bot.st["pos"]["A"]["qty"] == pytest.approx(0.0)

@@ -618,6 +618,9 @@ class StockCarry:
         cut = [n for n in exd if target.get(n, 0.0) > 0]
         for n in cut:
             target[n] = 0.0
+        for n in cfg["exclude"]:                  # excluded after older cohorts bought it: close it now
+            if target.get(n):
+                target[n] = 0.0
         div_notes = [f"ex-dividend: not buying {n} (ex {e['from']}{'' if e['to'] == e['from'] else '..' + e['to']}, "
                      f"~{e['pct']}%)" for n, e in sorted(self.exdiv_passed.items())]
         div_notes += [f"ex-dividend: {n} long closed (ex {exd[n]['from']}, ~{exd[n]['pct']}%)" for n in sorted(cut)]
