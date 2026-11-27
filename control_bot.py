@@ -2182,6 +2182,32 @@ def handle_message(msg: dict):
         send(chat_id, f"Unknown command {cmd}. /help for the list.")
 
 
+def handle_callback(cq: dict):
+    """Inline-button taps. dc:<yes|no|close>:<event id> -> a div-capture request for stock_carry.py."""
+    msg = cq.get("message") or {}
+    chat_id = str(msg.get("chat", {}).get("id", ""))
+    data = cq.get("data") or ""
+    try:
+        _api("answerCallbackQuery", {"callback_query_id": cq.get("id", ""), "text": "got it"}, timeout=10)
+    except Exception:
+        pass
+    if chat_id not in ALLOWED:
+        print(f"IGNORED callback from unauthorized chat {chat_id}: {data!r}", flush=True)
+        return
+    parts = data.split(":", 2)
+    if len(parts) == 3 and parts[0] == "dc" and parts[1] in ("yes", "no", "close"):
+        op, eid = parts[1], parts[2]
+        _sc_request("divcap", op=op, id=eid)
+        try:                                  # take the buttons off so it can't be tapped twice
+            _api("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": msg.get("message_id"),
+                                            "reply_markup": json.dumps({"inline_keyboard": []})}, timeout=10)
+        except Exception:
+            pass
+        send(chat_id, {"yes": f"📩 {eid}: putting the dividend capture on (Aster long + HL short)…",
+                       "no": f"{eid}: skipped", "close": f"📩 {eid}: closing both legs…"}[op])
+        print(f"callback from {chat_id}: {data}", flush=True)
+
+
 def main():
     if not TOKEN:
         raise SystemExit("ALERT_TELEGRAM_BOT_TOKEN not set")
@@ -2238,12 +2264,15 @@ def main():
 
     while True:
         try:
-            resp = _api("getUpdates", {"offset": offset, "timeout": 30}, timeout=40)
+            resp = _api("getUpdates", {"offset": offset, "timeout": 30, "allowed_updates": json.dumps(
+                ["message", "edited_message", "callback_query"])}, timeout=40)
             for upd in resp.get("result", []):
                 offset = upd["update_id"] + 1
                 msg = upd.get("message") or upd.get("edited_message")
                 if msg:
                     handle_message(msg)
+                elif upd.get("callback_query"):
+                    handle_callback(upd["callback_query"])
         except Exception as e:
             print(f"poll error: {e}", flush=True)
             time.sleep(5)

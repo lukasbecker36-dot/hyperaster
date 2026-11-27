@@ -77,6 +77,7 @@ except Exception:
     pass
 
 from session_flip import apply_fill, arb_holds, replay_trades
+from div_capture import DivCapture
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA = BASE_DIR / "data"
@@ -353,6 +354,10 @@ class StockCarry:
         self.scored_of = 0
         self.exdiv_passed: dict = {}                # names the cohort didn't buy for an ex-dividend date
         self.too_volatile: list = []                # names left out today for max_hvol
+        self.divcap = DivCapture(self, tg, load_exdiv, lambda: sf_names(), lambda n: arb_holds(n))
+
+    def save(self):
+        save_state(self.st)
 
     # -- market data (public /info through the client's session)
     async def info(self, body: dict, pace: bool = False):
@@ -387,7 +392,7 @@ class StockCarry:
 
     async def build_cohort(self, cfg: dict, snap: dict, now_s: float) -> tuple[dict, dict]:
         """Today's cohort {name: usd} and each candidate's 24h mean funding (annualised)."""
-        skip = sf_names() | set(cfg["exclude"])
+        skip = sf_names() | set(cfg["exclude"]) | self.divcap.names()
         names = [n for n, s in snap.items() if s["vol"] >= cfg["min_vol"] and n not in FX_COMM and n not in skip]
         sig, vol = {}, {}
         age_s = cfg["min_age_d"] * 86400
@@ -473,7 +478,10 @@ class StockCarry:
         d = await self.info({"type": "clearinghouseState", "user": addr, "dex": "xyz"})
         if not isinstance(d, dict) or not isinstance(d.get("assetPositions"), list):
             raise RuntimeError(f"bad clearinghouseState reply: {str(d)[:120]}")
-        return {ap["position"]["coin"].split(":")[-1]: float(ap["position"]["szi"]) for ap in d["assetPositions"]}
+        out = {ap["position"]["coin"].split(":")[-1]: float(ap["position"]["szi"]) for ap in d["assetPositions"]}
+        for n in self.divcap.names():                 # the dividend-capture short isn't stock carry's
+            out[n] = out.get(n, 0.0) - self.divcap.hl_qty(n)
+        return out
 
     @staticmethod
     def mismatch(venue: float, qty: float) -> bool:
@@ -642,7 +650,7 @@ class StockCarry:
         cut = [n for n in exd if target.get(n, 0.0) > 0]
         for n in cut:
             target[n] = 0.0
-        for n in cfg["exclude"]:                  # excluded after older cohorts bought it: close it now
+        for n in set(cfg["exclude"]) | self.divcap.names():   # excluded (or a dividend capture is on): close it
             if target.get(n):
                 target[n] = 0.0
         target = drop_small(target, MIN_ORDER_USD)
@@ -964,6 +972,12 @@ class StockCarry:
                 if self.last_ok:
                     self.st["last_rebalance"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 save_state(self.st)
+            elif a == "divcap" and req.get("id"):
+                try:
+                    await self.divcap.request(req.get("op", ""), req["id"])
+                except Exception as e:
+                    log.exception("divcap request")
+                    tg(f"div capture {req['id']}: ERROR {e} — check Aster and HL by hand")
             elif a == "reset" and req.get("name"):
                 n = req["name"]
                 p = self.st["pos"].setdefault(n, {"qty": 0.0, "avg": 0.0, "realised": 0.0, "fees": 0.0,
@@ -982,6 +996,12 @@ class StockCarry:
                 p["status"] = "ok"
                 save_state(self.st)
                 tg(f"{n}: reset — state now {p['qty']:+.4g} @ {p['avg']:.6g}")
+        if cfg.get("divcap", True):
+            try:
+                await self.divcap.tick()
+            except Exception as e:
+                log.exception("divcap tick")
+                tg(f"div capture error: {e}")
         if not cfg["enabled"]:
             if any(p.get("qty") for p in self.st["pos"].values()):
                 tg("disabled — flattened:\n" + await self.flatten(cfg, "disabled"))
