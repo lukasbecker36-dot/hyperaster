@@ -11,9 +11,14 @@ THE EDGE (hyperdata repo, scratchpad xs_bt.py / sx7.py, Nov 2026; paper book sto
 THE RULE (daily at REBALANCE UTC)
   Universe: xyz perps, no FX / commodities, >= $200k 24h volume, >= 14 days of history, minus any name the
   session flip trades and any name the arb bot holds. Score = mean hourly funding over the last 24h.
-  Today's cohort: long the lowest-funding 20%, short the highest 20%, `side_usd` a side, weights inverse to
-  10-day hourly volatility, no name above `cap` (10%) of its side. The book is the average of the last three
-  daily cohorts (each held 72h), traded to once a day; changes under $10 (HL's minimum) are skipped.
+  Today's cohort: long the lowest-funding 25%, short the highest 25%, `side_usd` a side, weights inverse to
+  10-day hourly volatility, no name above `cap` (10%) of its side; names whose 10-day hourly vol is above
+  `max_hvol` (1.5%, ~7%/day) are left out. The book is the average of the last three daily cohorts (each held
+  72h), traded to once a day. Book targets under $10 (HL's minimum order) are dropped and their $ spread over
+  the rest of that side; other changes under $10 are skipped.
+  (27 Nov 2026, scratchpad sc_variants.py, Apr-Nov, with the $10 minimum simulated at $600 a side: 20% and no
+  vol cap Sharpe 1.6, dev half 0.3; 25% + 1.5%/h cap + sub-$10 dropped Sharpe 2.7, dev half 1.5.)
+  Each rebalance reports the price P&L since the last one of the intended book vs what was actually held.
   Isolated margin, LEVERAGE PER NAME: the highest leverage up to `leverage` (4x) that keeps the liquidation
   (1/lev less ~5% maintenance) beyond a `lev_sigmas` (3) sigma move over the 3-day hold, from the name's 10-day
   hourly vol. Blue chips stay at 4x (~20% to liquidation); 7-8%/day names (NBIS, ZHIPU, KORU, SHAZ) get 2x or less.
@@ -93,7 +98,8 @@ DEFAULT_CONFIG = {
     "leverage": 4,                   # the MOST any name gets; each name's is set from its vol (lev_for)
     "lev_sigmas": 3.0,               # liquidation kept beyond this many sigmas of a hold_d-day move
     "cap": 0.10,                     # max share of one side in one name
-    "q": 0.20,                       # top / bottom fraction of the universe
+    "q": 0.25,                       # top / bottom fraction of the universe
+    "max_hvol": 0.015,               # leave out names whose 10-day hourly vol is above this (~7%/day); 0 = off
     "look_h": 24,                    # funding lookback
     "hold_d": 3,                     # cohorts averaged
     "min_vol": 200_000.0,            # $ 24h volume
@@ -153,6 +159,19 @@ def long_short(signal: dict, vol: dict, q: float, side_usd: float, cap=None, min
     for names, sign in ((longs, 1), (shorts, -1)):
         for c, wt in capped_weights({c: 1 / vol[c] for c in names}, cap).items():
             out[c] = sign * side_usd * wt
+    return out
+
+
+def drop_small(target: dict, min_usd: float) -> dict:
+    """Leave out book targets under `min_usd` (HL won't trade them, so they'd sit off target) and spread their
+    $ over the rest of the same side, so each side keeps its gross."""
+    out = dict(target)
+    for sgn in (1, -1):
+        side = {n: v for n, v in target.items() if v * sgn > 0}
+        keep = {n: v for n, v in side.items() if abs(v) >= min_usd}
+        tot, kept = sum(abs(v) for v in side.values()), sum(abs(v) for v in keep.values())
+        for n in side:
+            out[n] = side[n] * tot / kept if n in keep else 0.0
     return out
 
 
@@ -333,6 +352,7 @@ class StockCarry:
         self.skipped: list = []
         self.scored_of = 0
         self.exdiv_passed: dict = {}                # names the cohort didn't buy for an ex-dividend date
+        self.too_volatile: list = []                # names left out today for max_hvol
 
     # -- market data (public /info through the client's session)
     async def info(self, body: dict, pace: bool = False):
@@ -397,6 +417,10 @@ class StockCarry:
         self.scored_of = len(names)
         # a cohort is held until the rebalance hold_d days on, which comes after that day's Asian open
         no_long = exdiv_hits(load_exdiv(), _day(now_s), _day(now_s, cfg["hold_d"]), cfg["exdiv_min_pct"])
+        mx = cfg.get("max_hvol")
+        if mx:                                             # names that swing too much for the funding to matter
+            self.too_volatile = sorted(n for n, v in vol.items() if v and v > mx and n in sig)
+            vol = {n: v for n, v in vol.items() if not (v and v > mx)}
         free = long_short(sig, vol, cfg["q"], cfg["side_usd"], cfg["cap"])
         cohort = long_short(sig, vol, cfg["q"], cfg["side_usd"], cfg["cap"], no_long=set(no_long))
         self.exdiv_passed = {n: no_long[n] for n in free if free[n] > 0 and n not in cohort}
@@ -621,6 +645,9 @@ class StockCarry:
         for n in cfg["exclude"]:                  # excluded after older cohorts bought it: close it now
             if target.get(n):
                 target[n] = 0.0
+        target = drop_small(target, MIN_ORDER_USD)
+        if self.too_volatile:
+            div_notes.append(f"too volatile today (>{cfg['max_hvol']:.1%}/h): {', '.join(self.too_volatile)}")
         div_notes = [f"ex-dividend: not buying {n} (ex {e['from']}{'' if e['to'] == e['from'] else '..' + e['to']}, "
                      f"~{e['pct']}%)" for n, e in sorted(self.exdiv_passed.items())]
         div_notes += [f"ex-dividend: {n} long closed (ex {exd[n]['from']}, ~{exd[n]['pct']}%)" for n in sorted(cut)]
@@ -646,7 +673,8 @@ class StockCarry:
         # committed now: this cohort counts towards the 3-day book
         self.st["cohorts"], self.st["cohort_days"] = cohorts, days
         self.last_ok = True
-        traded, n_tr, notes = 0.0, 0, div_notes
+        track = self.tracking(snap, today)
+        traded, n_tr, notes = 0.0, 0, div_notes + ([track] if track else [])
         names = set(target) | {n for n, p in self.st["pos"].items() if p.get("qty")}
         for p in self.st["pos"].values():       # the old leverage refusal used to park: un-park those
             if p.get("status", "ok").startswith("could not set"):
@@ -680,6 +708,9 @@ class StockCarry:
                 self.st["pos"].setdefault(n, {})["status"] = f"error: {e}"
                 save_state(self.st)
                 notes.append(f"{n}: ERROR {e}")
+        self.st["track"] = {"day": today, "target": target,
+                            "mids": {n: snap[n]["mid"] for n in set(target) | set(self.st["pos"]) if n in snap},
+                            "qty": {n: p["qty"] for n, p in self.st["pos"].items() if p.get("qty")}}
         save_state(self.st)
         if live:
             notes += await self.top_up_margin(cfg)
@@ -698,6 +729,26 @@ class StockCarry:
                 f"margin ~${margin:,.0f} (names by leverage: {mix or 'none'})\n"
                 f"cohort long {', '.join(longs)}\ncohort short {', '.join(shorts)}"
                 + ("\n" + "\n".join(notes) if notes else ""))
+
+    def tracking(self, snap: dict, today: str) -> str | None:
+        """Price P&L since the last rebalance, on the same marks, of the rules' book (the target) and of what is
+        actually held: the gap is sizing (HL minimums, margin scaling, parked names), not luck or execution."""
+        tr = self.st.get("track")
+        if not tr or tr.get("day") == today:
+            return None
+        def pnl(book, as_qty):
+            tot = 0.0
+            for n, v in book.items():
+                m0, m1 = tr["mids"].get(n), snap.get(n, {}).get("mid")
+                if m0 and m1:
+                    tot += v * (m1 - m0) if as_qty else v * (m1 / m0 - 1)
+            return tot
+        model, held = pnl(tr["target"], False), pnl(tr["qty"], True)
+        cum = self.st.setdefault("track_cum", {"since": tr["day"], "model": 0.0, "held": 0.0})
+        cum["model"] += model
+        cum["held"] += held
+        return (f"tracking (price only, same marks): rules ${model:+.2f}, held ${held:+.2f} since {tr['day']}; "
+                f"since {cum['since']} rules ${cum['model']:+.2f}, held ${cum['held']:+.2f}")
 
     async def flatten(self, cfg: dict, reason: str) -> str:
         self._venue = None

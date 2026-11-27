@@ -554,3 +554,54 @@ def test_excluded_name_held_by_older_cohorts_is_closed(sandbox):
     bot.st["pos"]["A"] = {"mode": "paper", "qty": 10.0, "avg": 10.0, "realised": 0.0, "fees": 0.0, "funding": 0.0, "status": "ok"}
     asyncio.run(bot.rebalance(cfg))
     assert bot.st["pos"]["A"]["qty"] == pytest.approx(0.0)
+
+
+# ---- 25%, vol cap, sub-$10 targets, tracking
+def test_drop_small_respreads_each_side():
+    t = sc.drop_small({"A": 50.0, "B": 5.0, "C": 45.0, "X": -96.0, "Y": -4.0}, 10.0)
+    assert t["B"] == 0.0 and t["Y"] == 0.0
+    assert t["A"] + t["C"] == pytest.approx(100.0) and t["A"] / t["C"] == pytest.approx(50 / 45)
+    assert t["X"] == pytest.approx(-100.0)
+    assert sc.drop_small({"A": 5.0, "B": -50.0}, 10.0) == {"A": 0.0, "B": -50.0}
+
+
+def test_rebalance_drops_sub_minimum_targets(sandbox):
+    tmp, sent = sandbox
+    cfg = cfg_with(tmp)
+    c = FakeClient({"A": 10.0, "B": 20.0, "C": 5.0})
+    bot = make_bot(c, {"A": 285.0, "C": 15.0, "B": -300.0})       # C's book target is $5: dropped, A gets $100
+    asyncio.run(bot.rebalance(cfg))
+    assert bot.st["pos"].get("C", {}).get("qty", 0.0) == 0.0
+    assert bot.st["pos"]["A"]["qty"] * 10.0 == pytest.approx(100.0)
+
+
+def test_max_hvol_leaves_out_volatile_names(sandbox):
+    tmp, sent = sandbox
+    now = datetime(2026, 12, 1, 0, 5, tzinfo=timezone.utc)
+    cfg = cfg_with(tmp, q=0.3, min_age_d=1, max_hvol=0.015)
+    names = list("ABCDEFGHIJKL")
+    rank = {n: i for i, n in enumerate(names)}                    # A lowest funding -> long, L highest -> short
+    bot = sc.StockCarry(FakeClient({n: 10.0 for n in names}))
+
+    async def info(body, pace=False):
+        n = body.get("coin") or body["req"]["coin"]
+        n = n.split(":")[1]
+        if body["type"] == "candleSnapshot":
+            amp = 0.05 if n in ("A", "L") else 0.002               # A and L swing ~5%/h
+            return [{"t": int(now.timestamp() * 1000) - 2 * 86400_000 + h * 3600_000, "c": 10 * (1 + amp * (h % 2))}
+                    for h in range(60)]
+        return [{"fundingRate": str((rank[n] - 5) * 1e-5)}]
+    bot.info = info
+    snap = {n: {"mid": 10.0, "vol": 1e6, "funding": 0.0} for n in names}
+    cohort, _ = asyncio.run(bot.build_cohort(cfg, snap, now.timestamp()))
+    assert "A" not in cohort and "L" not in cohort and bot.too_volatile == ["A", "L"]
+    assert {n for n in cohort if cohort[n] > 0} == {"B", "C", "D"} and {n for n in cohort if cohort[n] < 0} == {"K", "J", "I"}
+
+
+def test_tracking_compares_the_rules_book_with_what_is_held(sandbox):
+    tmp, sent = sandbox
+    bot = make_bot(FakeClient({"A": 10.0}), {})
+    bot.st["track"] = {"day": "2026-11-26", "target": {"A": 100.0}, "mids": {"A": 10.0}, "qty": {"A": 5.0}}
+    msg = bot.tracking({"A": {"mid": 11.0}}, "2026-11-27")
+    assert "rules $+10.00, held $+5.00" in msg
+    assert bot.tracking({"A": {"mid": 11.0}}, "2026-11-26") is None
