@@ -605,3 +605,14 @@ def test_tracking_compares_the_rules_book_with_what_is_held(sandbox):
     msg = bot.tracking({"A": {"mid": 11.0}}, "2026-11-27")
     assert "rules $+10.00, held $+5.00" in msg
     assert bot.tracking({"A": {"mid": 11.0}}, "2026-11-26") is None
+
+
+def test_rebalance_reports_names_left_out_as_too_volatile(sandbox):
+    tmp, sent = sandbox
+    cfg = cfg_with(tmp)
+    c = FakeClient({"A": 10.0, "B": 20.0})
+    bot = make_bot(c, {"A": 300.0, "B": -300.0})
+    bot.too_volatile = ["ZZZ"]                                     # set by build_cohort on a real run
+    msg = asyncio.run(bot.rebalance(cfg))
+    assert "too volatile today" in msg and "ZZZ" in msg
+    assert bot.st["pos"]["A"]["qty"] * 10.0 == pytest.approx(100.0)          # 1 of 3 cohorts

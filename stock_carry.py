@@ -654,11 +654,11 @@ class StockCarry:
             if target.get(n):
                 target[n] = 0.0
         target = drop_small(target, MIN_ORDER_USD)
-        if self.too_volatile:
-            div_notes.append(f"too volatile today (>{cfg['max_hvol']:.1%}/h): {', '.join(self.too_volatile)}")
         div_notes = [f"ex-dividend: not buying {n} (ex {e['from']}{'' if e['to'] == e['from'] else '..' + e['to']}, "
                      f"~{e['pct']}%)" for n, e in sorted(self.exdiv_passed.items())]
         div_notes += [f"ex-dividend: {n} long closed (ex {exd[n]['from']}, ~{exd[n]['pct']}%)" for n in sorted(cut)]
+        if self.too_volatile:
+            div_notes.append(f"too volatile today (>{cfg['max_hvol']:.1%}/h): {', '.join(self.too_volatile)}")
         if cal["valid_until"] < _day(now_s, cfg["hold_d"] + 7):
             div_notes.append(f"⚠️ ex-dividend calendar {'missing' if not cal['valid_until'] else 'ends ' + cal['valid_until']}"
                              f" — rebuild exdiv.json (scripts/exdiv_build.py)")
